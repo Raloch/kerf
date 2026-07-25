@@ -5,7 +5,7 @@ Web 视频剪辑器，**导出在客户端完成**。服务端导出不在本方
 - 最后更新：2026-07-25
 - 界面设计稿：[design/kerf-editor-mockup.html](../design/kerf-editor-mockup.html)（单文件、零依赖，双击可开）
 - 在线版：https://claude.ai/code/artifact/244a2705-452c-4774-ac2c-2909b4096401
-- 当前阶段：设计稿已定稿，M0 未开工
+- 当前阶段：**M0 已完成**（管道跑通、14 项自检断言通过），下一步 M1
 
 ---
 
@@ -87,6 +87,15 @@ compose(edl, frameIndex) ──► VideoFrame        ← 唯一的合成入口
 5. **解码 / 合成 / 编码全部放 Web Worker**，`VideoFrame` 可 transfer 过去零拷贝；主线程只跑 UI，否则导出期间界面完全卡死。
 6. **导出结果流式写盘**，不要攒成一个 Blob。
 
+### M0 实施中发现的四件事
+
+这些是写代码时才暴露出来的，方案阶段想不到：
+
+1. **帧对齐必须带微秒级容差。** 帧号换算成秒会做微秒取整（偏差 ≤0.5μs），而解码器给出的 `sample.timestamp` 是未取整真值。两者直接比较会把"恰好等于"判成"还没到"，导致每个 trim 区间**末帧少一帧**——导出状态、帧数、时长全部正常，只有把文件读回来看画面才发现。现为 `FRAME_ALIGN_EPSILON_SECONDS = 1e-6`，并有单元测试锁死（`timebase.test.ts` 的"帧对齐容差"一节）。凡是拿"算出来的秒"与"解码器给的秒"比较，都要带这个容差。
+2. **时间轴时长必须按视频轨算，不能用容器总时长。** AAC 编码器会在音轨头尾加 priming/padding，音轨通常比视频轨长几帧；用 `input.computeDuration()` 会把 300 帧的素材算成 303 帧，末尾多出空档。要用 `videoTrack.computeDuration()`，且换算用 `round` 而非 `ceil`。
+3. **`OfflineAudioContext` 在 Worker 里不可用**（Web Audio 不暴露给 Worker）。M0 是单音轨，走 `AudioSampleSink → AudioSampleSource` 转封装即可，整条管道都留在 Worker 里。**M2 做多轨混音时，PCM 必须在主线程用 OfflineAudioContext 算好，再 transfer 进 Worker** —— 这会改变导出流水线的形状，届时要重新设计 Worker 协议。
+4. **mediabunny 的 `await source.add()` 本身就是背压**。它的 Promise 在编码器就绪时才 resolve，await 它等价于给编码队列施加背压，不需要自己轮询 `encodeQueueSize`。硬规则 5 因此简化为"必须 await add()"。
+
 ---
 
 ## 5. 兼容性现状（数据日期 2026-07）
@@ -153,8 +162,28 @@ compose(edl, frameIndex) ──► VideoFrame        ← 唯一的合成入口
 
 ## 7. 里程碑
 
-**M0 · 打通端到端（1–2 周）**
-单轨、单视频、只做 trim，导出 mp4。目的只有一个：验证 decode → compose → encode → mux 全链路和时间基模型是对的。可以先用 `MediaRecorder` 出片作为对照基准。
+**M0 · 打通端到端** ✅ 已完成（2026-07-25）
+
+单轨、单视频、只做 trim，导出 mp4。验证 decode → compose → encode → mux 全链路和时间基模型。
+
+实现落点：
+
+| 模块 | 位置 |
+|---|---|
+| 时间基（有理数帧号 ↔ 微秒 ↔ 时间码） | `src/time/` + 25 项单元测试 |
+| EDL 类型 | `src/edl/types.ts` |
+| 能力探测 | `src/media/capability.ts` |
+| 素材探针（帧率吸附） | `src/media/probe.ts` |
+| 合成层（Canvas2D，M2 换 PixiJS） | `src/compose/compositor.ts` |
+| 导出流水线 | `src/export/pipeline.ts` |
+| Worker 隔离 + 进度/取消 | `src/export/export.worker.ts`、`client.ts` |
+| 测试素材生成 + 验收脚本 | `src/dev/` |
+
+验收方式：`pnpm dev` 打开页面点「运行 M0 自检」，自动跑完 生成 300 帧素材 → 探测 → 导出第 90–210 帧 → 读回断言，14 项断言全过。
+素材画面带帧号水印，导出首帧显示 `frame 90`、末帧 `frame 209`，肉眼即可确认 trim 起止精确到帧。
+实测导出速度约 8.7× 实时（640×360，H.264 硬编）。
+
+没有做 `MediaRecorder` 对照基准：WebCodecs 主路径一次就跑通了，对照基准的唯一用途是"主路径出不了片时提供参照"，已无必要。
 
 **M1 · 编辑器骨架（3–4 周）**
 EDL 数据模型 + 撤销重做 + 多轨时间轴 UI + 拖拽/裁切/磁吸 + 播放头同步。导入时生成代理文件和缩略图条。工作量最大且几乎全是自研。

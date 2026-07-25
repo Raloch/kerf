@@ -1,0 +1,135 @@
+:root {
+  --bg: #0e1214;
+  --panel: #161b1e;
+  --line: #2a3237;
+  --tx: #e4e8e9;
+  --tx-dim: #8b979c;
+  --kerf: #e8a33d;
+  --ok: #57a87a;
+  --bad: #c8564e;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--tx);
+  font-family: "Avenir Next", Avenir, "Segoe UI", system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+main { max-width: 760px; margin: 0 auto; padding: 32px 22px 72px; }
+
+h1 { font-size: 21px; margin: 0 0 6px; letter-spacing: -0.01em; }
+h2 { font-size: 11px; letter-spacing: 0.09em; text-transform: uppercase; color: var(--tx-dim); margin: 0 0 12px; }
+.lead { color: var(--tx-dim); margin: 0 0 4px; max-width: 60ch; }
+
+section {
+  border-top: 1px solid var(--line);
+  padding: 20px 0;
+}
+
+.row { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+
+label { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--tx-dim); }
+
+input[type="number"], select {
+  font: inherit;
+  font-family: "SF Mono", ui-monospace, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  background: var(--bg);
+  color: var(--tx);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 7px 9px;
+  min-width: 130px;
+}
+
+button, .file-btn {
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  background: var(--panel);
+  color: var(--tx);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 8px 15px;
+  transition: background 0.14s;
+}
+button:hover:not(:disabled), .file-btn:hover { background: #232b2f; }
+button:disabled { opacity: 0.4; cursor: default; }
+button.primary { background: var(--kerf); border-color: var(--kerf); color: #17120a; font-weight: 600; }
+button.primary:hover:not(:disabled) { filter: brightness(1.08); }
+
+.file-btn { display: inline-flex; align-items: center; }
+.file-btn input { display: none; }
+
+.meta { display: flex; flex-direction: column; gap: 6px; margin: 16px 0 0; }
+.meta > div { display: grid; grid-template-columns: 82px 1fr; gap: 12px; }
+.meta dt { font-size: 11px; color: var(--tx-dim); }
+.meta dd {
+  margin: 0;
+  font-family: "SF Mono", ui-monospace, Menlo, monospace;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.caps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.caps li { font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: 12px; }
+.caps li.ok::before { content: "✓ "; color: var(--ok); }
+.caps li.bad::before { content: "✕ "; color: var(--bad); }
+
+.hint { color: var(--tx-dim); font-size: 12px; margin: 10px 0 0; }
+.warn {
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(200, 86, 78, 0.35);
+  background: rgba(200, 86, 78, 0.08);
+  border-radius: 5px;
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.progress { margin-top: 16px; }
+.bar { height: 5px; border-radius: 3px; background: var(--line); overflow: hidden; }
+.bar i { display: block; height: 100%; background: var(--kerf); transition: width 0.15s linear; }
+
+.mono {
+  font-family: "SF Mono", ui-monospace, Menlo, monospace;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--tx-dim);
+}
+.done { color: var(--ok); }
+.error { color: var(--bad); white-space: pre-wrap; }
+
+.checks { border-collapse: collapse; width: 100%; margin: 16px 0 0; font-size: 12px; }
+.checks td { padding: 4px 8px 4px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+.checks td:first-child { width: 18px; font-weight: 700; }
+.checks tr.ok td:first-child { color: var(--ok); }
+.checks tr.bad td { color: var(--bad); }
+.checks td.dim { color: var(--tx-dim); }
+
+.frames { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 16px; }
+.frames figure { margin: 0; flex: 1 1 240px; min-width: 0; }
+.frames canvas {
+  width: 100%;
+  height: auto;
+  display: block;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: #000;
+}
+.frames figcaption { font-size: 11px; color: var(--tx-dim); margin-top: 5px; }
+
+code {
+  font-family: "SF Mono", ui-monospace, Menlo, monospace;
+  font-size: 0.92em;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 1px 4px;
+}

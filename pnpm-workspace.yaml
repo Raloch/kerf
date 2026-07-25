@@ -1,0 +1,4 @@
+# esbuild 的二进制通过平台可选依赖提供，不需要 postinstall 构建脚本。
+# 显式声明以免每次 install 都提示 ERR_PNPM_IGNORED_BUILDS。
+allowBuilds:
+  esbuild: false
