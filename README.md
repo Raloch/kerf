@@ -20,7 +20,7 @@ M0 的目标不是可用的编辑器，而是先证明这条链路成立：
 
 实测导出速度约 **8.7× 实时**（640×360，H.264 硬编）。
 
-编辑器界面已经有可交互的设计稿，但还没实现：[design/kerf-editor-mockup.html](design/kerf-editor-mockup.html)（单文件、零依赖，双击即可打开）。
+编辑器界面已经有可交互的设计稿，但还没实现——**[点开直接操作](https://raw.githack.com/Raloch/kerf/main/design/kerf-editor-mockup.html)**：按空格播放、拖时间轴、点片段看检查器、走一遍导出流程。源文件在 [design/kerf-editor-mockup.html](design/kerf-editor-mockup.html)，单文件零依赖，clone 后双击也能打开。
 
 ## 快速开始
 
@@ -92,9 +92,9 @@ docs/PLAN.md    技术方案（活文档）
 ## 文档
 
 - [docs/PLAN.md](docs/PLAN.md) — 技术方案：选型理由、架构、兼容矩阵、设计决策记录、实施中踩到的坑
-- [design/kerf-editor-mockup.html](design/kerf-editor-mockup.html) — 界面设计稿，可交互，四种状态
+- [界面设计稿](https://raw.githack.com/Raloch/kerf/main/design/kerf-editor-mockup.html) — 可交互，一个应用外壳承载剪辑台、素材导入、导出三态与兼容降级四种状态（源文件：[design/kerf-editor-mockup.html](design/kerf-editor-mockup.html)）
 - [CLAUDE.md](CLAUDE.md) — 给 AI 编码助手的项目规则与硬约束
 
----
+## 许可
 
-许可尚未确定。仓库虽然公开，但在补上 LICENSE 之前默认保留所有权利。
+[MIT](LICENSE)
