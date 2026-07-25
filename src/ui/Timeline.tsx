@@ -8,13 +8,18 @@
  * 本步只做渲染 + 点选 + 播放头，拖拽/裁切留在 M1 子步骤 3（复用 operations.ts）。
  */
 
-import { useCallback, useMemo, useRef, type PointerEvent as ReactPointerEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { clipDuration, type Clip, type Timeline as Tl, type Track, type TrackId } from "../edl/types";
 import { framesToTimecode } from "../time/timebase";
 import { toNumber } from "../time/rational";
 import { useTimeline } from "../state/timeline-store";
 import { ghostForTrack, useClipDrag, type ClipDragApi, type Ghost } from "./use-clip-drag";
+import { buildStrip, cachedStrip, drawStrip } from "../media/thumbnails";
+import { proxyManager } from "../media/proxy-client";
 import { IconCut, IconEye, IconFilm, IconLock, IconMagnet, IconMute, IconPlus, IconTrash, IconVolume, IconWave } from "./icons";
+
+/** 片段内缩略图条高度，与 .strip 的 CSS 保持一致。 */
+const STRIP_HEIGHT = 32;
 
 /** 缩放滑块的取值范围（每帧像素数 × 100）。 */
 const ZOOM_MIN = 8;
@@ -36,6 +41,22 @@ export function TimelinePanel() {
   const pxPerFrame = zoom / 100;
   const ticksRef = useRef<HTMLDivElement>(null);
   const drag = useClipDrag(pxPerFrame);
+
+  /**
+   * 代理就绪的 URL 表。
+   *
+   * 必须在这里订阅并往下传：缩略图的 effect 需要"代理状态"作为依赖，
+   * 否则代理转好时片段不会重跑 effect，缩略图永远不出现（踩过）。
+   */
+  const [proxyUrls, setProxyUrls] = useState<Record<string, string>>({});
+  useEffect(
+    () =>
+      proxyManager.subscribe((sourceId, info) => {
+        if (info.status !== "ready" || !info.url) return;
+        setProxyUrls((prev) => (prev[sourceId] === info.url ? prev : { ...prev, [sourceId]: info.url! }));
+      }),
+    [],
+  );
 
   // 时间轴至少铺满可视宽度，否则空项目时标尺是一条短线
   const contentWidth = Math.max(1, timeline.durationFrames) * pxPerFrame;
@@ -160,6 +181,7 @@ export function TimelinePanel() {
                 selectedClipId={selectedClipId}
                 onSelect={select}
                 drag={drag}
+                proxyUrls={proxyUrls}
               />
             ))}
             <div className="ph-layer">
@@ -226,6 +248,7 @@ function TrackRow({
   selectedClipId,
   onSelect,
   drag,
+  proxyUrls,
 }: {
   track: Track;
   timeline: Tl;
@@ -233,6 +256,7 @@ function TrackRow({
   selectedClipId: string | null;
   onSelect: (id: string) => void;
   drag: ClipDragApi;
+  proxyUrls: Record<string, string>;
 }) {
   const isAudio = track.kind === "audio";
   const ghost = ghostForTrack(drag.ghost, track.id);
@@ -275,6 +299,7 @@ function TrackRow({
             selected={clip.id === selectedClipId}
             onSelect={onSelect}
             drag={drag}
+            proxyUrl={proxyUrls[clip.sourceId]}
           />
         ))}
         {ghost && <GhostView ghost={ghost} pxPerFrame={pxPerFrame} />}
@@ -308,6 +333,7 @@ function ClipView({
   selected,
   onSelect,
   drag,
+  proxyUrl,
 }: {
   clip: Clip;
   timeline: Tl;
@@ -317,11 +343,59 @@ function ClipView({
   selected: boolean;
   onSelect: (id: string) => void;
   drag: ClipDragApi;
+  proxyUrl: string | undefined;
 }) {
   const source = timeline.sources.find((s) => s.id === clip.sourceId);
   const label = clip.name ?? source?.name ?? clip.id;
   const length = clipDuration(clip);
   const widthPx = length * pxPerFrame;
+  const stripRef = useRef<HTMLCanvasElement>(null);
+
+  // 缩略图只画视频片段，且只在代理就绪后——从原片抽帧比转一遍代理还慢
+  useEffect(() => {
+    if (kind !== "video" || !source) return;
+    const canvas = stripRef.current;
+    if (!canvas || widthPx < 24) return;
+
+    let cancelled = false;
+    const paint = (strip: ReturnType<typeof cachedStrip>) => {
+      if (cancelled || !strip) return;
+      const dpr = Math.min(2, window.devicePixelRatio || 1);
+      const h = STRIP_HEIGHT;
+      canvas.width = Math.max(1, Math.round(widthPx * dpr));
+      canvas.height = Math.round(h * dpr);
+      canvas.style.height = `${h}px`;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.scale(dpr, dpr);
+      drawStrip(ctx, strip, {
+        widthPx,
+        heightPx: h,
+        sourceInFrame: clip.sourceIn,
+        lengthFrames: length,
+      });
+    };
+
+    const cached = cachedStrip(source.id);
+    if (cached) {
+      paint(cached);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    if (!proxyUrl) return;
+    // 用代理的 blob URL 取回 File 再抽帧
+    void fetch(proxyUrl)
+      .then((r) => r.blob())
+      .then((blob) => buildStrip(source.id, new File([blob], `${source.id}-proxy.mp4`), source.durationFrames))
+      .then(paint)
+      .catch(() => undefined);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [clip.sourceIn, kind, length, proxyUrl, pxPerFrame, source, widthPx]);
 
   return (
     <div
@@ -344,6 +418,7 @@ function ClipView({
         }
       }}
     >
+      {kind === "video" && <canvas className="strip" ref={stripRef} />}
       <span className="lbl">
         {kind === "video" ? <IconFilm /> : <IconWave />}
         {label}

@@ -5,7 +5,7 @@
 完整方案：[docs/PLAN.md](docs/PLAN.md)（选型理由、架构、兼容矩阵、决策记录、里程碑）
 界面设计稿：[design/kerf-editor-mockup.html](design/kerf-editor-mockup.html)（已定稿，四种状态）
 
-当前阶段：**M1 进行中**。M0（decode → compose → encode → mux）已跑通；M1 的状态层、编辑器外壳/时间轴渲染、拖拽交互、预览播放器已完成，下一步是代理文件与缩略图条（见 PLAN.md §7 的 M1 子步骤表）。
+当前阶段：**M1 已完成**（编辑器骨架可用：导入、多轨时间轴、拖拽/裁切/磁吸、预览播放、OPFS 代理与缩略图）。下一步 M2 创作能力（文字层、关键帧、转场、滤镜、音量包络 + 音频波形）。
 
 ```bash
 pnpm dev          # 起开发服务器
@@ -43,6 +43,7 @@ pnpm build        # 构建
 | 音频离线混流 | OfflineAudioContext |
 | 状态 / 撤销栈 | Zustand + Immer |
 | 大文件存储 | OPFS + File System Access API |
+| 预览代理转码 | mediabunny `Conversion`（Worker 内，串行） |
 | 时间轴、检查器、波形、导出面板 | 自研 |
 
 ffmpeg.wasm 不进主路径（软编慢 10–50×，多线程版的 COOP/COEP 会打断页面内第三方脚本）。要补 AAC 只考虑 libav.js，且属于待定项。

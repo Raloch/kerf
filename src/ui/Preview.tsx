@@ -10,6 +10,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTimeline } from "../state/timeline-store";
 import { createPreviewEngine, advanceFrames, type PreviewEngine } from "../preview/preview-engine";
+import { proxyManager } from "../media/proxy-client";
 import { framesToTimecode } from "../time/timebase";
 import { IconNext, IconPause, IconPlay, IconPrev } from "./icons";
 
@@ -54,6 +55,21 @@ export function Preview() {
       cancelled = true;
     };
   }, [hasContent, playhead, playing, timeline]);
+
+  // 代理就绪 → 预览换用代理（seek 快一个量级），并立刻重画当前帧
+  useEffect(
+    () =>
+      proxyManager.subscribe((sourceId, info) => {
+        if (info.status !== "ready" || !info.url) return;
+        const engine = engineRef.current;
+        if (!engine) return;
+        engine.useProxy(sourceId, info.url);
+        if (!playing) {
+          void engine.renderFrame(useTimeline.getState().timeline(), useTimeline.getState().playhead);
+        }
+      }),
+    [playing],
+  );
 
   const stop = useCallback(() => {
     setPlaying(false);

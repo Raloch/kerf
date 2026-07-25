@@ -43,10 +43,18 @@ interface SourceHandle {
   readonly video: HTMLVideoElement;
   readonly url: string;
   ready: boolean;
+  /** 原片 URL 是这里创建的，要负责 revoke；代理 URL 归 ProxyManager，不能碰。 */
+  readonly ownsUrl: boolean;
 }
 
 export interface PreviewEngine {
   readonly canvas: HTMLCanvasElement;
+  /**
+   * 代理就绪后调用：换用代理文件重建对应的 video。
+   *
+   * 预览读代理、导出读原片——代理只为 seek 流畅，绝不影响成片画质。
+   */
+  useProxy(sourceId: string, proxyUrl: string): void;
   /** 渲染指定帧（暂停态用）。会等待 seek 完成，因此是异步的。 */
   renderFrame(timeline: Timeline, frame: number): Promise<void>;
   /** 播放态每帧调用：只采样 video 当前画面，不等待 seek。 */
@@ -66,6 +74,8 @@ export function createPreviewEngine(
 ): PreviewEngine {
   let compositor: Compositor = createCanvas2DCompositor(width, height, canvas);
   const handles = new Map<string, SourceHandle>();
+  /** sourceId → 代理 blob URL。有代理就用它，没有才回退原片。 */
+  const proxies = new Map<string, string>();
   let playing = false;
 
   function handleFor(source: MediaSource): SourceHandle {
@@ -73,12 +83,14 @@ export function createPreviewEngine(
     if (existing) return existing;
 
     const video = document.createElement("video");
-    const url = URL.createObjectURL(source.file);
+    // 有代理用代理（seek 快一个量级），没有才读原片
+    const proxyUrl = proxies.get(source.id);
+    const url = proxyUrl ?? URL.createObjectURL(source.file);
     video.src = url;
     video.muted = true; // 见文件头注释：M1 预览刻意静音
     video.playsInline = true;
     video.preload = "auto";
-    const handle: SourceHandle = { video, url, ready: false };
+    const handle: SourceHandle = { video, url, ready: false, ownsUrl: proxyUrl === undefined };
     video.addEventListener("loadeddata", () => {
       handle.ready = true;
     });
@@ -218,6 +230,20 @@ export function createPreviewEngine(
       );
     },
 
+    useProxy(sourceId, proxyUrl) {
+      if (proxies.get(sourceId) === proxyUrl) return;
+      proxies.set(sourceId, proxyUrl);
+      // 丢掉已建的原片 video，下次取帧会用代理重建
+      const existing = handles.get(sourceId);
+      if (existing) {
+        existing.video.pause();
+        existing.video.removeAttribute("src");
+        existing.video.load();
+        if (existing.ownsUrl) URL.revokeObjectURL(existing.url);
+        handles.delete(sourceId);
+      }
+    },
+
     stopPlayback() {
       playing = false;
       for (const handle of handles.values()) handle.video.pause();
@@ -234,7 +260,7 @@ export function createPreviewEngine(
         handle.video.pause();
         handle.video.removeAttribute("src");
         handle.video.load();
-        URL.revokeObjectURL(handle.url);
+        if (handle.ownsUrl) URL.revokeObjectURL(handle.url);
       }
       handles.clear();
       compositor.dispose();

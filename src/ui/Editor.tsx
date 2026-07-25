@@ -8,6 +8,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { probeFile, wasFpsSnapped } from "../media/probe";
 import { probeCapabilities, type ExportCapabilities } from "../media/capability";
+import { proxyManager } from "../media/proxy-client";
+import type { ProxyInfo } from "../media/proxy";
 import { useTimeline } from "../state/timeline-store";
 import { findClip } from "../state/operations";
 import { clipDuration } from "../edl/types";
@@ -46,12 +48,27 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
   const removeSelected = useTimeline((s) => s.removeSelected);
 
   const [caps, setCaps] = useState<ExportCapabilities | null>(null);
+  const [proxies, setProxies] = useState<Record<string, ProxyInfo>>({});
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     probeCapabilities(timeline.width, timeline.height).then(setCaps).catch(() => setCaps(null));
   }, [timeline.width, timeline.height]);
+
+  // 代理状态：素材库要显示进度，预览要在就绪时切过去
+  useEffect(
+    () =>
+      proxyManager.subscribe((sourceId, info) => {
+        setProxies((prev) => ({ ...prev, [sourceId]: info }));
+      }),
+    [],
+  );
+
+  // 导入的素材都排队生成代理（已在 OPFS 里的会直接命中缓存）
+  useEffect(() => {
+    for (const source of timeline.sources) void proxyManager.request(source);
+  }, [timeline.sources]);
 
   const importFile = useCallback(
     async (file: File) => {
@@ -60,6 +77,7 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
       try {
         const result = await probeFile(file);
         loadSource(result.source);
+        void proxyManager.request(result.source);
         if (wasFpsSnapped(result)) {
           // 帧率被吸附过要告知：它决定了后续所有帧运算
           setBusy(
@@ -185,6 +203,7 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
                         {source.width}×{source.height} · {formatFps(source.fps)} ·{" "}
                         {formatDuration(source.durationFrames, source.fps)}
                       </span>
+                      <ProxyBadge info={proxies[source.id]} />
                     </span>
                   </button>
                 ))}
@@ -327,5 +346,50 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
         </div>
       </div>
     </div>
+  );
+}
+
+/**
+ * 代理状态徽标。
+ *
+ * 这个状态要露出来，因为它解释了用户能观察到的行为：刚导入时预览读原片、
+ * 拖播放头会卡；代理就绪后忽然变流畅。不显示的话这变化像是随机的。
+ */
+function ProxyBadge({ info }: { readonly info: ProxyInfo | undefined }) {
+  if (!info || info.status === "none") return null;
+  if (info.status === "ready") {
+    return (
+      <span className="px ok" title="预览走 720p 代理，导出仍读原片">
+        <span className="dot" />
+        代理就绪
+      </span>
+    );
+  }
+  if (info.status === "working") {
+    return (
+      <>
+        <span className="px work">
+          <span className="dot pulse" />
+          生成代理 {Math.round(info.progress * 100)}%
+        </span>
+        <span className="mini-bar">
+          <i style={{ width: `${Math.round(info.progress * 100)}%` }} />
+        </span>
+      </>
+    );
+  }
+  if (info.status === "queued") {
+    return (
+      <span className="px wait">
+        <span className="dot" />
+        排队中
+      </span>
+    );
+  }
+  return (
+    <span className="px bad" title={info.reason ?? ""}>
+      <span className="dot" />
+      代理失败，预览读原片
+    </span>
   );
 }

@@ -868,3 +868,80 @@
     transition-duration: 0.001s !important;
   }
 }
+
+/* ---------- 缩略图条 ---------- */
+.ed .clip .strip {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: 100%;
+  display: block;
+  pointer-events: none;
+  opacity: 0.92;
+}
+
+/* ---------- 代理状态徽标 ---------- */
+.ed .px {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  padding: 1px 5px;
+  border-radius: 100px;
+  border: 1px solid;
+  letter-spacing: 0.02em;
+}
+.ed .px.ok {
+  color: var(--ok);
+  border-color: rgba(87, 168, 122, 0.4);
+  background: rgba(87, 168, 122, 0.09);
+}
+.ed .px.work {
+  color: var(--kerf);
+  border-color: rgba(232, 163, 61, 0.38);
+  background: var(--kerf-glow);
+}
+.ed .px.wait {
+  color: var(--tx-faint);
+  border-color: var(--line-2);
+}
+.ed .px.bad {
+  color: var(--bad);
+  border-color: rgba(200, 86, 78, 0.4);
+  background: rgba(200, 86, 78, 0.08);
+}
+.ed .dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
+}
+.ed .dot.pulse {
+  animation: kerf-pulse 1.4s ease-in-out infinite;
+}
+@keyframes kerf-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+.ed .mini-bar {
+  display: block;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--line);
+  overflow: hidden;
+  margin-top: 4px;
+}
+.ed .mini-bar i {
+  display: block;
+  height: 100%;
+  background: var(--kerf);
+  border-radius: 2px;
+}
