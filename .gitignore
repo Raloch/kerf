@@ -1,0 +1,38 @@
+# 依赖
+node_modules/
+.pnpm-store/
+
+# 构建产物
+dist/
+build/
+.vite/
+*.tsbuildinfo
+
+# 环境变量
+.env
+.env.*
+!.env.example
+
+# 测试与工具产物
+coverage/
+.playwright-mcp/
+playwright-report/
+test-results/
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+*.swp
+
+# 日志
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# 本地媒体素材（剪辑器测试用的大文件不要进仓库）
+/samples/
+*.mp4
+*.mov
+*.wav
+*.mp3
+!design/**/*.svg

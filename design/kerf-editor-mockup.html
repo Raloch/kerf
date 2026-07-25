@@ -1,0 +1,1437 @@
+<meta charset="utf-8">
+<title>Kerf · 浏览器剪辑器界面设计稿</title>
+
+<style>
+/* ============================================================
+   Kerf — 界面设计稿
+   页面框架跟随浏览者主题；剪辑器外壳固定深色（真实 NLE 的选择）
+   ============================================================ */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+:root {
+  /* 页面框架 —— 随主题变化 */
+  --page-bg:      #EEF1F1;
+  --page-panel:   #FFFFFF;
+  --page-text:    #161C1E;
+  --page-muted:   #5C6B70;
+  --page-line:    #D2D9D9;
+  --page-line-2:  #E2E7E7;
+
+  /* 剪辑器外壳 —— 恒定深色 */
+  --ink:      #0E1214;
+  --panel:    #161B1E;
+  --panel-2:  #1D2327;
+  --panel-3:  #232B2F;
+  --line:     #2A3237;
+  --line-2:   #384349;
+  --tx:       #E4E8E9;
+  --tx-dim:   #8B979C;
+  --tx-faint: #5F6C71;
+
+  /* 强调色：黄铜锯屑 —— 只用于播放头 / 选中 / 主操作 */
+  --kerf:      #E8A33D;
+  --kerf-soft: #8A6224;
+  --kerf-glow: rgba(232,163,61,.18);
+
+  /* 片段类型色 */
+  --c-video: #33586A;
+  --c-video-hi: #4B7B90;
+  --c-audio: #46614F;
+  --c-audio-hi: #648A70;
+  --c-text:  #4A5580;
+  --c-text-hi: #6C79A8;
+  --c-image: #6A5470;
+  --c-image-hi: #8E7396;
+
+  /* 语义色 —— 与强调色分离 */
+  --ok:   #57A87A;
+  --warn: #7FA3B8;
+  --bad:  #C8564E;
+
+  /* 字体 */
+  --ui: "Avenir Next", Avenir, "Segoe UI", system-ui, -apple-system, "Helvetica Neue", sans-serif;
+  --mono: "SF Mono", "JetBrains Mono", "IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace;
+  --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+
+  --r: 5px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --page-bg:     #0B0E0F;
+    --page-panel:  #141819;
+    --page-text:   #DFE4E4;
+    --page-muted:  #8B979C;
+    --page-line:   #262D2F;
+    --page-line-2: #1C2223;
+  }
+}
+:root[data-theme="dark"] {
+  --page-bg:     #0B0E0F;
+  --page-panel:  #141819;
+  --page-text:   #DFE4E4;
+  --page-muted:  #8B979C;
+  --page-line:   #262D2F;
+  --page-line-2: #1C2223;
+}
+:root[data-theme="light"] {
+  --page-bg:     #EEF1F1;
+  --page-panel:  #FFFFFF;
+  --page-text:   #161C1E;
+  --page-muted:  #5C6B70;
+  --page-line:   #D2D9D9;
+  --page-line-2: #E2E7E7;
+}
+
+body {
+  margin: 0;
+  background: var(--page-bg);
+  color: var(--page-text);
+  font-family: var(--ui);
+  font-size: 15px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+.wrap { max-width: 1560px; margin: 0 auto; padding: 34px 26px 90px; }
+
+/* ---------- 文档页眉 ---------- */
+.doc-head { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 22px; justify-content: space-between; padding-bottom: 18px; border-bottom: 1px solid var(--page-line); }
+.doc-head h1 { margin: 0; font-size: 25px; font-weight: 600; letter-spacing: -.015em; text-wrap: balance; }
+.doc-head h1 .sub { color: var(--page-muted); font-weight: 400; }
+.doc-meta { display: flex; gap: 8px; flex-wrap: wrap; }
+.doc-tag { font-family: var(--mono); font-size: 11px; letter-spacing: .04em; text-transform: uppercase; color: var(--page-muted); border: 1px solid var(--page-line); border-radius: 100px; padding: 4px 10px; }
+.doc-lead { margin: 16px 0 0; max-width: 66ch; color: var(--page-muted); font-family: var(--serif); font-size: 16px; }
+
+/* ---------- 状态切换 ---------- */
+.states { display: flex; flex-wrap: wrap; gap: 6px; margin: 22px 0 12px; }
+.state-btn {
+  font: inherit; font-size: 13px; cursor: pointer;
+  background: transparent; color: var(--page-muted);
+  border: 1px solid var(--page-line); border-radius: 100px;
+  padding: 7px 15px; display: inline-flex; align-items: baseline; gap: 8px;
+  transition: color .16s, border-color .16s, background .16s;
+}
+.state-btn:hover { color: var(--page-text); border-color: var(--page-muted); }
+.state-btn[aria-selected="true"] { background: var(--kerf); border-color: var(--kerf); color: #17120A; font-weight: 600; }
+.state-btn .n { font-family: var(--mono); font-size: 10.5px; opacity: .65; }
+.state-note { font-family: var(--serif); font-size: 15px; color: var(--page-muted); margin: 0 0 16px; max-width: 74ch; min-height: 1.6em; }
+
+/* ============================================================
+   剪辑器外壳
+   ============================================================ */
+.ed {
+  --pxf: 0.42;          /* 每帧像素数，由缩放控制 */
+  --head-w: 132px;
+  background: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  overflow: hidden;
+  color: var(--tx);
+  font-size: 12px;
+  position: relative;
+  box-shadow: 0 22px 60px -30px rgba(0,0,0,.65), 0 2px 8px rgba(0,0,0,.25);
+}
+.ed, .ed * { font-family: var(--ui); }
+.ed *::-webkit-scrollbar { width: 9px; height: 9px; }
+.ed *::-webkit-scrollbar-track { background: var(--ink); }
+.ed *::-webkit-scrollbar-thumb { background: var(--line-2); border-radius: 5px; border: 2px solid var(--ink); }
+.ed *::-webkit-scrollbar-thumb:hover { background: var(--tx-faint); }
+.ed * { scrollbar-width: thin; scrollbar-color: var(--line-2) var(--ink); }
+.ed .m, .ed .tc { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+/* ---------- 顶栏 ---------- */
+.ed-top { display: flex; align-items: center; gap: 14px; height: 46px; padding: 0 12px; background: var(--panel); border-bottom: 1px solid var(--line); }
+.brand { display: flex; align-items: center; gap: 9px; padding-right: 12px; border-right: 1px solid var(--line); height: 24px; }
+.mark { width: 15px; height: 19px; flex: none; }
+.brand b { font-size: 14px; letter-spacing: .06em; font-weight: 600; }
+.proj { display: flex; flex-direction: column; line-height: 1.25; min-width: 0; }
+.proj .name { font-size: 12.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.proj .save { font-size: 10.5px; color: var(--tx-faint); }
+.spacer { flex: 1 1 auto; }
+
+.ico-row { display: flex; gap: 2px; align-items: center; }
+.ib { width: 27px; height: 27px; border: 0; border-radius: 4px; background: transparent; color: var(--tx-dim); display: grid; place-items: center; cursor: pointer; padding: 0; transition: background .14s, color .14s; }
+.ib:hover { background: var(--panel-3); color: var(--tx); }
+.ib[aria-pressed="true"] { background: var(--kerf-glow); color: var(--kerf); }
+.ib svg { width: 15px; height: 15px; }
+.ib.sm { width: 23px; height: 23px; } .ib.sm svg { width: 13px; height: 13px; }
+.ib:disabled { opacity: .3; cursor: default; }
+
+.chip { font-family: var(--mono); font-size: 10.5px; color: var(--tx-dim); background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px; padding: 4px 8px; letter-spacing: .02em; white-space: nowrap; }
+.btn-primary {
+  font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer;
+  background: var(--kerf); color: #17120A; border: 0; border-radius: var(--r);
+  padding: 7px 16px; display: inline-flex; align-items: center; gap: 7px;
+  transition: filter .14s;
+}
+.btn-primary:hover { filter: brightness(1.08); }
+.btn-primary svg { width: 14px; height: 14px; }
+.btn-ghost { font: inherit; font-size: 12.5px; cursor: pointer; background: var(--panel-2); color: var(--tx); border: 1px solid var(--line-2); border-radius: var(--r); padding: 7px 15px; transition: background .14s; }
+.btn-ghost:hover { background: var(--panel-3); }
+
+/* ---------- 降级横幅 ---------- */
+.banner { display: none; align-items: flex-start; gap: 10px; padding: 9px 14px; background: rgba(127,163,184,.09); border-bottom: 1px solid rgba(127,163,184,.3); font-size: 12px; line-height: 1.5; }
+.ed[data-fallback="1"] .banner { display: flex; }
+.banner svg { width: 15px; height: 15px; color: var(--warn); flex: none; margin-top: 1px; }
+.banner b { color: var(--tx); }
+.banner span { color: var(--tx-dim); }
+.banner .lnk { color: var(--warn); text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+
+/* ---------- 主体三栏 ---------- */
+.ed-body { display: grid; grid-template-columns: 232px minmax(0,1fr) 248px; height: 428px; overflow: hidden; }
+.pane { background: var(--panel); display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.pane.left { border-right: 1px solid var(--line); }
+.pane.right { border-left: 1px solid var(--line); }
+.pane-hd { display: flex; align-items: center; gap: 6px; height: 31px; padding: 0 10px; border-bottom: 1px solid var(--line); flex: none; }
+.pane-hd h3 { margin: 0; font-size: 10.5px; letter-spacing: .09em; text-transform: uppercase; color: var(--tx-faint); font-weight: 600; }
+
+/* 素材库 */
+.tabs { display: flex; gap: 1px; padding: 7px 7px 0; flex: none; }
+.tab { font: inherit; font-size: 11px; cursor: pointer; background: transparent; border: 0; border-bottom: 2px solid transparent; color: var(--tx-faint); padding: 5px 8px 6px; transition: color .14s; }
+.tab:hover { color: var(--tx-dim); }
+.tab[aria-selected="true"] { color: var(--tx); border-bottom-color: var(--kerf); }
+.search { margin: 8px 8px 4px; flex: none; position: relative; }
+.search input { width: 100%; font: inherit; font-size: 11.5px; background: var(--ink); border: 1px solid var(--line); border-radius: 4px; color: var(--tx); padding: 6px 8px 6px 26px; }
+.search input::placeholder { color: var(--tx-faint); }
+.search svg { position: absolute; left: 8px; top: 7px; width: 13px; height: 13px; color: var(--tx-faint); pointer-events: none; }
+.assets { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 4px 8px 10px; display: flex; flex-direction: column; gap: 4px; }
+.asset { display: grid; grid-template-columns: 56px 1fr; gap: 9px; padding: 5px; border-radius: 5px; cursor: grab; align-items: center; transition: background .14s; }
+.asset:hover { background: var(--panel-2); }
+.asset .thumb { position: relative; aspect-ratio: 16/9; border-radius: 3px; overflow: hidden; background: var(--ink); }
+.asset .thumb canvas { width: 100%; height: 100%; display: block; }
+.asset .dur { position: absolute; right: 2px; bottom: 2px; font-family: var(--mono); font-size: 8.5px; background: rgba(0,0,0,.72); padding: 1px 3px; border-radius: 2px; color: #D8DEDF; }
+.asset .nm { font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.asset .meta { font-family: var(--mono); font-size: 10px; color: var(--tx-faint); display: flex; align-items: center; gap: 5px; margin-top: 2px; }
+.px { display: inline-flex; align-items: center; gap: 4px; font-family: var(--mono); font-size: 9.5px; padding: 1px 5px; border-radius: 100px; border: 1px solid; letter-spacing: .02em; }
+.px.ok   { color: var(--ok);   border-color: rgba(87,168,122,.4);  background: rgba(87,168,122,.09); }
+.px.work { color: var(--kerf); border-color: rgba(232,163,61,.38); background: var(--kerf-glow); }
+.px.wait { color: var(--tx-faint); border-color: var(--line-2); }
+.dot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; flex: none; }
+.dot.pulse { animation: pulse 1.4s ease-in-out infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
+.mini-bar { height: 2px; border-radius: 2px; background: var(--line); overflow: hidden; margin-top: 5px; }
+.mini-bar i { display: block; height: 100%; background: var(--kerf); border-radius: 2px; }
+.imp-only { display: none; }
+.ed[data-import="1"] .imp-only { display: grid; }
+
+/* 预览区 */
+.stage { background: var(--ink); display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
+.stage-wrap { flex: 1 1 auto; min-height: 0; overflow: hidden; display: flex; align-items: center; justify-content: center; padding: 13px; }
+.screen { position: relative; flex: 0 1 auto; height: 100%; width: auto; max-width: 100%; aspect-ratio: 16/9; background: #000; border-radius: 3px; overflow: hidden; box-shadow: 0 0 0 1px var(--line), 0 10px 30px -14px rgba(0,0,0,.9); }
+.screen canvas { width: 100%; height: 100%; display: block; }
+.stage-bar { flex: none; display: flex; align-items: center; gap: 8px; height: 34px; padding: 0 10px; border-top: 1px solid var(--line); background: var(--panel); }
+.tc { font-size: 12px; letter-spacing: .02em; }
+.tc b { color: var(--tx); font-weight: 600; }
+.tc span { color: var(--tx-faint); }
+.transport { display: flex; align-items: center; gap: 1px; }
+.transport .ib.play { width: 31px; height: 31px; background: var(--panel-3); color: var(--tx); }
+.transport .ib.play:hover { background: var(--line-2); }
+
+/* 检查器 */
+.insp { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+.insp-hd { padding: 9px 11px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 8px; }
+.swatch { width: 3px; height: 24px; border-radius: 2px; flex: none; }
+.insp-hd .t { min-width: 0; }
+.insp-hd .t .n { font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.insp-hd .t .s { font-family: var(--mono); font-size: 10px; color: var(--tx-faint); }
+.grp { border-bottom: 1px solid var(--line-2); }
+.grp > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 6px; padding: 8px 11px; font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--tx-dim); font-weight: 600; }
+.grp > summary::-webkit-details-marker { display: none; }
+.grp > summary svg { width: 10px; height: 10px; transition: transform .16s; color: var(--tx-faint); }
+.grp[open] > summary svg { transform: rotate(90deg); }
+.grp .fields { padding: 2px 11px 12px; display: flex; flex-direction: column; gap: 8px; }
+.f { display: grid; grid-template-columns: 60px 1fr; align-items: center; gap: 8px; }
+.f > label { font-size: 10.5px; line-height: 1.3; color: var(--tx-dim); }
+.num-pair { display: flex; gap: 5px; }
+.num { flex: 1 1 0; min-width: 0; font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 11px; background: var(--ink); border: 1px solid var(--line); border-radius: 4px; color: var(--tx); padding: 4px 6px; text-align: right; }
+.num:focus-visible, .search input:focus-visible { outline: 2px solid var(--kerf); outline-offset: 1px; border-color: var(--kerf); }
+.slide { display: flex; align-items: center; gap: 8px; }
+input[type="range"] { -webkit-appearance: none; appearance: none; flex: 1 1 auto; height: 3px; border-radius: 3px; background: var(--line-2); }
+input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 11px; height: 11px; border-radius: 50%; background: var(--tx); border: 0; cursor: pointer; }
+input[type="range"]::-moz-range-thumb { width: 11px; height: 11px; border-radius: 50%; background: var(--tx); border: 0; cursor: pointer; }
+input[type="range"]:focus-visible { outline: 2px solid var(--kerf); outline-offset: 3px; }
+.val { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 10.5px; color: var(--tx-dim); width: 38px; text-align: right; flex: none; }
+.kf-row { display: grid; grid-template-columns: 60px 1fr; gap: 8px; align-items: center; }
+.kf-track { position: relative; height: 18px; background: var(--ink); border: 1px solid var(--line); border-radius: 3px; }
+.kf { position: absolute; top: 50%; width: 7px; height: 7px; background: var(--kerf); transform: translate(-50%,-50%) rotate(45deg); border-radius: 1px; }
+.kf.hollow { background: transparent; border: 1.5px solid var(--kerf-soft); }
+.seg { display: flex; background: var(--ink); border: 1px solid var(--line); border-radius: 4px; padding: 2px; gap: 2px; }
+.seg button { flex: 1 1 0; font: inherit; font-size: 10.5px; cursor: pointer; background: transparent; border: 0; border-radius: 3px; color: var(--tx-dim); padding: 3px 0; }
+.seg button[aria-pressed="true"] { background: var(--panel-3); color: var(--tx); }
+.lut-row { display: flex; gap: 5px; }
+.lut { flex: 1 1 0; aspect-ratio: 16/10; border-radius: 3px; border: 1.5px solid transparent; cursor: pointer; }
+.lut[aria-pressed="true"] { border-color: var(--kerf); }
+.hint { font-size: 10.5px; color: var(--tx-faint); line-height: 1.45; }
+
+/* ---------- 时间轴 ---------- */
+.tl { border-top: 1px solid var(--line); background: var(--panel); }
+.tl-bar { display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 10px; border-bottom: 1px solid var(--line); }
+.tl-bar .sep { width: 1px; height: 17px; background: var(--line); }
+.zoom { display: flex; align-items: center; gap: 7px; width: 150px; }
+.tl-scroll { overflow-x: auto; overflow-y: hidden; }
+.tl-inner { min-width: 100%; width: max-content; }
+
+.ruler { position: relative; height: 25px; display: grid; grid-template-columns: var(--head-w) 1fr; border-bottom: 1px solid var(--line); background: var(--panel-2); }
+.ruler .rh { border-right: 1px solid var(--line); display: flex; align-items: center; padding-left: 10px; }
+.ruler .rh span { font-family: var(--mono); font-size: 9.5px; color: var(--tx-faint); letter-spacing: .06em; }
+.ticks { position: relative; cursor: ew-resize; }
+.tick { position: absolute; bottom: 0; width: 1px; background: var(--line-2); }
+.tick.maj { height: 10px; } .tick.min { height: 5px; }
+.tick-lbl { position: absolute; top: 3px; font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 9.5px; color: var(--tx-faint); transform: translateX(3px); pointer-events: none; }
+.io { position: absolute; top: 0; bottom: 0; background: var(--kerf-glow); pointer-events: none; }
+.io::before, .io::after { content: ""; position: absolute; top: 0; bottom: 0; width: 2px; background: var(--kerf-soft); }
+.io::before { left: 0; } .io::after { right: 0; }
+
+.tracks { position: relative; }
+.trk { display: grid; grid-template-columns: var(--head-w) 1fr; border-bottom: 1px solid var(--line-2); }
+.trk:last-child { border-bottom: 0; }
+.th { border-right: 1px solid var(--line); background: var(--panel-2); display: flex; align-items: center; gap: 5px; padding: 0 6px 0 9px; }
+.th .lb { flex: 1 1 auto; min-width: 0; }
+.th .lb .k { font-family: var(--mono); font-size: 10px; color: var(--tx-dim); letter-spacing: .04em; }
+.th .lb .d { font-size: 10px; color: var(--tx-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lane { position: relative; background:
+  repeating-linear-gradient(to right, transparent 0, transparent calc(var(--pxf) * 30 - 1px), rgba(255,255,255,.028) calc(var(--pxf) * 30 - 1px), rgba(255,255,255,.028) calc(var(--pxf) * 30));
+}
+.trk.h-text .lane, .trk.h-text .th { height: 37px; }
+.trk.h-vid  .lane, .trk.h-vid  .th { height: 54px; }
+.trk.h-ovl  .lane, .trk.h-ovl  .th { height: 39px; }
+.trk.h-aud  .lane, .trk.h-aud  .th { height: 44px; }
+
+.clip { position: absolute; top: 3px; bottom: 3px; border-radius: 4px; overflow: hidden; cursor: pointer; border: 1px solid rgba(0,0,0,.45); background: var(--fill); }
+.clip::after { content: ""; position: absolute; inset: 0; border-radius: 3px; box-shadow: inset 0 1px 0 rgba(255,255,255,.09); pointer-events: none; }
+.clip:hover { filter: brightness(1.14); }
+.clip[aria-selected="true"] { outline: 1.5px solid var(--kerf); outline-offset: -1px; z-index: 3; box-shadow: 0 0 0 3px var(--kerf-glow); }
+.clip .lbl { position: absolute; left: 0; right: 0; top: 0; height: 15px; display: flex; align-items: center; gap: 4px; padding: 0 5px; font-size: 10px; color: rgba(255,255,255,.94); background: var(--band); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; z-index: 2; }
+.clip .lbl svg { width: 9px; height: 9px; flex: none; opacity: .85; }
+.clip canvas { position: absolute; left: 0; bottom: 0; width: 100%; display: block; }
+.clip .fx { position: absolute; left: 3px; bottom: 2px; max-width: calc(100% - 6px); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-family: var(--mono); font-size: 9px; line-height: 1.5; color: rgba(255,255,255,.82); background: rgba(0,0,0,.45); padding: 0 4px; border-radius: 3px; z-index: 3; }
+.clip .grip { position: absolute; top: 0; bottom: 0; width: 5px; z-index: 4; }
+.clip .grip.l { left: 0; cursor: w-resize; } .clip .grip.r { right: 0; cursor: e-resize; }
+.clip:hover .grip::before { content: ""; position: absolute; top: 4px; bottom: 4px; left: 1.5px; width: 2px; border-radius: 2px; background: rgba(255,255,255,.55); }
+.clip .txt-body { position: absolute; inset: 17px 5px 2px; font-size: 9.5px; line-height: 1.5; color: rgba(255,255,255,.68); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+
+.trans { position: absolute; top: 3px; bottom: 3px; z-index: 4; display: grid; place-items: center; background: linear-gradient(90deg, rgba(232,163,61,.05), rgba(232,163,61,.3), rgba(232,163,61,.05)); border-left: 1px solid var(--kerf-soft); border-right: 1px solid var(--kerf-soft); cursor: pointer; }
+.trans svg { width: 11px; height: 11px; color: var(--kerf); }
+.trans:hover { background: linear-gradient(90deg, rgba(232,163,61,.1), rgba(232,163,61,.45), rgba(232,163,61,.1)); }
+
+.playhead { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--kerf); z-index: 20; pointer-events: none; box-shadow: 0 0 7px rgba(232,163,61,.55); }
+#phRl::before { content: ""; position: absolute; top: 0; left: -5px; width: 11px; height: 9px; background: var(--kerf); clip-path: polygon(0 0, 100% 0, 100% 55%, 50% 100%, 0 55%); }
+.ph-layer { position: absolute; top: 0; bottom: 0; left: var(--head-w); right: 0; pointer-events: none; }
+
+/* ---------- 状态栏 ---------- */
+.ed-foot { display: flex; align-items: center; gap: 12px; height: 27px; padding: 0 11px; background: var(--panel-2); border-top: 1px solid var(--line); font-family: var(--mono); font-size: 10px; color: var(--tx-faint); }
+.ed-foot .sel { color: var(--tx-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.caps { display: flex; gap: 10px; flex: none; }
+.caps i { font-style: normal; display: inline-flex; align-items: center; gap: 4px; }
+.caps i.y { color: var(--ok); } .caps i.n { color: var(--bad); }
+
+/* ---------- 导出对话框 ---------- */
+.scrim { position: absolute; inset: 0; background: rgba(6,9,10,.62); backdrop-filter: blur(1.5px); display: none; place-items: center; z-index: 60; padding: 20px; }
+.ed[data-export="1"] .scrim, .ed[data-export="2"] .scrim, .ed[data-export="3"] .scrim { display: grid; }
+.dlg { width: min(660px, 100%); background: var(--panel); border: 1px solid var(--line-2); border-radius: 8px; box-shadow: 0 30px 80px -20px rgba(0,0,0,.85); overflow: hidden; }
+.dlg-hd { display: flex; align-items: center; gap: 9px; padding: 13px 16px; border-bottom: 1px solid var(--line); }
+.dlg-hd h2 { margin: 0; font-size: 14px; font-weight: 600; }
+.dlg-hd .ib { margin-left: auto; }
+.dlg-body { padding: 16px; }
+.two { display: grid; grid-template-columns: 1fr 232px; gap: 18px; }
+.fld { margin-bottom: 13px; }
+.fld > .k { font-size: 10.5px; letter-spacing: .07em; text-transform: uppercase; color: var(--tx-faint); font-weight: 600; margin-bottom: 6px; }
+.opt { display: flex; flex-direction: column; gap: 5px; }
+.o { display: grid; grid-template-columns: 14px 1fr auto; gap: 9px; align-items: center; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--r); background: var(--ink); cursor: pointer; font-size: 12px; transition: border-color .14s, background .14s; }
+.o:hover { border-color: var(--line-2); }
+.o[aria-checked="true"] { border-color: var(--kerf); background: var(--kerf-glow); }
+.o .radio { width: 13px; height: 13px; border-radius: 50%; border: 1.5px solid var(--line-2); position: relative; }
+.o[aria-checked="true"] .radio { border-color: var(--kerf); }
+.o[aria-checked="true"] .radio::after { content: ""; position: absolute; inset: 2.5px; border-radius: 50%; background: var(--kerf); }
+.o .sub { display: block; font-family: var(--mono); font-size: 10px; color: var(--tx-faint); margin-top: 2px; }
+/* 不可用 ≠ 整体压暗到看不清：主标签降级，但"为什么不可用"必须保持可读 */
+.o[data-off="1"] { cursor: not-allowed; background: rgba(0,0,0,.22); border-color: var(--line); }
+.o[data-off="1"]:hover { border-color: var(--line); }
+.o[data-off="1"] > span:nth-child(2) { color: var(--tx-faint); }
+.o[data-off="1"] .radio { opacity: .35; }
+.o .why { display: block; font-family: var(--mono); font-size: 10px; line-height: 1.55; color: var(--warn); margin-top: 3px; }
+.o .whylink { color: var(--kerf); text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+.o .whylink:hover { filter: brightness(1.15); }
+.o .tago { font-family: var(--mono); font-size: 9.5px; color: var(--tx-faint); border: 1px solid var(--line-2); border-radius: 100px; padding: 1px 6px; white-space: nowrap; }
+.o .tagn { font-family: var(--mono); font-size: 9.5px; color: var(--bad); border: 1px solid rgba(200,86,78,.4); border-radius: 100px; padding: 1px 6px; }
+.o .tagr { font-family: var(--mono); font-size: 9.5px; color: var(--kerf); border: 1px solid rgba(232,163,61,.4); border-radius: 100px; padding: 1px 6px; }
+.row2 { display: grid; grid-template-columns: 1.16fr .84fr; gap: 9px; }
+.sel-box { width: 100%; font: inherit; font-size: 11.5px; font-family: var(--mono); background: var(--ink); color: var(--tx); border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px; }
+.path { display: flex; gap: 6px; align-items: center; }
+.path .p { flex: 1 1 auto; min-width: 0; font-family: var(--mono); font-size: 11px; color: var(--tx-dim); background: var(--ink); border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.card { background: var(--ink); border: 1px solid var(--line); border-radius: var(--r); padding: 12px; }
+.card .ttl { font-size: 10.5px; letter-spacing: .07em; text-transform: uppercase; color: var(--tx-faint); font-weight: 600; margin-bottom: 9px; }
+.cap-list { display: flex; flex-direction: column; gap: 6px; }
+.cap { display: flex; align-items: center; gap: 7px; font-family: var(--mono); font-size: 10.5px; color: var(--tx-dim); }
+.cap .s { width: 12px; flex: none; display: grid; place-items: center; }
+.cap .s svg { width: 11px; height: 11px; }
+.cap.y .s { color: var(--ok); } .cap.n .s { color: var(--bad); } .cap.w .s { color: var(--warn); }
+.cap em { font-style: normal; margin-left: auto; color: var(--tx-faint); }
+.est { margin-top: 11px; padding-top: 11px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 5px; }
+.est div { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 10.5px; color: var(--tx-faint); }
+.est div b { color: var(--tx); font-weight: 600; }
+.dlg-foot { display: flex; align-items: center; gap: 9px; padding: 12px 16px; border-top: 1px solid var(--line); background: var(--panel-2); }
+.dlg-foot .note { font-size: 10.5px; color: var(--tx-faint); flex: 1 1 auto; }
+
+.ex-stage { display: none; }
+.ed[data-export="1"] .ex-set,  .ed[data-export="2"] .ex-run,  .ed[data-export="3"] .ex-done { display: block; }
+.bar { height: 5px; border-radius: 3px; background: var(--line); overflow: hidden; }
+.bar i { display: block; height: 100%; background: var(--kerf); border-radius: 3px; transition: width .3s linear; }
+.stages { display: flex; gap: 0; margin: 15px 0 4px; }
+.stg { flex: 1 1 0; text-align: center; font-size: 10.5px; color: var(--tx-faint); position: relative; padding-top: 15px; }
+.stg::before { content: ""; position: absolute; top: 4px; left: 50%; transform: translateX(-50%); width: 8px; height: 8px; border-radius: 50%; background: var(--line-2); }
+.stg::after { content: ""; position: absolute; top: 7.5px; left: 50%; width: 100%; height: 1px; background: var(--line); }
+.stg:last-child::after { display: none; }
+.stg[data-on="1"] { color: var(--tx); }
+.stg[data-on="1"]::before { background: var(--kerf); box-shadow: 0 0 0 3px var(--kerf-glow); }
+.stg[data-done="1"]::before { background: var(--kerf-soft); }
+.stg[data-done="1"]::after { background: var(--kerf-soft); }
+.run-nums { display: grid; grid-template-columns: repeat(4,1fr); gap: 10px; margin-top: 16px; }
+.rn { background: var(--ink); border: 1px solid var(--line); border-radius: var(--r); padding: 9px 10px; }
+.rn .k { font-size: 9.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--tx-faint); }
+.rn .v { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 15px; color: var(--tx); margin-top: 3px; }
+.rn .v small { font-size: 10px; color: var(--tx-faint); }
+.done-wrap { display: flex; gap: 14px; align-items: center; }
+.done-ic { width: 38px; height: 38px; border-radius: 50%; background: rgba(87,168,122,.13); color: var(--ok); display: grid; place-items: center; flex: none; }
+.done-ic svg { width: 19px; height: 19px; }
+
+/* ---------- 吐司 ---------- */
+.toast { position: absolute; right: 14px; bottom: 40px; z-index: 70; display: none; align-items: center; gap: 10px; background: var(--panel-3); border: 1px solid var(--line-2); border-radius: 7px; padding: 10px 13px; box-shadow: 0 14px 40px -14px rgba(0,0,0,.8); font-size: 11.5px; max-width: 300px; }
+.ed[data-import="1"] .toast { display: flex; }
+.toast .sp { width: 15px; height: 15px; flex: none; border-radius: 50%; border: 2px solid var(--line-2); border-top-color: var(--kerf); animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.toast b { display: block; color: var(--tx); font-weight: 600; }
+.toast span { color: var(--tx-faint); font-family: var(--mono); font-size: 10px; }
+
+/* ============================================================
+   文档说明区
+   ============================================================ */
+.notes { margin-top: 54px; display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 34px 44px; }
+.notes > .full { grid-column: 1 / -1; }
+.notes h2 { font-size: 12px; letter-spacing: .1em; text-transform: uppercase; color: var(--page-muted); font-weight: 600; margin: 0 0 14px; padding-bottom: 8px; border-bottom: 1px solid var(--page-line); }
+.notes p, .notes li { font-family: var(--serif); font-size: 15.5px; }
+.notes p { margin: 0 0 12px; max-width: 62ch; }
+.q-list { list-style: none; margin: 0; padding: 0; counter-reset: q; display: flex; flex-direction: column; gap: 12px; }
+.q-list li { display: grid; grid-template-columns: 22px 1fr; gap: 12px; }
+.q-list li::before { counter-increment: q; content: counter(q); font-family: var(--mono); font-size: 11px; color: var(--kerf); border: 1px solid var(--page-line); border-radius: 50%; width: 22px; height: 22px; display: grid; place-items: center; margin-top: 3px; }
+.q-list li > b, .q-list li > span { grid-column: 2; }   /* 不指定就掉进隐式第三列被压成 0 宽 */
+.q-list b { font-family: var(--ui); font-size: 14px; display: block; }
+.q-list span { display: block; color: var(--page-muted); margin-top: 2px; }
+.tbl-wrap { overflow-x: auto; }
+/* color/font 显式继承：本地无 doctype 时浏览器走 quirks 模式，表格默认不继承父级文字颜色 */
+table { border-collapse: collapse; width: 100%; font-size: 13.5px; min-width: 520px; color: inherit; font-family: inherit; }
+th, td { text-align: left; padding: 8px 12px 8px 0; border-bottom: 1px solid var(--page-line-2); vertical-align: top; color: inherit; }
+th { font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--page-muted); font-weight: 600; border-bottom-color: var(--page-line); }
+td.who { color: var(--page-text); }
+td.who { font-family: var(--mono); font-size: 11.5px; white-space: nowrap; }
+td.who.self { color: var(--kerf); }
+.scope { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 4px; }
+.scope span { font-family: var(--mono); font-size: 11px; color: var(--page-muted); border: 1px dashed var(--page-line); border-radius: 4px; padding: 4px 9px; }
+.legend { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 14px; }
+.lg { display: flex; align-items: center; gap: 7px; font-family: var(--mono); font-size: 11px; color: var(--page-muted); }
+.lg i { width: 13px; height: 13px; border-radius: 3px; display: block; }
+
+@media (max-width: 1080px) {
+  .ed-body { grid-template-columns: 1fr; height: auto; }
+  .pane.left, .pane.right { display: none; }
+  .stage { height: 300px; }
+  .two { grid-template-columns: 1fr; }
+  .run-nums { grid-template-columns: repeat(2,1fr); }
+  .notes { grid-template-columns: 1fr; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .001s !important; transition-duration: .001s !important; }
+}
+</style>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-mark" viewBox="0 0 15 19"><path d="M3 0v19M12 0v19" stroke="currentColor" stroke-width="2.4"/><path d="M6.6 3.5l1.8 12" stroke="currentColor" stroke-width="1.1" opacity=".55"/></symbol>
+    <symbol id="i-undo" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3 7h7.5a3.5 3.5 0 010 7H7"/><path d="M6 4L3 7l3 3"/></symbol>
+    <symbol id="i-redo" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M13 7H5.5a3.5 3.5 0 000 7H9"/><path d="M10 4l3 3-3 3"/></symbol>
+    <symbol id="i-play" viewBox="0 0 16 16"><path d="M4.5 3l8 5-8 5z" fill="currentColor"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 16 16"><path d="M4.5 3h2.5v10H4.5zM9 3h2.5v10H9z" fill="currentColor"/></symbol>
+    <symbol id="i-prev" viewBox="0 0 16 16"><path d="M11 3v10L4 8z" fill="currentColor"/><path d="M3 3v10" stroke="currentColor" stroke-width="1.4"/></symbol>
+    <symbol id="i-next" viewBox="0 0 16 16"><path d="M5 3v10l7-5z" fill="currentColor"/><path d="M13 3v10" stroke="currentColor" stroke-width="1.4"/></symbol>
+    <symbol id="i-eye" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M1.5 8S4 4 8 4s6.5 4 6.5 4-2.5 4-6.5 4S1.5 8 1.5 8z"/><circle cx="8" cy="8" r="1.7"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="3.5" y="7" width="9" height="6.5" rx="1.2"/><path d="M5.6 7V5.2a2.4 2.4 0 014.8 0V7"/></symbol>
+    <symbol id="i-vol" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M8 3L4.8 5.8H2.5v4.4h2.3L8 13z" stroke-linejoin="round"/><path d="M10.6 6a3 3 0 010 4"/></symbol>
+    <symbol id="i-mute" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M8 3L4.8 5.8H2.5v4.4h2.3L8 13z" stroke-linejoin="round"/><path d="M10.5 6.5l3 3M13.5 6.5l-3 3" stroke-linecap="round"/></symbol>
+    <symbol id="i-magnet" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M4 3v5a4 4 0 008 0V3"/><path d="M4 6.4h3.6M8.4 6.4H12"/></symbol>
+    <symbol id="i-cut" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="4.2" cy="12" r="1.9"/><circle cx="11.8" cy="12" r="1.9"/><path d="M5.4 10.6L11 2.5M10.6 10.6L5 2.5"/></symbol>
+    <symbol id="i-search" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="7" cy="7" r="4.3"/><path d="M10.3 10.3L14 14" stroke-linecap="round"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M8 3.5v9M3.5 8h9"/></symbol>
+    <symbol id="i-chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3l5 5-5 5"/></symbol>
+    <symbol id="i-x" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M4 4l8 8M12 4l-8 8"/></symbol>
+    <symbol id="i-up" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 13V3.5M4.2 7.3L8 3.5l3.8 3.8"/></symbol>
+    <symbol id="i-check" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5l3.5 3.5L13 4.5"/></symbol>
+    <symbol id="i-no" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7"/></symbol>
+    <symbol id="i-warn" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M8 2.6l5.8 10.2H2.2z" stroke-linejoin="round"/><path d="M8 6.4v3M8 11.2v.1"/></symbol>
+    <symbol id="i-film" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"><rect x="2" y="3.5" width="12" height="9" rx="1"/><path d="M5 3.5v9M11 3.5v9"/></symbol>
+    <symbol id="i-type" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M3.5 4h9M8 4v9"/></symbol>
+    <symbol id="i-img" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"><rect x="2" y="3" width="12" height="10" rx="1.2"/><path d="M2 10.5l3.4-3 3 2.6 2.2-1.8L14 11"/></symbol>
+    <symbol id="i-wave" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"><path d="M2.5 6.5v3M5.2 4.5v7M8 3v10M10.8 5v6M13.5 6.5v3"/></symbol>
+    <symbol id="i-trans" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M2.5 3.5h5v9h-5z"/><path d="M8.5 3.5h5v9h-5z" stroke-dasharray="2 1.6"/></symbol>
+    <symbol id="i-dl" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.5v8M4.6 7.2L8 10.5l3.4-3.3M2.8 13.2h10.4"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M2 4.5h4l1.3 1.6H14v6.4H2z" stroke-linejoin="round"/></symbol>
+  </defs>
+</svg>
+
+<div class="wrap">
+
+  <header class="doc-head">
+    <div>
+      <h1>Kerf <span class="sub">— 浏览器剪辑器界面设计稿</span></h1>
+      <p class="doc-lead">一个应用外壳，四种状态。可以直接操作：拖动标尺或按空格播放，点片段看检查器切换，点右上「导出」走完整个导出流程。</p>
+    </div>
+    <div class="doc-meta">
+      <span class="doc-tag">v1 · 待评审</span>
+      <span class="doc-tag">1920×1080 · 29.97</span>
+      <span class="doc-tag">客户端导出</span>
+    </div>
+  </header>
+
+  <nav class="states" role="tablist" aria-label="界面状态">
+    <button class="state-btn" role="tab" aria-selected="true" data-st="edit">剪辑台 <span class="n">默认</span></button>
+    <button class="state-btn" role="tab" aria-selected="false" data-st="import">素材导入 <span class="n">代理生成中</span></button>
+    <button class="state-btn" role="tab" aria-selected="false" data-st="export">导出 <span class="n">设置</span></button>
+    <button class="state-btn" role="tab" aria-selected="false" data-st="running">导出 <span class="n">进行中</span></button>
+    <button class="state-btn" role="tab" aria-selected="false" data-st="done">导出 <span class="n">完成</span></button>
+    <button class="state-btn" role="tab" aria-selected="false" data-st="fallback">兼容降级 <span class="n">缺 AAC</span></button>
+  </nav>
+  <p class="state-note" id="stateNote">主界面。左素材库、中预览、右检查器、下多轨时间轴——四区固定，不做浮动面板。</p>
+
+  <!-- ================= 剪辑器 ================= -->
+  <div class="ed" id="ed" data-export="0" data-import="0" data-fallback="0">
+
+    <div class="ed-top">
+      <div class="brand">
+        <svg class="mark" style="color:var(--kerf)"><use href="#i-mark"/></svg>
+        <b>KERF</b>
+      </div>
+      <div class="proj">
+        <span class="name">夏日骑行 Vlog EP.07</span>
+        <span class="save">已自动保存 · 14:32</span>
+      </div>
+      <div class="ico-row" style="margin-left:6px">
+        <button class="ib" title="撤销 ⌘Z"><svg><use href="#i-undo"/></svg></button>
+        <button class="ib" title="重做 ⇧⌘Z" disabled><svg><use href="#i-redo"/></svg></button>
+      </div>
+      <div class="spacer"></div>
+      <span class="chip">1920×1080</span>
+      <span class="chip">29.97 fps</span>
+      <button class="btn-primary" id="btnExport"><svg><use href="#i-dl"/></svg>导出</button>
+    </div>
+
+    <div class="banner">
+      <svg><use href="#i-warn"/></svg>
+      <div>
+        <b>这个浏览器不能编码 AAC 音频，导出 MP4 会没有声音。</b>
+        <span>改成导出 WebM（VP9 + Opus），或换 Chrome / Safari 打开。项目和剪辑内容不受影响。</span>
+        <span class="lnk" id="lnkWebm">切换到 WebM</span>
+      </div>
+    </div>
+
+    <!-- ---------- 三栏 ---------- -->
+    <div class="ed-body">
+
+      <!-- 素材库 -->
+      <div class="pane left">
+        <div class="tabs" role="tablist" aria-label="素材类型">
+          <button class="tab" role="tab" aria-selected="true">媒体</button>
+          <button class="tab" role="tab" aria-selected="false">文字</button>
+          <button class="tab" role="tab" aria-selected="false">音频</button>
+          <button class="tab" role="tab" aria-selected="false">转场</button>
+          <button class="tab" role="tab" aria-selected="false">滤镜</button>
+        </div>
+        <div class="search">
+          <svg><use href="#i-search"/></svg>
+          <input type="text" placeholder="搜索素材" aria-label="搜索素材">
+        </div>
+        <div class="assets" id="assets"></div>
+        <div style="flex:none;padding:8px;border-top:1px solid var(--line)">
+          <button class="btn-ghost" style="width:100%;display:flex;align-items:center;justify-content:center;gap:6px">
+            <svg style="width:13px;height:13px"><use href="#i-plus"/></svg>导入素材
+          </button>
+        </div>
+      </div>
+
+      <!-- 预览 -->
+      <div class="stage">
+        <div class="stage-wrap">
+          <div class="screen">
+            <canvas id="prev" width="960" height="540"></canvas>
+          </div>
+        </div>
+        <div class="stage-bar">
+          <div class="transport">
+            <button class="ib" id="btnPrev" title="上一帧 ←"><svg><use href="#i-prev"/></svg></button>
+            <button class="ib play" id="btnPlay" title="播放 / 暂停 空格"><svg id="playIcon"><use href="#i-play"/></svg></button>
+            <button class="ib" id="btnNext" title="下一帧 →"><svg><use href="#i-next"/></svg></button>
+          </div>
+          <div class="tc"><b id="tcNow">00:00:00:00</b> <span>/ 00:01:20:00</span></div>
+          <div class="spacer"></div>
+          <span class="chip" id="frameChip">帧 0 / 2400</span>
+          <button class="ib sm" id="btnSafe" aria-pressed="false" title="字幕安全框"><svg><use href="#i-img"/></svg></button>
+          <span class="chip">适应</span>
+        </div>
+      </div>
+
+      <!-- 检查器 -->
+      <div class="pane right">
+        <div class="pane-hd"><h3>检查器</h3></div>
+        <div class="insp" id="insp"></div>
+      </div>
+    </div>
+
+    <!-- ---------- 时间轴 ---------- -->
+    <div class="tl">
+      <div class="tl-bar">
+        <button class="ib sm" id="btnSnap" aria-pressed="true" title="磁吸对齐"><svg><use href="#i-magnet"/></svg></button>
+        <button class="ib sm" title="在播放头切分 ⌘K"><svg><use href="#i-cut"/></svg></button>
+        <span class="sep"></span>
+        <button class="ib sm" title="新建轨道"><svg><use href="#i-plus"/></svg></button>
+        <div class="spacer"></div>
+        <span class="chip" id="ioChip">入出点 00:00:08:00 – 00:01:12:00</span>
+        <span class="sep"></span>
+        <div class="zoom">
+          <span style="font-family:var(--mono);font-size:10px;color:var(--tx-faint)">缩放</span>
+          <input type="range" id="zoom" min="18" max="140" value="42" aria-label="时间轴缩放">
+        </div>
+      </div>
+
+      <div class="tl-scroll" id="tlScroll">
+        <div class="tl-inner" id="tlInner">
+          <div class="ruler">
+            <div class="rh"><span>时间码</span></div>
+            <div class="ticks" id="ticks"><div class="io" id="ioBand"></div><div class="playhead" id="phRl"></div></div>
+          </div>
+          <div class="tracks" id="tracks"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="ed-foot">
+      <span class="m" id="footTc">00:00:00:00 · 帧 0</span>
+      <span class="sel" id="footSel">未选中片段</span>
+      <div class="spacer"></div>
+      <div class="caps">
+        <i class="y" id="capH264"><svg style="width:9px;height:9px"><use href="#i-check"/></svg>H.264 硬编</i>
+        <i class="y" id="capAac"><svg style="width:9px;height:9px"><use href="#i-check"/></svg>AAC</i>
+        <i>显存 412 MB</i>
+        <i>代理 720p</i>
+      </div>
+    </div>
+
+    <!-- ---------- 导入吐司 ---------- -->
+    <div class="toast">
+      <div class="sp"></div>
+      <div>
+        <b>正在生成 720p 代理</b>
+        <span>2 / 3 个文件 · 预计 40 秒</span>
+      </div>
+    </div>
+
+    <!-- ---------- 导出对话框 ---------- -->
+    <div class="scrim" id="scrim">
+      <div class="dlg" role="dialog" aria-label="导出" aria-modal="true">
+
+
+        <!-- 设置 -->
+        <div class="ex-stage ex-set">
+          <div class="dlg-hd">
+            <svg style="width:15px;height:15px;color:var(--kerf)"><use href="#i-dl"/></svg>
+            <h2>导出</h2>
+            <button class="ib" data-close="1" aria-label="关闭"><svg><use href="#i-x"/></svg></button>
+          </div>
+          <div class="dlg-body">
+            <div class="two">
+              <div>
+                <div class="fld">
+                  <div class="k">格式</div>
+                  <div class="opt" id="fmtOpts">
+                    <div class="o" role="radio" aria-checked="true" data-fmt="mp4">
+                      <span class="radio"></span>
+                      <span>MP4 <span class="sub" id="subMp4">H.264 + AAC · 通用性最好</span></span>
+                      <span id="tagMp4"><span class="tagr">推荐</span></span>
+                    </div>
+                    <div class="o" role="radio" aria-checked="false" data-fmt="webm">
+                      <span class="radio"></span>
+                      <span>WebM <span class="sub">VP9 + Opus · 体积更小</span></span>
+                      <span id="tagWebm"></span>
+                    </div>
+                    <div class="o" role="radio" aria-checked="false" data-fmt="m4a">
+                      <span class="radio"></span>
+                      <span>仅音频 <span class="sub" id="subM4a">M4A · 只导出混音后的音轨</span></span>
+                      <span></span>
+                    </div>
+                  </div>
+                </div>
+                <div class="row2">
+                  <div class="fld">
+                    <div class="k">预设</div>
+                    <select class="sel-box" aria-label="预设">
+                      <option selected>标准发布 · 1080p · 10 Mbps</option>
+                      <option>高清发布 · 1080p · 16 Mbps</option>
+                      <option>快速分享 · 720p · 6 Mbps</option>
+                      <option>存档母版 · 与源片一致</option>
+                    </select>
+                  </div>
+                  <div class="fld">
+                    <div class="k">范围</div>
+                    <select class="sel-box" aria-label="导出范围">
+                      <option>整条时间轴 · 80.0 秒</option>
+                      <option selected>入出点之间 · 64.0 秒</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="fld" style="margin-bottom:0">
+                  <div class="k">保存到</div>
+                  <div class="path">
+                    <span class="p" id="outName">夏日骑行_EP07_1080p.mp4</span>
+                    <button class="btn-ghost" style="display:flex;align-items:center;gap:6px;padding:6px 11px">
+                      <svg style="width:13px;height:13px"><use href="#i-folder"/></svg>选择位置
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="card">
+                <div class="ttl">本机能力</div>
+                <div class="cap-list">
+                  <div class="cap y"><span class="s"><svg><use href="#i-check"/></svg></span>H.264 硬件编码<em>VideoToolbox</em></div>
+                  <div class="cap y" id="capRowAac"><span class="s"><svg><use href="#i-check"/></svg></span>AAC 音频编码<em>44.1 kHz</em></div>
+                  <div class="cap y"><span class="s"><svg><use href="#i-check"/></svg></span>WebGPU 合成<em>已启用</em></div>
+                  <div class="cap w"><span class="s"><svg><use href="#i-warn"/></svg></span>AV1 编码<em>不可用</em></div>
+                </div>
+                <div class="est">
+                  <div><span>待编码</span><b id="estFrames">1920 帧</b></div>
+                  <div><span>预计耗时</span><b id="estTime">约 24 秒</b></div>
+                  <div><span>预计体积</span><b id="estSize">~82 MB</b></div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="dlg-foot">
+            <span class="note">导出全程在本机完成，素材不会上传。</span>
+            <button class="btn-ghost" data-close="1">取消</button>
+            <button class="btn-primary" id="btnStart">开始导出</button>
+          </div>
+        </div>
+
+        <!-- 进行中 -->
+        <div class="ex-stage ex-run">
+          <div class="dlg-hd">
+            <svg style="width:15px;height:15px;color:var(--kerf)"><use href="#i-dl"/></svg>
+            <h2>正在导出</h2>
+          </div>
+          <div class="dlg-body">
+            <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px">
+              <span style="font-size:12.5px">夏日骑行_EP07_1080p.mp4</span>
+              <span class="m" style="font-size:17px;color:var(--kerf)">62<small style="font-size:11px">%</small></span>
+            </div>
+            <div class="bar"><i style="width:62%"></i></div>
+            <div class="stages">
+              <div class="stg" data-done="1">解码</div>
+              <div class="stg" data-done="1">合成</div>
+              <div class="stg" data-on="1">编码</div>
+              <div class="stg">封装写盘</div>
+            </div>
+            <div class="run-nums">
+              <div class="rn"><div class="k">已编码</div><div class="v">1190<small> / 1920</small></div></div>
+              <div class="rn"><div class="k">速度</div><div class="v">41<small> fps · 1.4×</small></div></div>
+              <div class="rn"><div class="k">剩余</div><div class="v">18<small> 秒</small></div></div>
+              <div class="rn"><div class="k">显存</div><div class="v">640<small> MB</small></div></div>
+            </div>
+          </div>
+          <div class="dlg-foot">
+            <span class="note">关闭标签页会中断导出。可以最小化这个窗口继续剪辑。</span>
+            <button class="btn-ghost" data-close="1">取消导出</button>
+            <button class="btn-ghost" data-goto="3">后台运行</button>
+          </div>
+        </div>
+
+        <!-- 完成 -->
+        <div class="ex-stage ex-done">
+          <div class="dlg-hd">
+            <svg style="width:15px;height:15px;color:var(--ok)"><use href="#i-check"/></svg>
+            <h2>导出完成</h2>
+            <button class="ib" data-close="1" aria-label="关闭"><svg><use href="#i-x"/></svg></button>
+          </div>
+          <div class="dlg-body">
+            <div class="done-wrap">
+              <div class="done-ic"><svg><use href="#i-check"/></svg></div>
+              <div>
+                <div style="font-size:13px;font-weight:600">夏日骑行_EP07_1080p.mp4</div>
+                <div class="m" style="font-size:11px;color:var(--tx-faint);margin-top:3px">
+                  84.2 MB · 1920×1080 · 29.97 fps · H.264 + AAC · 用时 26 秒（1.4× 实时）
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="dlg-foot">
+            <span class="note"></span>
+            <button class="btn-ghost" data-goto="1">再导一份</button>
+            <button class="btn-primary" data-close="1">在文件夹中显示</button>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+  <!-- ================= 说明 ================= -->
+  <section class="notes">
+
+    <div class="full">
+      <h2>这一版定下来的是什么</h2>
+      <p>四个固定区域、不做浮动面板：素材库在左、预览居中、检查器在右、时间轴横贯底部。这是 Premiere / Resolve / 剪映共有的骨架，用户不需要重新学。黄铜色只出现在三个地方——播放头、选中片段、主操作按钮，别处一律灰调，让"当前在哪一帧、选中了什么"永远是画面里最亮的信息。</p>
+      <p>片段按类型着色（视频钢青、音频苔绿、文字靛、图片紫灰），缩略图和波形直接画在片段里，所以时间轴在缩得很小的时候仍然能靠颜色和形状认出结构。</p>
+      <div class="legend">
+        <span class="lg"><i style="background:var(--c-video)"></i>视频</span>
+        <span class="lg"><i style="background:var(--c-audio)"></i>音频</span>
+        <span class="lg"><i style="background:var(--c-text)"></i>文字</span>
+        <span class="lg"><i style="background:var(--c-image)"></i>图片 / 叠加</span>
+        <span class="lg"><i style="background:var(--kerf)"></i>播放头 · 选中 · 主操作</span>
+        <span class="lg"><i style="background:var(--ok)"></i>能力可用</span>
+        <span class="lg"><i style="background:var(--warn)"></i>需降级</span>
+        <span class="lg"><i style="background:var(--bad)"></i>不支持</span>
+      </div>
+    </div>
+
+    <div>
+      <h2>界面里的技术事实</h2>
+      <p>底部状态栏常驻显示探测到的编码能力（H.264 硬编 / AAC / 显存 / 代理档位）。这不是装饰——客户端导出的成败取决于本机能力，用户点导出之前就该知道自己能导出什么。</p>
+      <p>导出面板右侧的「本机能力」卡片同理：先告知，再让用户选格式。缺 AAC 时不静默换成 WebM，而是明确说"MP4 会没有声音"并给出两条出路。</p>
+      <p>素材库的代理状态徽标（<span class="m" style="font-size:11px">代理就绪 / 生成中 / 排队</span>）暴露了预览走低码率代理、导出走原片这件事，用户才能理解为什么刚导入的素材拖进时间轴会先卡一下。</p>
+    </div>
+
+    <div>
+      <h2>自研 / 复用的边界</h2>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>模块</th><th>来源</th></tr></thead>
+          <tbody>
+            <tr><td>时间轴（多轨 / 磁吸 / 缩放）</td><td class="who self">自研</td></tr>
+            <tr><td>检查器 · 关键帧行</td><td class="who self">自研</td></tr>
+            <tr><td>波形 / 缩略图条</td><td class="who self">自研 Canvas</td></tr>
+            <tr><td>导出面板 · 能力探测</td><td class="who self">自研</td></tr>
+            <tr><td>画面合成 / 滤镜 / 转场</td><td class="who">PixiJS v8</td></tr>
+            <tr><td>编解码 · 封装 · 转码</td><td class="who">mediabunny</td></tr>
+            <tr><td>音频离线混流</td><td class="who">OfflineAudioContext</td></tr>
+            <tr><td>撤销栈 · EDL 状态</td><td class="who">Zustand + Immer</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="full">
+      <h2>已定的四件事</h2>
+      <ol class="q-list">
+        <li><b>默认 5 轨</b><span>文字 / 叠加 / 主视频 / 人声 / 音乐。Vlog 的常规配置一次给齐，用户不用先学「怎么加轨道」再开始剪。空轨道成本很低，缺轨道的挫败感很高。</span></li>
+        <li><b>磁吸默认开</b><span>新手最容易犯的错是留下 1 帧黑缝，磁吸默认开就消掉了这类事故。精细微调按住 ⌥ 临时关闭。</span></li>
+        <li><b>缺 AAC 时禁掉 MP4，但把原因写在选项里</b><span>无声视频不是任何人的目标，是编码能力缺失的副产品，所以不给这条路——曾经考虑过"允许 + 二次确认"，但那个确认框的推荐项永远是 WebM，说明岔路口本身不该存在。代价是禁止必须解释清楚：MP4 选项就地写「这个浏览器不能编码 AAC，导出会没有声音 · 改用 WebM」，出路可点，用户不用去顶部横幅找答案。「仅音频」同样受影响，自动降级成 Opus（.webm）。</span></li>
+        <li><b>预设用场景词做主标签，参数留在同一行</b><span>「标准发布 · 1080p · 10 Mbps」。场景词回答"我该选哪个"，参数回答"选了会得到什么"。不用第三方平台名（发抖音 / 发 B 站）——平台规格会变、名字会过期，得长期维护一张清单，而且不同人对同一个平台的预期并不一致。</span></li>
+      </ol>
+    </div>
+
+    <div class="full">
+      <h2>这一版明确没有画</h2>
+      <div class="scope">
+        <span>关键帧曲线编辑器</span><span>色轮 / 一级调色</span><span>蒙版绘制</span><span>多机位</span>
+        <span>语音转字幕结果面板</span><span>项目管理 / 首页</span><span>登录与账号</span><span>快捷键设置</span>
+      </div>
+      <p style="margin-top:14px">这些都要等骨架定稿后单独出稿——它们的信息密度差异很大，塞进这一版会掩盖主界面的问题。</p>
+    </div>
+
+  </section>
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  /* ---------- 项目数据（就是方案里的 EDL） ---------- */
+  const FPS = 30;                 // 显示按 29.97 非丢帧计数
+  const TOTAL = 2400;             // 80 秒
+  const IN_F = 240, OUT_F = 2160;
+
+  const TRACKS = [
+    { id:"T1", kind:"text",  label:"字幕 / 标题", h:"h-text" },
+    { id:"V2", kind:"image", label:"叠加",        h:"h-ovl"  },
+    { id:"V1", kind:"video", label:"主视频",      h:"h-vid"  },
+    { id:"A1", kind:"audio", label:"人声",        h:"h-aud"  },
+    { id:"A2", kind:"audio", label:"音乐",        h:"h-aud"  }
+  ];
+
+  const CLIPS = [
+    { id:"t1", trk:"T1", kind:"text",  name:"夏日骑行 · 第七日", body:"淡入 12f", s:60,   e:300  },
+    { id:"t2", trk:"T1", kind:"text",  name:"下期：环岛第二段",   body:"上滑",     s:2010, e:2340 },
+    { id:"o1", trk:"V2", kind:"image", name:"logo_kerf.png",     fx:"不透明度 78%", s:120, e:2400 },
+    { id:"v1", trk:"V1", kind:"video", name:"A7S3_0413.mp4", scene:0, fx:"LUT 日落 · 100%",  s:0,    e:780  },
+    { id:"v2", trk:"V1", kind:"video", name:"A7S3_0417.mp4", scene:1, fx:"速度 85%",         s:780,  e:1560 },
+    { id:"v3", trk:"V1", kind:"video", name:"drone_04.mov",  scene:2, fx:"缩放关键帧 ×2",   s:1560, e:2400 },
+    { id:"a1", trk:"A1", kind:"audio", name:"配音_v3.wav",  seed:7,  fx:"降噪 · -3 dB", s:150, e:1500 },
+    { id:"a2", trk:"A2", kind:"audio", name:"bgm_lofi.mp3", seed:19, fx:"音量包络",      s:0,   e:2400 }
+  ];
+
+  const TRANSITION = { at:780, len:30, name:"交叉溶解 1s" };
+
+  // 正在导入的排在最前，用户不用滚动就能看到进度
+  const ASSETS = [
+    { name:"A7S3_0431.mp4", dur:"02:14", meta:"4K · 29.97", scene:1, proxy:"work", pct:64 },
+    { name:"街景_手持.mov",  dur:"00:31", meta:"1080p · 30", scene:1, proxy:"wait" },
+    { name:"A7S3_0413.mp4", dur:"00:42", meta:"4K · 29.97", scene:0, proxy:"ok" },
+    { name:"A7S3_0417.mp4", dur:"01:08", meta:"4K · 29.97", scene:1, proxy:"ok" },
+    { name:"drone_04.mov",  dur:"00:55", meta:"4K · 59.94", scene:2, proxy:"ok" },
+    { name:"配音_v3.wav",   dur:"00:45", meta:"48 kHz · 单声道", scene:-1, proxy:"ok" }
+  ];
+
+  const FILL = {
+    video:["var(--c-video)","var(--c-video-hi)"],
+    audio:["var(--c-audio)","var(--c-audio-hi)"],
+    text: ["var(--c-text)","var(--c-text-hi)"],
+    image:["var(--c-image)","var(--c-image-hi)"]
+  };
+  const KIND_ICON = { video:"#i-film", audio:"#i-wave", text:"#i-type", image:"#i-img" };
+
+  const ed = document.getElementById("ed");
+  const $ = s => document.querySelector(s);
+
+  /* ---------- 工具 ---------- */
+  const tc = f => {
+    const t = Math.max(0, Math.round(f));
+    const ff = t % FPS, s = Math.floor(t / FPS);
+    return [Math.floor(s/3600), Math.floor(s/60)%60, s%60, ff]
+      .map(n => String(n).padStart(2,"0")).join(":");
+  };
+  const rng = seed => { let x = seed * 9301 + 49297; return () => (x = (x*9301+49297) % 233280) / 233280; };
+  const pxf = () => parseFloat(getComputedStyle(ed).getPropertyValue("--pxf"));
+
+  /* ---------- 场景绘制：一个 compose(edl, frame) 的缩影 ---------- */
+  function paintScene(ctx, w, h, scene, p) {
+    const g = ctx.createLinearGradient(0, 0, 0, h);
+    if (scene === 0) {                                   // 海岸黄昏
+      g.addColorStop(0,"#1B3552"); g.addColorStop(.42,"#5E6F86");
+      g.addColorStop(.62,"#D89B63"); g.addColorStop(1,"#8E5F49");
+      ctx.fillStyle = g; ctx.fillRect(0,0,w,h);
+      const sx = w*(.28 + p*.16), sy = h*(.56 - p*.06);
+      const sun = ctx.createRadialGradient(sx,sy,0,sx,sy,h*.34);
+      sun.addColorStop(0,"rgba(255,231,186,.95)"); sun.addColorStop(1,"rgba(255,190,120,0)");
+      ctx.fillStyle = sun; ctx.fillRect(0,0,w,h);
+      ctx.fillStyle = "#16222E"; ctx.fillRect(0, h*.68, w, h*.32);
+      ctx.fillStyle = "rgba(255,214,160,.34)"; ctx.fillRect(sx - w*.03, h*.68, w*.06, h*.32);
+      ctx.fillStyle = "#0D141B";
+      ctx.beginPath(); ctx.moveTo(0,h*.7);
+      ctx.quadraticCurveTo(w*.2, h*.55 - p*10, w*.42, h*.71); ctx.lineTo(0,h*.71); ctx.fill();
+    } else if (scene === 1) {                            // 夜间街景
+      g.addColorStop(0,"#0B1420"); g.addColorStop(.7,"#1A2634"); g.addColorStop(1,"#0A1017");
+      ctx.fillStyle = g; ctx.fillRect(0,0,w,h);
+      const r = rng(31);
+      for (let i=0;i<9;i++){
+        const bx = (i/9)*w - p*w*.1, bw = w*.07 + r()*w*.05, bh = h*(.2 + r()*.34);
+        ctx.fillStyle = "#101B25"; ctx.fillRect(bx, h*.72-bh, bw, bh);
+        for (let k=0;k<5;k++) if (r()>.45) {
+          ctx.fillStyle = "rgba(240,196,120,.5)";
+          ctx.fillRect(bx + bw*.2, h*.72-bh + k*(bh/6) + 4, bw*.16, bh/12);
+        }
+      }
+      for (let i=0;i<14;i++){
+        const bx = ((i*137)%100)/100*w, by = h*(.5 + ((i*53)%40)/100);
+        const rad = h*(.045 + (i%4)*.028);            // 按画布高度取半径，缩略图里才不会糊成一片
+        const bo = ctx.createRadialGradient(bx,by,0,bx,by,rad);
+        bo.addColorStop(0,"rgba(255,205,140,.38)"); bo.addColorStop(1,"rgba(255,180,110,0)");
+        ctx.fillStyle = bo; ctx.beginPath(); ctx.arc(bx,by,rad,0,7); ctx.fill();
+      }
+      ctx.fillStyle = "#080F14"; ctx.fillRect(0, h*.76, w, h*.24);
+      const wet = ctx.createLinearGradient(0, h*.76, 0, h);   // 路面反光，避免下缘看着像纯黑边
+      wet.addColorStop(0,"rgba(214,164,104,.14)"); wet.addColorStop(1,"rgba(214,164,104,0)");
+      ctx.fillStyle = wet; ctx.fillRect(0, h*.76, w, h*.24);
+      ctx.fillStyle = "rgba(255,214,160,.07)";
+      for (let i=0;i<6;i++) ctx.fillRect(((i*167)%100)/100*w, h*.76, w*.005, h*.24);
+    } else {                                             // 航拍山脊
+      g.addColorStop(0,"#9CB0B7"); g.addColorStop(.5,"#7E959D"); g.addColorStop(1,"#516870");
+      ctx.fillStyle = g; ctx.fillRect(0,0,w,h);
+      const layers = [["#7E9298",.58],["#5E7379",.7],["#42545A",.82],["#2B3A3F",.95]];
+      layers.forEach(([c,base],li) => {
+        ctx.fillStyle = c; ctx.beginPath(); ctx.moveTo(0,h);
+        const r = rng(5+li*11), off = p*w*(.05+li*.03);
+        for (let x=-off; x<=w+40; x+=w/8)
+          ctx.lineTo(x, h*base - (r()*h*.1) - li*2);
+        ctx.lineTo(w,h); ctx.closePath(); ctx.fill();
+      });
+      const fl = ctx.createRadialGradient(w*.78,h*.16,0,w*.78,h*.16,h*.5);
+      fl.addColorStop(0,"rgba(255,255,255,.5)"); fl.addColorStop(1,"rgba(255,255,255,0)");
+      ctx.fillStyle = fl; ctx.fillRect(0,0,w,h);
+    }
+  }
+
+  /* ---------- 预览 ---------- */
+  const prev = document.getElementById("prev");
+  const pctx = prev.getContext("2d");
+
+  function drawPreview(f) {
+    const w = prev.width, h = prev.height;
+    const vc = CLIPS.find(c => c.trk === "V1" && f >= c.s && f < c.e) || CLIPS[3];
+    const p = (f - vc.s) / (vc.e - vc.s);
+    paintScene(pctx, w, h, vc.scene, p);
+
+    // 转场：交叉溶解期间叠加下一段
+    const t0 = TRANSITION.at - TRANSITION.len/2, t1 = TRANSITION.at + TRANSITION.len/2;
+    if (f > t0 && f < t1) {
+      const nx = CLIPS.find(c => c.trk === "V1" && c.s === TRANSITION.at);
+      if (nx) { pctx.globalAlpha = (f-t0)/(t1-t0); paintScene(pctx,w,h,nx.scene,0); pctx.globalAlpha = 1; }
+    }
+
+    // 文字层
+    const t = CLIPS.find(c => c.trk === "T1" && f >= c.s && f < c.e);
+    if (t) {
+      const fade = Math.min(1, (f-t.s)/12, (t.e-f)/12);
+      pctx.globalAlpha = Math.max(0, fade);
+      pctx.font = "600 40px " + getComputedStyle(document.body).fontFamily;
+      pctx.textAlign = "center";
+      pctx.shadowColor = "rgba(0,0,0,.55)"; pctx.shadowBlur = 14; pctx.shadowOffsetY = 2;
+      pctx.fillStyle = "#FFF"; pctx.fillText(t.name, w/2, h*.82);
+      pctx.shadowBlur = 0; pctx.shadowOffsetY = 0; pctx.globalAlpha = 1;
+    }
+
+    // 叠加层水印
+    const o = CLIPS.find(c => c.trk === "V2" && f >= c.s && f < c.e);
+    if (o) {
+      pctx.globalAlpha = .78;
+      pctx.fillStyle = "#E8A33D";
+      pctx.fillRect(w-96, 26, 3, 22); pctx.fillRect(w-84, 26, 3, 22);
+      pctx.font = "600 15px " + getComputedStyle(document.body).fontFamily;
+      pctx.textAlign = "left"; pctx.fillStyle = "rgba(255,255,255,.9)";
+      pctx.fillText("KERF", w-72, 43);
+      pctx.globalAlpha = 1;
+    }
+
+    // 安全框
+    if (safeOn) {
+      pctx.strokeStyle = "rgba(255,255,255,.34)"; pctx.lineWidth = 1; pctx.setLineDash([6,5]);
+      pctx.strokeRect(w*.05, h*.05, w*.9, h*.9);
+      pctx.strokeRect(w*.1, h*.1, w*.8, h*.8);
+      pctx.setLineDash([]);
+    }
+  }
+
+  /* ---------- 素材库 ---------- */
+  (function buildAssets(){
+    const host = document.getElementById("assets");
+    ASSETS.forEach((a,i) => {
+      const el = document.createElement("div");
+      el.className = "asset" + (a.proxy !== "ok" ? " imp-only" : "");
+      const px = a.proxy === "ok"
+        ? '<span class="px ok"><span class="dot"></span>代理就绪</span>'
+        : a.proxy === "work"
+          ? '<span class="px work"><span class="dot pulse"></span>生成中 ' + a.pct + '%</span>'
+          : '<span class="px wait"><span class="dot"></span>排队</span>';
+      el.innerHTML =
+        '<div class="thumb"><canvas width="112" height="63"></canvas><span class="dur">'+a.dur+'</span></div>' +
+        '<div><div class="nm">'+a.name+'</div><div class="meta">'+a.meta+'</div>' + px +
+        (a.proxy === "work" ? '<div class="mini-bar"><i style="width:'+a.pct+'%"></i></div>' : '') + '</div>';
+      host.appendChild(el);
+      const c = el.querySelector("canvas"), cx = c.getContext("2d");
+      if (a.scene < 0) {
+        cx.fillStyle = "#1B2426"; cx.fillRect(0,0,112,63);
+        const r = rng(3); cx.fillStyle = "#648A70";
+        for (let x=2;x<110;x+=3){ const hh = 4 + r()*46; cx.fillRect(x, 31.5-hh/2, 2, hh); }
+      } else paintScene(cx, 112, 63, a.scene, .3);
+    });
+  })();
+
+  /* ---------- 时间轴 ---------- */
+  const tracksHost = document.getElementById("tracks");
+  const ticksHost  = document.getElementById("ticks");
+  let selected = "v2";
+
+  function buildTracks() {
+    tracksHost.innerHTML = "";
+    TRACKS.forEach(t => {
+      const row = document.createElement("div");
+      row.className = "trk " + t.h;
+      const mutable = t.kind === "audio";
+      row.innerHTML =
+        '<div class="th">' +
+          '<div class="lb"><div class="k">'+t.id+'</div><div class="d">'+t.label+'</div></div>' +
+          '<button class="ib sm" aria-pressed="false" title="'+(mutable?"静音":"隐藏")+'"><svg><use href="'+(mutable?"#i-vol":"#i-eye")+'"/></svg></button>' +
+          '<button class="ib sm" aria-pressed="false" title="锁定"><svg><use href="#i-lock"/></svg></button>' +
+        '</div><div class="lane" data-trk="'+t.id+'"></div>';
+      tracksHost.appendChild(row);
+    });
+
+    const layer = document.createElement("div");
+    layer.className = "ph-layer";
+    layer.innerHTML = '<div class="playhead" id="phTl"></div>';
+    tracksHost.appendChild(layer);
+
+    CLIPS.forEach(c => {
+      const lane = tracksHost.querySelector('.lane[data-trk="'+c.trk+'"]');
+      if (!lane) return;
+      const el = document.createElement("div");
+      el.className = "clip";
+      el.dataset.id = c.id;
+      el.setAttribute("role","option");
+      el.setAttribute("aria-selected", String(c.id === selected));
+      el.style.setProperty("--fill", FILL[c.kind][0]);
+      el.style.setProperty("--band", FILL[c.kind][1]);
+      el.innerHTML =
+        '<span class="grip l"></span><span class="grip r"></span>' +
+        '<div class="lbl"><svg><use href="'+KIND_ICON[c.kind]+'"/></svg>'+c.name+'</div>' +
+        (c.kind === "text" ? '<div class="txt-body">'+(c.body||"")+'</div>' : '') +
+        (c.fx ? '<div class="fx">'+c.fx+'</div>' : '') +
+        (c.kind === "video" || c.kind === "audio" ? '<canvas></canvas>' : '');
+      lane.appendChild(el);
+      el.addEventListener("click", () => select(c.id));
+    });
+
+    const lane = tracksHost.querySelector('.lane[data-trk="V1"]');
+    const tr = document.createElement("div");
+    tr.className = "trans";
+    tr.title = TRANSITION.name;
+    tr.innerHTML = '<svg><use href="#i-trans"/></svg>';
+    lane.appendChild(tr);
+    layoutClips();
+  }
+
+  function layoutClips() {
+    const k = pxf();
+    CLIPS.forEach(c => {
+      const el = tracksHost.querySelector('.clip[data-id="'+c.id+'"]');
+      if (!el) return;
+      const w = (c.e - c.s) * k;
+      el.style.left = (c.s * k) + "px";
+      el.style.width = w + "px";
+      const cv = el.querySelector("canvas");
+      if (cv) c.kind === "video" ? paintStrip(cv, c, w) : paintWave(cv, c, w);
+    });
+    const tr = tracksHost.querySelector(".trans");
+    if (tr) { tr.style.left = ((TRANSITION.at - TRANSITION.len/2) * k) + "px"; tr.style.width = (TRANSITION.len * k) + "px"; }
+    const io = document.getElementById("ioBand");
+    io.style.left = (IN_F * k) + "px";
+    io.style.width = ((OUT_F - IN_F) * k) + "px";
+    document.getElementById("tlInner").style.width = "max(100%, calc(var(--head-w) + " + (TOTAL * k) + "px))";
+    buildTicks();
+    setFrame(frame);
+  }
+
+  function paintStrip(cv, c, w) {
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    const H = 32, W = Math.max(1, Math.round(w));
+    cv.width = W*dpr; cv.height = H*dpr; cv.style.height = H+"px";
+    const cx = cv.getContext("2d"); cx.scale(dpr,dpr);
+    const tw = 34, n = Math.max(1, Math.ceil(W/tw));
+    for (let i=0;i<n;i++){
+      cx.save(); cx.beginPath(); cx.rect(i*tw,0,tw,H); cx.clip();
+      cx.translate(i*tw,0);
+      paintScene(cx, tw, H, c.scene, (i/n)*.9);
+      cx.restore();
+      cx.fillStyle = "rgba(0,0,0,.3)"; cx.fillRect(i*tw+tw-1,0,1,H);
+    }
+  }
+
+  function paintWave(cv, c, w) {
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    const H = 21, W = Math.max(1, Math.round(w));
+    cv.width = W*dpr; cv.height = H*dpr; cv.style.height = H+"px";
+    const cx = cv.getContext("2d"); cx.scale(dpr,dpr);
+    const r = rng(c.seed);
+    cx.fillStyle = "rgba(255,255,255,.5)";
+    for (let x=0;x<W;x+=2){
+      const env = .35 + .65*Math.abs(Math.sin(x/ (W/6) + c.seed));
+      const hh = Math.max(1.5, (r()*.55 + .45) * env * H);
+      cx.fillRect(x, (H-hh)/2, 1.4, hh);
+    }
+    cx.strokeStyle = "rgba(232,163,61,.5)"; cx.lineWidth = 1;
+    cx.beginPath(); cx.moveTo(0, H*.28);
+    cx.lineTo(W*.18, H*.18); cx.lineTo(W*.62, H*.2); cx.lineTo(W*.88, H*.5); cx.lineTo(W, H*.6);
+    cx.stroke();
+  }
+
+  function buildTicks() {
+    const k = pxf();
+    ticksHost.querySelectorAll(".tick,.tick-lbl").forEach(n => n.remove());
+    const secs = [1,2,5,10,15,30].find(s => s*FPS*k >= 62) || 30;
+    const frag = document.createDocumentFragment();
+    for (let f=0; f<=TOTAL; f+=FPS*(secs/5)) {
+      const maj = f % (FPS*secs) === 0;
+      const d = document.createElement("div");
+      d.className = "tick " + (maj ? "maj" : "min");
+      d.style.left = (f*k) + "px";
+      frag.appendChild(d);
+      if (maj) {
+        const l = document.createElement("div");
+        l.className = "tick-lbl"; l.style.left = (f*k) + "px";
+        l.textContent = tc(f).slice(3, 8);
+        frag.appendChild(l);
+      }
+    }
+    ticksHost.appendChild(frag);
+  }
+
+  /* ---------- 检查器 ---------- */
+  const INSP = {
+    video: c => `
+      ${grp("变换", `
+        ${f2("位置", "0", "0")}
+        ${f2("缩放", "112%", "112%")}
+        ${f1("旋转", "0°")}
+        <div class="kf-row"><label style="font-size:11px;color:var(--tx-dim)">关键帧</label>
+          <div class="kf-track"><div class="kf" style="left:18%"></div><div class="kf hollow" style="left:64%"></div></div></div>`)}
+      ${grp("速度与时长", `
+        ${slide("速度", 85, 30, 200, "85%")}
+        ${f1("时长", tc(c.e-c.s).slice(3))}
+        <div class="f"><label>补帧</label><div class="seg"><button aria-pressed="true">丢帧</button><button aria-pressed="false">混合</button><button aria-pressed="false">光流</button></div></div>`)}
+      ${grp("颜色", `
+        <div class="f"><label>LUT</label><div class="lut-row">
+          <button class="lut" aria-pressed="false" style="background:linear-gradient(135deg,#4B6B84,#B7C6CC)" title="原始"></button>
+          <button class="lut" aria-pressed="true" style="background:linear-gradient(135deg,#8E5A3A,#E4B078)" title="日落"></button>
+          <button class="lut" aria-pressed="false" style="background:linear-gradient(135deg,#2F4A44,#8FB0A0)" title="青绿"></button>
+          <button class="lut" aria-pressed="false" style="background:linear-gradient(135deg,#3A3A42,#C9C9CE)" title="黑白"></button>
+        </div></div>
+        ${slide("强度", 100, 0, 100, "100%")}
+        ${slide("曝光", 58, 0, 100, "+0.3")}
+        ${slide("饱和", 62, 0, 100, "+8")}`)}
+      ${grp("音频", `${slide("音量", 70, 0, 100, "-3 dB")}<div class="hint">这段素材的原声。人声在 A1 轨单独控制。</div>`, false)}`,
+    audio: c => `
+      ${grp("电平", `
+        ${slide("音量", 74, 0, 100, "-3 dB")}
+        ${slide("声道平衡", 50, 0, 100, "中")}
+        <div class="f"><label>包络</label><div class="seg"><button aria-pressed="true">曲线</button><button aria-pressed="false">固定</button></div></div>
+        <div class="kf-row"><label style="font-size:11px;color:var(--tx-dim)">节点</label>
+          <div class="kf-track"><div class="kf" style="left:8%"></div><div class="kf" style="left:40%"></div><div class="kf hollow" style="left:78%"></div></div></div>`)}
+      ${grp("淡入淡出", `${f2("淡入 / 淡出", "12f", "24f")}${slide("曲线", 50, 0, 100, "S 形")}`)}
+      ${grp("处理", `
+        <div class="f"><label>降噪</label><div class="seg"><button aria-pressed="false">关</button><button aria-pressed="true">中</button><button aria-pressed="false">强</button></div></div>
+        <div class="hint">降噪在导出时统一离线重算，预览里听到的是简化版。</div>`)}`,
+    text: c => `
+      ${grp("内容", `<div style="display:flex;flex-direction:column;gap:6px">
+        <textarea class="num" style="text-align:left;min-height:48px;resize:vertical;line-height:1.5">${c.name}</textarea></div>`)}
+      ${grp("字体", `
+        <div class="f"><label>字体</label><select class="sel-box"><option>思源黑体 Bold</option><option>思源宋体</option></select></div>
+        ${f2("字号 / 行距", "40", "1.35")}
+        ${f1("字距", "0.02em")}
+        <div class="f"><label>对齐</label><div class="seg"><button aria-pressed="false">左</button><button aria-pressed="true">中</button><button aria-pressed="false">右</button></div></div>`)}
+      ${grp("样式", `
+        <div class="f"><label>填充</label><div class="lut-row">
+          <button class="lut" aria-pressed="true" style="background:#FFF"></button>
+          <button class="lut" aria-pressed="false" style="background:#E8A33D"></button>
+          <button class="lut" aria-pressed="false" style="background:#111"></button>
+          <button class="lut" aria-pressed="false" style="background:linear-gradient(135deg,#E8A33D,#C8564E)"></button>
+        </div></div>
+        ${f2("描边 / 阴影", "0", "14")}
+        ${slide("背景不透明度", 0, 0, 100, "0%")}`)}
+      ${grp("动画", `
+        <div class="f"><label>入场</label><select class="sel-box"><option>淡入 12f</option><option>上滑 15f</option><option>打字机</option></select></div>
+        <div class="f"><label>出场</label><select class="sel-box"><option>淡出 12f</option><option>无</option></select></div>`)}`,
+    image: c => `
+      ${grp("变换", `${f2("位置", "1512", "42")}${f2("缩放", "34%", "34%")}${f1("旋转", "0°")}`)}
+      ${grp("混合", `
+        ${slide("不透明度", 78, 0, 100, "78%")}
+        <div class="f"><label>混合模式</label><select class="sel-box"><option>正常</option><option>滤色</option><option>叠加</option></select></div>`)}
+      ${grp("固定", `<div class="hint">已锁定为整片水印：跟随时间轴长度自动伸缩，不随主视频剪切变化。</div>`)}`
+  };
+
+  function grp(title, inner, open = true) {
+    return `<details class="grp"${open?" open":""}><summary><svg><use href="#i-chev"/></svg>${title}</summary><div class="fields">${inner}</div></details>`;
+  }
+  function f1(label, v) { return `<div class="f"><label>${label}</label><input class="num" value="${v}"></div>`; }
+  function f2(label, a, b) { return `<div class="f"><label>${label}</label><div class="num-pair"><input class="num" value="${a}"><input class="num" value="${b}"></div></div>`; }
+  function slide(label, v, min, max, out) {
+    return `<div class="f"><label>${label}</label><div class="slide"><input type="range" min="${min}" max="${max}" value="${v}" aria-label="${label}"><span class="val">${out}</span></div></div>`;
+  }
+
+  function renderInsp(id) {
+    const c = CLIPS.find(x => x.id === id);
+    const host = document.getElementById("insp");
+    if (!c) { host.innerHTML = '<div style="padding:16px" class="hint">未选中片段。点时间轴上的片段查看属性。</div>'; return; }
+    const kindName = { video:"视频", audio:"音频", text:"文字", image:"图片" }[c.kind];
+    host.innerHTML =
+      `<div class="insp-hd"><span class="swatch" style="background:${FILL[c.kind][1]}"></span>
+        <div class="t"><div class="n">${c.name}</div>
+        <div class="s">${kindName} · ${c.trk} · ${tc(c.s).slice(3)} → ${tc(c.e).slice(3)}</div></div></div>` +
+      INSP[c.kind](c);
+    host.querySelectorAll(".seg button, .lut").forEach(b => {
+      b.addEventListener("click", () => {
+        b.parentElement.querySelectorAll("[aria-pressed]").forEach(x => x.setAttribute("aria-pressed","false"));
+        b.setAttribute("aria-pressed","true");
+      });
+    });
+    host.querySelectorAll('input[type="range"]').forEach(r => {
+      const out = r.parentElement.querySelector(".val");
+      r.addEventListener("input", () => { if (out) out.textContent = r.value + (out.textContent.includes("%") ? "%" : ""); });
+    });
+  }
+
+  function select(id) {
+    selected = id;
+    tracksHost.querySelectorAll(".clip").forEach(el => el.setAttribute("aria-selected", String(el.dataset.id === id)));
+    renderInsp(id);
+    const c = CLIPS.find(x => x.id === id);
+    document.getElementById("footSel").textContent = c
+      ? `${c.name} · ${c.trk} · ${tc(c.s).slice(3)} → ${tc(c.e).slice(3)} · ${c.e - c.s}f`
+      : "未选中片段";
+  }
+
+  /* ---------- 播放头 ---------- */
+  let frame = 0, playing = false, safeOn = false, raf = 0, last = 0;
+
+  function setFrame(f) {
+    frame = Math.max(0, Math.min(TOTAL, f));
+    const x = frame * pxf();
+    document.getElementById("phTl").style.left = x + "px";
+    document.getElementById("phRl").style.left = x + "px";
+    document.getElementById("tcNow").textContent = tc(frame);
+    document.getElementById("frameChip").textContent = "帧 " + Math.round(frame) + " / " + TOTAL;
+    document.getElementById("footTc").textContent = tc(frame) + " · 帧 " + Math.round(frame);
+    drawPreview(frame);
+  }
+
+  function loop(t) {
+    if (!playing) return;
+    if (!last) last = t;
+    const d = (t - last) / 1000; last = t;
+    let nf = frame + d * 29.97;
+    if (nf >= TOTAL) { nf = 0; }
+    setFrame(nf);
+    raf = requestAnimationFrame(loop);
+  }
+  function setPlaying(on) {
+    playing = on; last = 0;
+    document.getElementById("playIcon").innerHTML = '<use href="' + (on ? "#i-pause" : "#i-play") + '"/>';
+    cancelAnimationFrame(raf);
+    if (on) raf = requestAnimationFrame(loop);
+  }
+
+  document.getElementById("btnPlay").addEventListener("click", () => setPlaying(!playing));
+  document.getElementById("btnPrev").addEventListener("click", () => { setPlaying(false); setFrame(Math.round(frame)-1); });
+  document.getElementById("btnNext").addEventListener("click", () => { setPlaying(false); setFrame(Math.round(frame)+1); });
+  document.getElementById("btnSafe").addEventListener("click", e => {
+    safeOn = !safeOn; e.currentTarget.setAttribute("aria-pressed", String(safeOn)); drawPreview(frame);
+  });
+
+  // 标尺拖动擦洗
+  let scrub = false;
+  const scrubTo = e => {
+    const r = ticksHost.getBoundingClientRect();
+    setFrame((e.clientX - r.left) / pxf());
+  };
+  ticksHost.addEventListener("pointerdown", e => { scrub = true; setPlaying(false); ticksHost.setPointerCapture(e.pointerId); scrubTo(e); });
+  ticksHost.addEventListener("pointermove", e => { if (scrub) scrubTo(e); });
+  ticksHost.addEventListener("pointerup", () => { scrub = false; });
+
+  // 缩放
+  document.getElementById("zoom").addEventListener("input", e => {
+    ed.style.setProperty("--pxf", (e.target.value / 100).toFixed(3));
+    layoutClips();
+  });
+
+  document.addEventListener("keydown", e => {
+    if (e.target.matches("input,textarea,select")) return;
+    if (e.code === "Space") { e.preventDefault(); setPlaying(!playing); }
+    if (e.code === "ArrowLeft")  { setPlaying(false); setFrame(Math.round(frame)-1); }
+    if (e.code === "ArrowRight") { setPlaying(false); setFrame(Math.round(frame)+1); }
+    if (e.code === "Escape") setExport(0);
+  });
+
+  /* ---------- 状态切换 ---------- */
+  const NOTES = {
+    edit:     "主界面。左素材库、中预览、右检查器、下多轨时间轴——四区固定，不做浮动面板。",
+    import:   "导入后台生成 720p 代理：素材带状态徽标（就绪 / 生成中 / 排队），未就绪也能先拖进时间轴，只是预览走原片会卡。",
+    export:   "导出前先摊开本机能力，再让用户选格式。预计帧数、耗时、体积都是按探测结果算的，不是固定文案。",
+    running:  "四个阶段（解码 → 合成 → 编码 → 封装）明确指示当前位置；速度用「fps + 实时倍数」双单位，用户才知道快慢。",
+    done:     "完成态给足事实：体积、分辨率、编码器、实际耗时。「再导一份」保留上次设置，改一个参数就能重出。",
+    fallback: "Firefox 与桌面 Linux 无法编码 AAC。MP4 直接禁掉——但原因和出路写在选项里，不让用户去顶部横幅猜。「改用 WebM」仍然可点。"
+  };
+  function setExport(n) { ed.dataset.export = String(n); }
+  function setState(st) {
+    document.querySelectorAll(".state-btn").forEach(b => b.setAttribute("aria-selected", String(b.dataset.st === st)));
+    document.getElementById("stateNote").textContent = NOTES[st];
+    ed.dataset.import = st === "import" ? "1" : "0";
+    ed.dataset.fallback = st === "fallback" ? "1" : "0";
+    setExport(st === "export" || st === "fallback" ? 1 : st === "running" ? 2 : st === "done" ? 3 : 0);
+    applyCaps(st === "fallback");
+    if (st !== "edit") setPlaying(false);
+  }
+  function applyCaps(noAac) {
+    noAacNow = noAac;
+    const foot = document.getElementById("capAac");
+    foot.className = noAac ? "n" : "y";
+    foot.innerHTML = '<svg style="width:9px;height:9px"><use href="' + (noAac ? "#i-no" : "#i-check") + '"/></svg>AAC';
+    const row = document.getElementById("capRowAac");
+    row.className = "cap " + (noAac ? "n" : "y");
+    row.innerHTML = '<span class="s"><svg><use href="' + (noAac ? "#i-no" : "#i-check") + '"/></svg></span>AAC 音频编码<em>' + (noAac ? "此浏览器不支持" : "44.1 kHz") + '</em>';
+    // 缺 AAC 时禁掉 MP4，但把原因和出路写在选项里，不让用户去顶部横幅猜
+    const mp4 = document.querySelector('.o[data-fmt="mp4"]');
+    const subMp4 = document.getElementById("subMp4");
+    mp4.dataset.off = noAac ? "1" : "0";
+    mp4.setAttribute("aria-disabled", String(noAac));
+    document.getElementById("tagMp4").innerHTML = noAac
+      ? '<span class="tago">不可用</span>'
+      : '<span class="tagr">推荐</span>';
+    document.getElementById("tagWebm").innerHTML = noAac ? '<span class="tagr">推荐</span>' : "";
+    subMp4.className = noAac ? "sub why" : "sub";
+    subMp4.innerHTML = noAac
+      ? '这个浏览器不能编码 AAC，导出会没有声音 · <span class="whylink">改用 WebM</span>'
+      : "H.264 + AAC · 通用性最好";
+    document.getElementById("subM4a").textContent = noAac
+      ? "缺 AAC，将导出 Opus 音频（.webm）"
+      : "M4A · 只导出混音后的音轨";
+    selectFmt(noAac ? "webm" : "mp4");
+  }
+  document.querySelectorAll(".state-btn").forEach(b => b.addEventListener("click", () => setState(b.dataset.st)));
+
+  document.getElementById("btnExport").addEventListener("click", () => { setPlaying(false); setExport(1); });
+  document.getElementById("btnStart").addEventListener("click", () => setExport(2));
+  document.getElementById("lnkWebm").addEventListener("click", () => { setExport(1); });
+  document.querySelectorAll("[data-close]").forEach(b => b.addEventListener("click", () => setExport(0)));
+  document.querySelectorAll("[data-goto]").forEach(b => b.addEventListener("click", () => setExport(+b.dataset.goto)));
+  document.getElementById("scrim").addEventListener("click", e => { if (e.target.id === "scrim") setExport(0); });
+
+  // 格式决定容器后缀、预计体积和耗时（VP9 走软编，明显慢于 H.264 硬编）
+  const FMT = {
+    mp4:  { ext:"mp4",  frames:"1920 帧", time:"约 24 秒", size:"~82 MB" },
+    webm: { ext:"webm", frames:"1920 帧", time:"约 48 秒", size:"~61 MB" },
+    m4a:  { ext:"m4a",  frames:"仅音频",  time:"约 3 秒",  size:"~1.1 MB" }
+  };
+  let noAacNow = false;
+  function applyFmt(key) {
+    const f = FMT[key]; if (!f) return;
+    // 缺 AAC 时纯音频只能装 Opus，容器也跟着变
+    const ext = (key === "m4a" && noAacNow) ? "webm" : f.ext;
+    document.getElementById("outName").textContent = "夏日骑行_EP07_1080p." + ext;
+    document.getElementById("estFrames").textContent = f.frames;
+    document.getElementById("estTime").textContent = f.time;
+    document.getElementById("estSize").textContent = f.size;
+  }
+  function selectFmt(key) {
+    document.querySelectorAll("#fmtOpts .o").forEach(x => x.setAttribute("aria-checked", String(x.dataset.fmt === key)));
+    applyFmt(key);
+  }
+  document.querySelectorAll("#fmtOpts .o").forEach(o => o.addEventListener("click", e => {
+    if (e.target.closest(".whylink")) { selectFmt("webm"); return; }   // 置灰项里的出路仍然可点
+    if (o.dataset.off === "1") return;
+    selectFmt(o.dataset.fmt);
+  }));
+  document.querySelectorAll(".tab, .tl-bar .ib[aria-pressed], .th .ib").forEach(b => {
+    b.addEventListener("click", () => {
+      if (b.classList.contains("tab")) {
+        b.parentElement.querySelectorAll(".tab").forEach(x => x.setAttribute("aria-selected","false"));
+        b.setAttribute("aria-selected","true");
+      } else b.setAttribute("aria-pressed", b.getAttribute("aria-pressed") === "true" ? "false" : "true");
+    });
+  });
+
+  /* ---------- 启动 ---------- */
+  buildTracks();
+  select(selected);
+  setFrame(1080);
+  document.getElementById("ioChip").textContent = "入出点 " + tc(IN_F) + " – " + tc(OUT_F);
+  new ResizeObserver(() => drawPreview(frame)).observe(prev);
+})();
+</script>
