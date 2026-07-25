@@ -15,6 +15,7 @@ import { framesToTimecode, formatDuration, frameToSeconds } from "../time/timeba
 import { formatFps, toNumber } from "../time/rational";
 // dev 工具走动态 import：只在点击时加载，不进主包
 import type { VerifyResult } from "../dev/verify-m0";
+import type { PreviewVerifyResult } from "../dev/verify-preview";
 
 type Status =
   | { kind: "idle" }
@@ -31,6 +32,7 @@ export function M0Panel({ onBack }: { readonly onBack: () => void }) {
   const [outFrame, setOutFrame] = useState(0);
   const [status, setStatus] = useState<Status>({ kind: "idle" });
   const [verify, setVerify] = useState<VerifyResult | null>(null);
+  const [pv, setPv] = useState<PreviewVerifyResult | null>(null);
   const handleRef = useRef<ExportHandle | null>(null);
   const firstFrameRef = useRef<HTMLCanvasElement>(null);
   const lastFrameRef = useRef<HTMLCanvasElement>(null);
@@ -79,6 +81,24 @@ export function M0Panel({ onBack }: { readonly onBack: () => void }) {
         text: result.passed
           ? `M0 自检通过：${result.checks.length} 项断言全部成立 · ${(result.elapsedMs / 1000).toFixed(1)} 秒`
           : `M0 自检失败：${result.checks.filter((c) => !c.pass).length} 项断言不成立`,
+      });
+    } catch (error) {
+      setStatus({ kind: "error", text: error instanceof Error ? error.message : String(error) });
+    }
+  }, []);
+
+  const runPreviewCheck = useCallback(async () => {
+    setPv(null);
+    setStatus({ kind: "busy", label: "运行预览／导出一致性自检（同一帧两条路径逐像素比对）…" });
+    try {
+      const { verifyPreviewMatchesExport } = await import("../dev/verify-preview");
+      const result = await verifyPreviewMatchesExport();
+      setPv(result);
+      setStatus({
+        kind: result.passed ? "done" : "error",
+        text: result.passed
+          ? `预览与导出画面一致：${result.checks.length} 项断言全部成立`
+          : `不一致：${result.checks.filter((c) => !c.pass).length} 项断言失败`,
       });
     } catch (error) {
       setStatus({ kind: "error", text: error instanceof Error ? error.message : String(error) });
@@ -333,6 +353,42 @@ export function M0Panel({ onBack }: { readonly onBack: () => void }) {
             <figcaption>导出末帧（应为源片 frame 209）</figcaption>
           </figure>
         </div>
+      </section>
+
+      <section>
+        <h2>预览 / 导出一致性自检</h2>
+        <p className="hint" style={{ margin: "0 0 12px" }}>
+          硬规则 2 的护栏：用同一份 EDL、同一帧号分别走预览（<code>video</code> seek）和导出
+          （<code>VideoDecoder</code> 顺序解码）两条路径，再逐像素比对。刻意用方形输出跑，
+          这样 16:9 素材必然产生上下黑边——黑边位置差一个像素就说明两条路径的缩放算法已经分叉。
+        </p>
+        <button type="button" onClick={() => void runPreviewCheck()} disabled={status.kind === "busy"}>
+          运行一致性自检
+        </button>
+
+        {pv && (
+          <>
+            <table className="checks">
+              <tbody>
+                {pv.checks.map((c) => (
+                  <tr key={c.name} className={c.pass ? "ok" : "bad"}>
+                    <td>{c.pass ? "✓" : "✕"}</td>
+                    <td>{c.name}</td>
+                    <td className="mono">{c.actual}</td>
+                    <td className="mono dim">{c.pass ? "" : `期望 ${c.expected}`}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <p className="hint">
+              预览 上边 {pv.preview.top}px · 下边 {pv.preview.bottom}px · 主色 rgb(
+              {pv.preview.meanR}, {pv.preview.meanG}, {pv.preview.meanB})
+              <br />
+              导出 上边 {pv.exported.top}px · 下边 {pv.exported.bottom}px · 主色 rgb(
+              {pv.exported.meanR}, {pv.exported.meanG}, {pv.exported.meanB})
+            </p>
+          </>
+        )}
       </section>
 
       {status.kind === "busy" && <p className="mono">{status.label}</p>}

@@ -13,17 +13,15 @@ import { findClip } from "../state/operations";
 import { clipDuration } from "../edl/types";
 import { formatDuration, framesToTimecode } from "../time/timebase";
 import { formatFps } from "../time/rational";
+import { Preview } from "./Preview";
 import { TimelinePanel } from "./Timeline";
 import {
   IconCheck,
   IconDownload,
   IconFilm,
   IconMark,
-  IconNext,
   IconNo,
-  IconPlay,
   IconPlus,
-  IconPrev,
   IconRedo,
   IconUndo,
   IconWave,
@@ -79,7 +77,7 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
     [loadSource],
   );
 
-  // 快捷键：空格暂留给 M1 子步骤 4 的播放，这里先接编辑相关的
+  // 编辑相关快捷键。空格（播放/暂停）由 Preview 自己接，它持有播放状态
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
@@ -210,46 +208,7 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
           </div>
         </div>
 
-        <div className="stage">
-          <div className="stage-wrap">
-            <div className="screen">
-              <div className="placeholder">
-                {hasContent ? "预览在 M1 子步骤 4 接入（与导出共用 compose）" : "导入素材后在此预览"}
-              </div>
-            </div>
-          </div>
-          <div className="stage-bar">
-            <div className="transport">
-              <button
-                type="button"
-                className="ib"
-                title="上一帧 ←"
-                onClick={() => setPlayhead(playhead - 1)}
-              >
-                <IconPrev />
-              </button>
-              <button type="button" className="ib" title="播放（M1 子步骤 4）" disabled>
-                <IconPlay />
-              </button>
-              <button
-                type="button"
-                className="ib"
-                title="下一帧 →"
-                onClick={() => setPlayhead(playhead + 1)}
-              >
-                <IconNext />
-              </button>
-            </div>
-            <div className="tc">
-              <b>{framesToTimecode(playhead, timeline.fps)}</b>{" "}
-              <span>/ {framesToTimecode(timeline.durationFrames, timeline.fps)}</span>
-            </div>
-            <div className="spacer" />
-            <span className="chip m">
-              帧 {playhead} / {timeline.durationFrames}
-            </span>
-          </div>
-        </div>
+        <Preview />
 
         <div className="pane right">
           <div className="pane-hd">

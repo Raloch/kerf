@@ -167,7 +167,7 @@ export async function runExport(
           break;
         }
 
-        compositor.composeFrame([{ sample: current }]);
+        compositor.composeFrame([{ kind: "sample", sample: current }]);
 
         // await = 背压：编码队列满时这里会等，不会无限堆积 VideoFrame
         await videoSource.add(
