@@ -5,14 +5,22 @@
 完整方案：[docs/PLAN.md](docs/PLAN.md)（选型理由、架构、兼容矩阵、决策记录、里程碑）
 界面设计稿：[design/kerf-editor-mockup.html](design/kerf-editor-mockup.html)（已定稿，四种状态）
 
-当前阶段：**M0 已完成**（decode → compose → encode → mux 跑通），下一步 M1 编辑器骨架。
+当前阶段：**M1 进行中**。M0（decode → compose → encode → mux）已跑通；M1 的状态层已完成，下一步是应用外壳与多轨时间轴渲染（见 PLAN.md §7 的 M1 子步骤表）。
 
 ```bash
 pnpm dev          # 起开发服务器
-pnpm test         # 跑单元测试（时间基，25 项）
+pnpm test         # 跑单元测试（时间基 25 项 + 状态层 65 项）
 pnpm typecheck    # 类型检查，严格模式
 pnpm build        # 构建
 ```
+
+## 状态层约定（M1 起）
+
+- **改 Timeline 只能走 `useTimeline` 的 action**，它们内部统一经 `apply()` 进撤销栈。绕过去直接 `set({ history })` 会产生撤销不了的编辑，是最难查的一类 bug。
+- **编辑逻辑写在 `src/state/operations.ts` 的纯函数里**，不要写进组件或 store。那里能脱离浏览器单测，而移动/裁切/切分的边界条件多到必须靠测试锁死。
+- **同一轨道内片段永不重叠**，这是核心不变量。越界操作返回 `changed:false` + `reason`，不要静默失败。
+- **播放头和选中不进撤销栈**；但撤销后要清掉指向已不存在片段的选中。
+- 连续拖拽必须传带对象标识的合并键（`move:${clipId}`），否则用户要按几十次 ⌘Z。
 
 **改动导出管道或时间基后，必须跑 M0 自检**：`pnpm dev` → 页面上点「运行 M0 自检」，它会生成素材、导出 trim 区间、读回断言 14 项。帧数/时长/trim 起点错了不会报错，只会静默产出错误的片子，单元测试也覆盖不到——只有这个自检能发现。
 

@@ -44,6 +44,8 @@ export interface Clip {
   readonly timelineIn: number;
   readonly timelineOut: number;
   readonly sourceIn: number;
+  /** 片段标签，缺省时 UI 回退到素材名。冲突提示也用它。 */
+  readonly name?: string | undefined;
   /** M2 起承载滤镜/变换/关键帧。M0 恒为空。 */
   readonly effects?: readonly never[];
 }
@@ -52,8 +54,12 @@ export interface Track {
   readonly id: TrackId;
   readonly kind: TrackKind;
   readonly clips: readonly Clip[];
-  readonly muted?: boolean;
-  readonly hidden?: boolean;
+  /** 轨道头显示的名称，例如「主视频」「人声」。 */
+  readonly label?: string | undefined;
+  readonly muted?: boolean | undefined;
+  readonly hidden?: boolean | undefined;
+  /** 锁定后所有编辑操作被拒绝。UI 上是轨道头的锁图标。 */
+  readonly locked?: boolean | undefined;
 }
 
 /** 一个项目的完整可渲染状态。不可变——改动产生新对象，以便撤销栈直接持有快照。 */
