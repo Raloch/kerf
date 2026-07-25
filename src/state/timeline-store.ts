@@ -66,6 +66,8 @@ export interface TimelineState {
   zoom: number;
   /** 最近一次被拒绝的操作原因，供 UI 提示；成功操作会清空。 */
   lastRejection: string | null;
+  /** 拖拽过程中的即时提示（落点非法的原因）。拖拽结束清空，不进撤销栈。 */
+  dragHint: string | null;
 
   // ---- 读 ----
   timeline: () => Timeline;
@@ -88,6 +90,7 @@ export interface TimelineState {
   select: (clipId: ClipId | null) => void;
   toggleSnap: () => void;
   setZoom: (zoom: number) => void;
+  setDragHint: (hint: string | null) => void;
   undo: () => void;
   redo: () => void;
 }
@@ -115,6 +118,7 @@ export const useTimeline = create<TimelineState>((set, get) => {
     snapEnabled: true, // 默认开，见 PLAN.md 决策 D2
     zoom: 42,
     lastRejection: null,
+    dragHint: null,
 
     timeline: () => current(get().history),
     canUndo: () => histCanUndo(get().history),
@@ -259,6 +263,10 @@ export const useTimeline = create<TimelineState>((set, get) => {
       set((state) => ({ snapEnabled: !state.snapEnabled }));
     },
 
+    setDragHint(hint) {
+      set({ dragHint: hint });
+    },
+
     setZoom(zoom) {
       // 夹住范围：0 会让所有片段宽度归零，过大则一帧几十像素、滚动条失控
       set({ zoom: Math.max(4, Math.min(400, Math.round(zoom))) });
@@ -298,3 +306,15 @@ export const useTimeline = create<TimelineState>((set, get) => {
     },
   };
 });
+
+/**
+ * 开发期把 store 挂到全局，供浏览器控制台和自动化实测脚本驱动**真实**实例。
+ *
+ * 不这样做的话，脚本里 `import('/src/state/timeline-store.ts')` 会因为 Vite 的
+ * HMR URL 带参数而拿到另一个模块实例——脚本改了状态，界面毫无反应，
+ * 看起来像 UI 没绑定 store，实际是两份状态各自为政。排查过一次，记在这里。
+ */
+if (import.meta.env.DEV) {
+  (globalThis as typeof globalThis & { __kerfStore?: typeof useTimeline }).__kerfStore =
+    useTimeline;
+}

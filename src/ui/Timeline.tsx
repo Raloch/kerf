@@ -9,10 +9,11 @@
  */
 
 import { useCallback, useMemo, useRef, type PointerEvent as ReactPointerEvent } from "react";
-import { clipDuration, type Clip, type Timeline as Tl, type Track } from "../edl/types";
+import { clipDuration, type Clip, type Timeline as Tl, type Track, type TrackId } from "../edl/types";
 import { framesToTimecode } from "../time/timebase";
 import { toNumber } from "../time/rational";
 import { useTimeline } from "../state/timeline-store";
+import { ghostForTrack, useClipDrag, type ClipDragApi, type Ghost } from "./use-clip-drag";
 import { IconCut, IconEye, IconFilm, IconLock, IconMagnet, IconMute, IconPlus, IconTrash, IconVolume, IconWave } from "./icons";
 
 /** 缩放滑块的取值范围（每帧像素数 × 100）。 */
@@ -34,6 +35,7 @@ export function TimelinePanel() {
 
   const pxPerFrame = zoom / 100;
   const ticksRef = useRef<HTMLDivElement>(null);
+  const drag = useClipDrag(pxPerFrame);
 
   // 时间轴至少铺满可视宽度，否则空项目时标尺是一条短线
   const contentWidth = Math.max(1, timeline.durationFrames) * pxPerFrame;
@@ -157,10 +159,15 @@ export function TimelinePanel() {
                 pxPerFrame={pxPerFrame}
                 selectedClipId={selectedClipId}
                 onSelect={select}
+                drag={drag}
               />
             ))}
             <div className="ph-layer">
               <div className="playhead" style={{ left: `${playhead * pxPerFrame}px` }} />
+              {/* 吸附辅助线：贯穿所有轨道，让用户看清贴住了什么 */}
+              {drag.snapLine !== null && (
+                <div className="snapline" style={{ left: `${drag.snapLine * pxPerFrame}px` }} />
+              )}
             </div>
           </div>
         </div>
@@ -218,14 +225,17 @@ function TrackRow({
   pxPerFrame,
   selectedClipId,
   onSelect,
+  drag,
 }: {
   track: Track;
   timeline: Tl;
   pxPerFrame: number;
   selectedClipId: string | null;
   onSelect: (id: string) => void;
+  drag: ClipDragApi;
 }) {
   const isAudio = track.kind === "audio";
+  const ghost = ghostForTrack(drag.ghost, track.id);
   return (
     <div className={`trk h-${track.kind}`}>
       <div className="th">
@@ -252,20 +262,40 @@ function TrackRow({
           <IconLock />
         </button>
       </div>
-      <div className="lane">
+      {/* data-track-id 供拖拽时做几何命中测试，判断落在哪条轨道 */}
+      <div className="lane" data-track-id={track.id}>
         {track.clips.map((clip) => (
           <ClipView
             key={clip.id}
             clip={clip}
             timeline={timeline}
             kind={track.kind}
+            trackId={track.id}
             pxPerFrame={pxPerFrame}
             selected={clip.id === selectedClipId}
             onSelect={onSelect}
+            drag={drag}
           />
         ))}
+        {ghost && <GhostView ghost={ghost} pxPerFrame={pxPerFrame} />}
       </div>
     </div>
+  );
+}
+
+/**
+ * 落点预览。只用颜色区分合法/非法——非法原因由状态栏显示，
+ * 因为片段窄时（默认缩放下 180 帧只有 75px）幽灵里根本装不下文字。
+ */
+function GhostView({ ghost, pxPerFrame }: { ghost: Ghost; pxPerFrame: number }) {
+  return (
+    <div
+      className={`ghost${ghost.valid ? "" : " invalid"}`}
+      style={{
+        left: `${ghost.inFrame * pxPerFrame}px`,
+        width: `${ghost.lengthFrames * pxPerFrame}px`,
+      }}
+    />
   );
 }
 
@@ -273,42 +303,65 @@ function ClipView({
   clip,
   timeline,
   kind,
+  trackId,
   pxPerFrame,
   selected,
   onSelect,
+  drag,
 }: {
   clip: Clip;
   timeline: Tl;
   kind: "video" | "audio";
+  trackId: TrackId;
   pxPerFrame: number;
   selected: boolean;
   onSelect: (id: string) => void;
+  drag: ClipDragApi;
 }) {
   const source = timeline.sources.find((s) => s.id === clip.sourceId);
   const label = clip.name ?? source?.name ?? clip.id;
   const length = clipDuration(clip);
+  const widthPx = length * pxPerFrame;
 
   return (
-    <button
-      type="button"
+    <div
       className="clip"
       role="option"
+      tabIndex={0}
       aria-selected={selected}
       title={`${label} · ${framesToTimecode(clip.timelineIn, timeline.fps)} → ${framesToTimecode(clip.timelineOut, timeline.fps)}`}
       style={{
         left: `${clip.timelineIn * pxPerFrame}px`,
-        width: `${length * pxPerFrame}px`,
+        width: `${widthPx}px`,
         ["--fill" as string]: kind === "video" ? "var(--c-video)" : "var(--c-audio)",
         ["--band" as string]: kind === "video" ? "var(--c-video-hi)" : "var(--c-audio-hi)",
       }}
-      onClick={() => onSelect(clip.id)}
+      onPointerDown={(e) => drag.onClipPointerDown(e, clip, trackId)}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onSelect(clip.id);
+        }
+      }}
     >
       <span className="lbl">
         {kind === "video" ? <IconFilm /> : <IconWave />}
         {label}
       </span>
       {/* 片段太窄时藏掉帧数，否则会溢出成一团 */}
-      {length * pxPerFrame > 56 && <span className="len m">{length}f</span>}
-    </button>
+      {widthPx > 56 && <span className="len m">{length}f</span>}
+
+      {/* 裁切手柄。窄片段也要留出可抓区域，否则短片段无法裁切 */}
+      <span
+        className="grip l"
+        title="裁切入点（拖动同时改变引用源片的起点）"
+        onPointerDown={(e) => drag.onHandlePointerDown(e, clip, trackId, "in")}
+      />
+      <span
+        className="grip r"
+        title="裁切出点"
+        onPointerDown={(e) => drag.onHandlePointerDown(e, clip, trackId, "out")}
+      />
+    </div>
   );
 }

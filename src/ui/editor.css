@@ -709,6 +709,85 @@
   font-size: 9px;
   color: rgba(255, 255, 255, 0.62);
 }
+/* ---------- 拖拽反馈 ---------- */
+.ed .clip {
+  cursor: grab;
+  touch-action: none; /* 不写会被浏览器的滚动手势抢走 pointermove */
+}
+.ed .clip:active {
+  cursor: grabbing;
+}
+.ed .grip {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 7px;
+  z-index: 4;
+  touch-action: none;
+}
+.ed .grip.l {
+  left: 0;
+  cursor: w-resize;
+}
+.ed .grip.r {
+  right: 0;
+  cursor: e-resize;
+}
+.ed .clip:hover .grip::before {
+  content: "";
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  left: 2px;
+  width: 2px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.55);
+}
+
+/* 幽灵：拖拽中的落点预览。合法为铜色虚框，非法为红色 */
+.ed .ghost {
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  border-radius: 4px;
+  border: 1.5px dashed var(--kerf);
+  background: var(--kerf-glow);
+  pointer-events: none;
+  z-index: 8;
+  display: flex;
+  align-items: center;
+  padding: 0 6px;
+  overflow: hidden;
+}
+.ed .ghost.invalid {
+  border-color: var(--bad);
+  background: rgba(200, 86, 78, 0.16);
+}
+.ed .ghost .why {
+  font-size: 10px;
+  color: #f3c3bf;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 吸附辅助线：贯穿轨道区，说明贴住了哪个位置 */
+.ed .snapline {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: repeating-linear-gradient(
+    to bottom,
+    var(--kerf) 0,
+    var(--kerf) 4px,
+    transparent 4px,
+    transparent 8px
+  );
+  z-index: 19;
+  pointer-events: none;
+}
+
 .ed .playhead {
   position: absolute;
   top: 0;

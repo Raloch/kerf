@@ -35,6 +35,7 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
   const playhead = useTimeline((s) => s.playhead);
   const selectedClipId = useTimeline((s) => s.selectedClipId);
   const lastRejection = useTimeline((s) => s.lastRejection);
+  const dragHint = useTimeline((s) => s.dragHint);
   const loadSource = useTimeline((s) => s.loadSource);
   const setPlayhead = useTimeline((s) => s.setPlayhead);
   const undo = useTimeline((s) => s.undo);
@@ -329,7 +330,10 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
           {framesToTimecode(playhead, timeline.fps)} · 帧 {playhead}
         </span>
         <span className="sel">
-          {error ? (
+          {/* 拖拽提示优先：它是正在进行的操作的实时反馈 */}
+          {dragHint ? (
+            <span className="reject">{dragHint}</span>
+          ) : error ? (
             <span className="reject">{error}</span>
           ) : lastRejection ? (
             <span className="reject">{lastRejection}</span>

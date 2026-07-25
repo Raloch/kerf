@@ -5,7 +5,7 @@
 完整方案：[docs/PLAN.md](docs/PLAN.md)（选型理由、架构、兼容矩阵、决策记录、里程碑）
 界面设计稿：[design/kerf-editor-mockup.html](design/kerf-editor-mockup.html)（已定稿，四种状态）
 
-当前阶段：**M1 进行中**。M0（decode → compose → encode → mux）已跑通；M1 的状态层与编辑器外壳/时间轴渲染已完成，下一步是拖拽/裁切/磁吸交互（见 PLAN.md §7 的 M1 子步骤表）。
+当前阶段：**M1 进行中**。M0（decode → compose → encode → mux）已跑通；M1 的状态层、编辑器外壳/时间轴渲染、拖拽/裁切/磁吸交互已完成，下一步是预览播放器（见 PLAN.md §7 的 M1 子步骤表）。
 
 ```bash
 pnpm dev          # 起开发服务器
@@ -27,6 +27,8 @@ pnpm build        # 构建
 - **新增样式文件先作用域化**：`app.css` 限定 `.m0`、`editor.css` 限定 `.ed`。曾因 `app.css` 里的 `label` / `button` 裸选择器和同名 `.caps` 类，把编辑器状态栏和缩放滑块变成纵向排列。
 - **像素与帧的换算只有一处**（`Timeline` 的 `pxPerFrame`），位置一律由帧号乘它算出。不要缓存像素值再反推帧号，缩放后必错。
 - 改完 UI 要在浏览器里实测，不能只看类型通过——布局 bug（撑爆容器、播放头错位、文字重叠）只有渲染出来才看得见。
+- **浏览器实测要用 `window.__kerfStore`**（dev 环境自动挂载），不要在脚本里 `import('/src/state/timeline-store.ts')`：Vite 的 HMR URL 带参数，动态 import 会拿到**另一个模块实例**，脚本改了状态界面毫无反应，看起来像 UI 没绑定 store。
+- 拖拽类交互要**同时测水平和垂直**：跨轨道是纯垂直移动，只测水平会漏掉阈值判定的 bug。
 
 **改动导出管道或时间基后，必须跑 M0 自检**：`pnpm dev` → 页面上点「运行 M0 自检」，它会生成素材、导出 trim 区间、读回断言 14 项。帧数/时长/trim 起点错了不会报错，只会静默产出错误的片子，单元测试也覆盖不到——只有这个自检能发现。
 
