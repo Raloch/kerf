@@ -1,0 +1,791 @@
+/**
+ * 编辑器样式。色板与布局照 design/kerf-editor-mockup.html 定稿实现。
+ *
+ * 两条来自设计稿的硬约束（都是实测踩过的）：
+ * - 固定高度的 flex/grid 容器里，子元素必须 min-height: 0，
+ *   否则内容会撑爆容器把下方区域压掉。
+ * - 轨道区的播放头层必须偏移轨道头宽度（left: var(--head-w)），
+ *   否则它相对整个时间轴定位，会和标尺上的播放头错位。
+ */
+
+.ed {
+  --pxf: 0.42; /* 每帧像素数，由缩放控制 */
+  --head-w: 132px;
+
+  --ink: #0e1214;
+  --panel: #161b1e;
+  --panel-2: #1d2327;
+  --panel-3: #232b2f;
+  --line: #2a3237;
+  --line-2: #384349;
+  --tx: #e4e8e9;
+  --tx-dim: #8b979c;
+  --tx-faint: #5f6c71;
+
+  /* 强调色：只用于播放头 / 选中 / 主操作，别处一律灰调 */
+  --kerf: #e8a33d;
+  --kerf-soft: #8a6224;
+  --kerf-glow: rgba(232, 163, 61, 0.18);
+
+  --c-video: #33586a;
+  --c-video-hi: #4b7b90;
+  --c-audio: #46614f;
+  --c-audio-hi: #648a70;
+
+  --ok: #57a87a;
+  --bad: #c8564e;
+
+  --ui: "Avenir Next", Avenir, "Segoe UI", system-ui, -apple-system, sans-serif;
+  --mono: "SF Mono", "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--ink);
+  color: var(--tx);
+  font-family: var(--ui);
+  font-size: 12px;
+  overflow: hidden;
+}
+.ed *, .ed *::before, .ed *::after {
+  box-sizing: border-box;
+}
+.ed .m {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.ed *::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+.ed *::-webkit-scrollbar-track {
+  background: var(--ink);
+}
+.ed *::-webkit-scrollbar-thumb {
+  background: var(--line-2);
+  border-radius: 5px;
+  border: 2px solid var(--ink);
+}
+/* ---------- 顶栏 ---------- */
+.ed-top {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  height: 46px;
+  padding: 0 12px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+.ed .brand {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding-right: 12px;
+  border-right: 1px solid var(--line);
+  height: 24px;
+}
+.ed .brand b {
+  font-size: 14px;
+  letter-spacing: 0.06em;
+  font-weight: 600;
+}
+.ed .mark {
+  width: 15px;
+  height: 19px;
+  color: var(--kerf);
+  flex: none;
+}
+.ed .proj {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.25;
+  min-width: 0;
+}
+.ed .proj .name {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.ed .proj .sub {
+  font-size: 10.5px;
+  color: var(--tx-faint);
+}
+.ed .spacer {
+  flex: 1 1 auto;
+}
+.ed .ico-row {
+  display: flex;
+  gap: 2px;
+  align-items: center;
+}
+.ed .ib {
+  width: 27px;
+  height: 27px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--tx-dim);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  padding: 0;
+  transition: background 0.14s, color 0.14s;
+}
+.ed .ib:hover:not(:disabled) {
+  background: var(--panel-3);
+  color: var(--tx);
+}
+.ed .ib[aria-pressed="true"] {
+  background: var(--kerf-glow);
+  color: var(--kerf);
+}
+.ed .ib:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+.ed .ib svg {
+  width: 15px;
+  height: 15px;
+}
+.ed .ib.sm {
+  width: 23px;
+  height: 23px;
+}
+.ed .ib.sm svg {
+  width: 13px;
+  height: 13px;
+}
+.ed .ib:focus-visible, .ed .btn-primary:focus-visible, .ed .chip-btn:focus-visible {
+  outline: 2px solid var(--kerf);
+  outline-offset: 1px;
+}
+.ed .chip {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--tx-dim);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 4px 8px;
+  white-space: nowrap;
+}
+.ed .chip-btn {
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--tx-dim);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+.ed .chip-btn:hover {
+  color: var(--tx);
+  background: var(--panel-3);
+}
+.ed .btn-primary {
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  background: var(--kerf);
+  color: #17120a;
+  border: 0;
+  border-radius: 5px;
+  padding: 7px 16px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.ed .btn-primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+.ed .btn-primary:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.ed .btn-primary svg {
+  width: 14px;
+  height: 14px;
+}
+/* ---------- 主体三栏 ---------- */
+.ed-body {
+  flex: 1 1 auto;
+  min-height: 0; /* 不写这行下方时间轴会被撑掉 */
+  display: grid;
+  grid-template-columns: 232px minmax(0, 1fr) 248px;
+  overflow: hidden;
+}
+.ed .pane {
+  background: var(--panel);
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+.ed .pane.left {
+  border-right: 1px solid var(--line);
+}
+.ed .pane.right {
+  border-left: 1px solid var(--line);
+}
+.ed .pane-hd {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 31px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--line);
+}
+.ed .pane-hd h3 {
+  margin: 0;
+  font-size: 10.5px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--tx-faint);
+  font-weight: 600;
+}
+.ed .pane-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+.ed .empty {
+  padding: 16px 12px;
+  font-size: 11.5px;
+  color: var(--tx-faint);
+  line-height: 1.6;
+}
+/* ---------- 素材库 ---------- */
+.ed .assets {
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.ed .asset {
+  display: grid;
+  grid-template-columns: 56px 1fr;
+  gap: 9px;
+  padding: 5px;
+  border-radius: 5px;
+  align-items: center;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.ed .asset:hover {
+  background: var(--panel-2);
+}
+.ed .asset .thumb {
+  aspect-ratio: 16/9;
+  border-radius: 3px;
+  background: var(--ink);
+  border: 1px solid var(--line);
+  display: grid;
+  place-items: center;
+  color: var(--tx-faint);
+}
+.ed .asset .thumb svg {
+  width: 15px;
+  height: 15px;
+}
+/* 名称与规格必须各占一行：span 默认 inline，不写 block 会并排挤出去 */
+.ed .asset > span:last-child {
+  min-width: 0;
+}
+.ed .asset .nm {
+  display: block;
+  font-size: 11.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ed .asset .meta {
+  display: block;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--tx-faint);
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ed .pool-foot {
+  flex: none;
+  padding: 8px;
+  border-top: 1px solid var(--line);
+}
+.ed .file-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  background: var(--panel-2);
+  color: var(--tx);
+  border: 1px solid var(--line-2);
+  border-radius: 5px;
+  padding: 8px 12px;
+}
+.ed .file-btn:hover {
+  background: var(--panel-3);
+}
+.ed .file-btn input {
+  display: none;
+}
+.ed .file-btn svg {
+  width: 13px;
+  height: 13px;
+}
+/* ---------- 预览 ---------- */
+.ed .stage {
+  background: var(--ink);
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+.ed .stage-wrap {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 13px;
+}
+.ed .screen {
+  position: relative;
+  flex: 0 1 auto;
+  height: 100%;
+  width: auto;
+  max-width: 100%;
+  aspect-ratio: 16/9;
+  background: #000;
+  border-radius: 3px;
+  overflow: hidden;
+  box-shadow: 0 0 0 1px var(--line), 0 10px 30px -14px rgba(0, 0, 0, 0.9);
+}
+.ed .screen canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.ed .screen .placeholder {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: var(--tx-faint);
+  font-size: 11.5px;
+}
+.ed .stage-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 10px;
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+}
+.ed .tc {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+}
+.ed .tc b {
+  font-weight: 600;
+}
+.ed .tc span {
+  color: var(--tx-faint);
+}
+.ed .transport {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+}
+/* ---------- 检查器 ---------- */
+.ed .insp-hd {
+  padding: 9px 11px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.ed .swatch {
+  width: 3px;
+  height: 24px;
+  border-radius: 2px;
+  flex: none;
+}
+.ed .insp-hd .n {
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ed .insp-hd .s {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--tx-faint);
+}
+.ed .fields {
+  padding: 10px 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.ed .f {
+  display: grid;
+  grid-template-columns: 62px 1fr;
+  align-items: center;
+  gap: 8px;
+}
+.ed .f > label {
+  font-size: 10.5px;
+  line-height: 1.3;
+  color: var(--tx-dim);
+}
+.ed .f .val {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--tx);
+}
+.ed .grp-title {
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--tx-faint);
+  font-weight: 600;
+  padding: 10px 11px 0;
+}
+/* ---------- 时间轴 ---------- */
+/* 高度要容得下 5 条默认轨道：工具条 32 + 标尺 25 + 轨道 (54×3 + 44×2) = 307。
+   给到 316 留余量；轨道更多时靠 .tl-scroll 滚动兜底。 */
+.ed .tl {
+  flex: none;
+  height: 316px;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+}
+.ed .tl-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 32px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--line);
+}
+.ed .tl-bar .sep {
+  width: 1px;
+  height: 17px;
+  background: var(--line);
+}
+.ed .zoom {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 150px;
+}
+.ed .zoom span {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--tx-faint);
+}
+.ed input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  flex: 1 1 auto;
+  height: 3px;
+  border-radius: 3px;
+  background: var(--line-2);
+}
+.ed input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--tx);
+  cursor: pointer;
+}
+.ed input[type="range"]:focus-visible {
+  outline: 2px solid var(--kerf);
+  outline-offset: 3px;
+}
+.ed .tl-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+.ed .tl-inner {
+  min-width: 100%;
+  width: max-content;
+}
+.ed .ruler {
+  position: sticky;
+  top: 0;
+  z-index: 12;
+  height: 25px;
+  display: grid;
+  grid-template-columns: var(--head-w) 1fr;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel-2);
+}
+.ed .ruler .rh {
+  border-right: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  padding-left: 10px;
+  background: var(--panel-2);
+}
+.ed .ruler .rh span {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--tx-faint);
+  letter-spacing: 0.06em;
+}
+.ed .ticks {
+  position: relative;
+  cursor: ew-resize;
+  overflow: hidden;
+}
+.ed .tick {
+  position: absolute;
+  bottom: 0;
+  width: 1px;
+  background: var(--line-2);
+}
+.ed .tick.maj {
+  height: 10px;
+}
+.ed .tick.min {
+  height: 5px;
+}
+.ed .tick-lbl {
+  position: absolute;
+  top: 3px;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 9.5px;
+  color: var(--tx-faint);
+  transform: translateX(3px);
+  pointer-events: none;
+}
+.ed .tracks {
+  position: relative;
+}
+.ed .trk {
+  display: grid;
+  grid-template-columns: var(--head-w) 1fr;
+  border-bottom: 1px solid var(--line-2);
+}
+.ed .trk:last-child {
+  border-bottom: 0;
+}
+.ed .th {
+  border-right: 1px solid var(--line);
+  background: var(--panel-2);
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 6px 0 9px;
+  position: sticky;
+  left: 0;
+  z-index: 6;
+}
+.ed .th .lb {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.ed .th .lb .k {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--tx-dim);
+  letter-spacing: 0.04em;
+}
+.ed .th .lb .d {
+  font-size: 10px;
+  color: var(--tx-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ed .lane {
+  position: relative;
+  background: repeating-linear-gradient(
+    to right,
+    transparent 0,
+    transparent calc(var(--pxf) * 30 - 1px),
+    rgba(255, 255, 255, 0.028) calc(var(--pxf) * 30 - 1px),
+    rgba(255, 255, 255, 0.028) calc(var(--pxf) * 30)
+  );
+}
+.ed .trk.h-video .lane, .ed .trk.h-video .th {
+  height: 54px;
+}
+.ed .trk.h-audio .lane, .ed .trk.h-audio .th {
+  height: 44px;
+}
+.ed .clip {
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  border-radius: 4px;
+  overflow: hidden;
+  cursor: pointer;
+  border: 1px solid rgba(0, 0, 0, 0.45);
+  background: var(--fill);
+  padding: 0;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+}
+.ed .clip::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 3px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.09);
+  pointer-events: none;
+}
+.ed .clip:hover {
+  filter: brightness(1.14);
+}
+.ed .clip[aria-selected="true"] {
+  outline: 1.5px solid var(--kerf);
+  outline-offset: -1px;
+  z-index: 3;
+  box-shadow: 0 0 0 3px var(--kerf-glow);
+}
+.ed .clip:focus-visible {
+  outline: 2px solid var(--kerf);
+  outline-offset: -1px;
+}
+.ed .clip .lbl {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 15px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 5px;
+  font-size: 10px;
+  color: rgba(255, 255, 255, 0.94);
+  background: var(--band);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ed .clip .lbl svg {
+  width: 9px;
+  height: 9px;
+  flex: none;
+  opacity: 0.85;
+}
+.ed .clip .len {
+  position: absolute;
+  left: 4px;
+  bottom: 3px;
+  font-family: var(--mono);
+  font-size: 9px;
+  color: rgba(255, 255, 255, 0.62);
+}
+.ed .playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--kerf);
+  z-index: 20;
+  pointer-events: none;
+  box-shadow: 0 0 7px rgba(232, 163, 61, 0.55);
+}
+.ed .ph-head::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: -5px;
+  width: 11px;
+  height: 9px;
+  background: var(--kerf);
+  clip-path: polygon(0 0, 100% 0, 100% 55%, 50% 100%, 0 55%);
+}
+/* 必须偏移轨道头宽度，否则与标尺上的播放头错位 */
+.ed .ph-layer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: var(--head-w);
+  right: 0;
+  pointer-events: none;
+}
+/* ---------- 底部状态栏 ---------- */
+.ed-foot {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 27px;
+  padding: 0 11px;
+  background: var(--panel-2);
+  border-top: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--tx-faint);
+}
+.ed-foot .sel {
+  color: var(--tx-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ed-foot .reject {
+  color: var(--bad);
+}
+.ed .caps {
+  display: flex;
+  gap: 10px;
+  flex: none;
+}
+.ed .caps i {
+  font-style: normal;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.ed .caps i.y {
+  color: var(--ok);
+}
+.ed .caps i.n {
+  color: var(--bad);
+}
+.ed .caps svg {
+  width: 9px;
+  height: 9px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ed *,
+  .ed *::before,
+  .ed *::after {
+    transition-duration: 0.001s !important;
+  }
+}

@@ -62,6 +62,8 @@ export interface TimelineState {
   playhead: number;
   selectedClipId: ClipId | null;
   snapEnabled: boolean;
+  /** 时间轴缩放：每帧像素数 × 100。UI 状态，不进撤销栈。 */
+  zoom: number;
   /** 最近一次被拒绝的操作原因，供 UI 提示；成功操作会清空。 */
   lastRejection: string | null;
 
@@ -85,6 +87,7 @@ export interface TimelineState {
   setPlayhead: (frame: number) => void;
   select: (clipId: ClipId | null) => void;
   toggleSnap: () => void;
+  setZoom: (zoom: number) => void;
   undo: () => void;
   redo: () => void;
 }
@@ -110,6 +113,7 @@ export const useTimeline = create<TimelineState>((set, get) => {
     playhead: 0,
     selectedClipId: null,
     snapEnabled: true, // 默认开，见 PLAN.md 决策 D2
+    zoom: 42,
     lastRejection: null,
 
     timeline: () => current(get().history),
@@ -253,6 +257,11 @@ export const useTimeline = create<TimelineState>((set, get) => {
 
     toggleSnap() {
       set((state) => ({ snapEnabled: !state.snapEnabled }));
+    },
+
+    setZoom(zoom) {
+      // 夹住范围：0 会让所有片段宽度归零，过大则一帧几十像素、滚动条失控
+      set({ zoom: Math.max(4, Math.min(400, Math.round(zoom))) });
     },
 
     undo() {
