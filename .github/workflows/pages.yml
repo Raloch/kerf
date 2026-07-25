@@ -1,0 +1,56 @@
+name: 部署设计稿到 GitHub Pages
+
+# 设计稿是自包含单文件（内联样式与脚本、无外部依赖），所以站点不需要构建，
+# 复制成 index.html 即可。第三方 HTML 预览服务（githack / jsdelivr）都不适合做公开入口：
+# githack 对顶层导航会插一个防钓鱼确认页，jsdelivr 以 text/plain 返回、浏览器不渲染。
+#
+# M1 有可运行的编辑器之后，把「组装站点」那一步换成 pnpm build 并改 path 即可。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "design/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同时只允许一个部署，新的推送取消进行中的旧部署
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 组装站点
+        run: |
+          mkdir -p _site
+          # 根路径直接是设计稿
+          cp design/kerf-editor-mockup.html _site/index.html
+          # 原文件名也保留一份，旧链接不失效
+          cp design/kerf-editor-mockup.html _site/kerf-editor-mockup.html
+
+      - name: 配置 Pages
+        uses: actions/configure-pages@v5
+        with:
+          # 仓库尚未开启 Pages 时尝试自动开启，省去手动进设置页
+          enablement: true
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: 部署
+        id: deployment
+        uses: actions/deploy-pages@v4
