@@ -41,11 +41,11 @@ jobs:
           # 原文件名也保留一份，旧链接不失效
           cp design/kerf-editor-mockup.html _site/kerf-editor-mockup.html
 
+      # 首次使用需要先在 Settings → Pages 把 Source 选成「GitHub Actions」。
+      # 不用 enablement: true 自动开启——那需要 administration: write，
+      # 默认的 GITHUB_TOKEN 没有这个权限，只会让这一步直接失败。
       - name: 配置 Pages
         uses: actions/configure-pages@v5
-        with:
-          # 仓库尚未开启 Pages 时尝试自动开启，省去手动进设置页
-          enablement: true
 
       - uses: actions/upload-pages-artifact@v3
         with:
