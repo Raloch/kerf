@@ -41,7 +41,7 @@ pnpm dev
 其他命令：
 
 ```bash
-pnpm test         # 单元测试，115 项（时间基 / 状态层 / 取样映射 / 导出预设）
+pnpm test         # 单元测试，119 项（时间基 / 状态层 / 取样映射 / 导出预设）
 pnpm typecheck    # 类型检查（strict + noUncheckedIndexedAccess + exactOptionalPropertyTypes）
 pnpm build        # 生产构建
 ```
@@ -90,7 +90,7 @@ src/
 ├─ export/      导出流水线 + 取帧游标 + Worker + 流式写盘 + 预设
 ├─ preview/     预览引擎（seek + rAF 采样）
 ├─ ui/          编辑器四区布局、时间轴、导出面板
-└─ dev/         测试素材生成 + 三个自检脚本
+└─ dev/         测试素材生成 + 四个自检脚本
 design/         界面设计稿
 docs/PLAN.md    技术方案（活文档）
 ```

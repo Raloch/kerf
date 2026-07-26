@@ -8,6 +8,11 @@
  *    而按公式算的「存档母版」只有 2 Mbps，四个档位直接倒挂。
  * 2. **奇数尺寸**。H.264 的 4:2:0 要求宽高能被 2 整除，奇数在一些编码器上
  *    直接报错，在另一些上静默裁掉一行。
+ * 3. **竖屏按长边封顶**。曾经按高度封顶，1080×1920 选「1080p」被压成
+ *    608×1080——像素量只剩三分之一，而标签上仍写着 1080p。这条最阴险的地方是
+ *    **原来的测试把错误行为断言死了**（`expect(r.width).toBe(608)`），
+ *    改对反而会让测试变红。断言写的是"当前行为"而不是"应有行为"时，
+ *    测试就从护栏变成了水泥。
  */
 
 import { describe, expect, it } from "vitest";
@@ -55,10 +60,51 @@ describe("resolvePreset", () => {
     }
   });
 
-  it("竖屏素材按高度限制，宽度跟着比例算，不会被拉成横向", () => {
+  it("竖屏 1080×1920 选「1080p」原样输出，不被压成 608×1080", () => {
+    // 这条曾经断言的正是错误行为（expect(width).toBe(608)）。按高度封顶会让
+    // 竖屏只剩三分之一像素，而标签上还写着 1080p——竖屏语境里 1080p 是短边 1080
     const r = resolvePreset(byId("standard"), 1080, 1920, FPS.ntsc30);
-    expect(r.height).toBe(1080);
-    expect(r.width).toBe(608); // 1080 * 1080/1920 = 607.5 → 偶数取 608
+    expect(r.width).toBe(1080);
+    expect(r.height).toBe(1920);
+  });
+
+  it("横竖屏在同一预设下得到相同的像素量（短边口径的定义）", () => {
+    const landscape = resolvePreset(byId("standard"), 1920, 1080, FPS.ntsc30);
+    const portrait = resolvePreset(byId("standard"), 1080, 1920, FPS.ntsc30);
+    expect(landscape.width * landscape.height).toBe(portrait.width * portrait.height);
+    // 码率也该一样：同样的像素量、同样的画质档位
+    expect(portrait.videoBitrate).toBe(landscape.videoBitrate);
+  });
+
+  it("超过上限的竖屏按短边缩，不变形", () => {
+    // 真实素材尺寸（一次实际导出里出现过 1232×2160）
+    const r = resolvePreset(byId("standard"), 1232, 2160, FPS.ntsc30);
+    expect(r.width).toBe(1080);
+    // 2160 * 1080/1232 = 1893.5 → 四舍五入 1894，已是偶数
+    expect(r.height).toBe(1894);
+    // 长宽比偏差不超过 1 像素
+    expect(Math.abs(r.width / r.height - 1232 / 2160)).toBeLessThan(0.001);
+  });
+
+  it("竖屏的档位标签写短边，不写长边", () => {
+    const preset = byId("standard");
+    const portrait = describePreset(resolvePreset(preset, 1080, 1920, FPS.ntsc30), preset);
+    expect(portrait).toMatch(/^1080p · /); // 不是 1920p
+    // 同一预设下横竖屏的标签应当完全一致——像素量相同，档位相同。
+    // 不写死码率数字：那是 bitsPerPixel 常数的函数，改档位不该让这条变红
+    expect(portrait).toBe(describePreset(resolvePreset(preset, 1920, 1080, FPS.ntsc30), preset));
+  });
+
+  it("尺寸非法时抛错，不产出 NaN 分辨率", () => {
+    // NaN 会一路流进 VideoEncoder 的 config，报错和真正的原因隔好几层
+    for (const [w, h] of [
+      [0, 1080],
+      [1920, 0],
+      [-1920, 1080],
+      [Number.NaN, 1080],
+    ] as const) {
+      expect(() => resolvePreset(byId("standard"), w, h, FPS.ntsc30), `${w}×${h}`).toThrow();
+    }
   });
 
   it("输出尺寸一律偶数（H.264 的 4:2:0 要求）", () => {
