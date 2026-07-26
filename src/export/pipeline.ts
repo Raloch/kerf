@@ -39,6 +39,7 @@ import {
 } from "mediabunny";
 
 import { createCanvas2DCompositor, type ComposeLayer } from "../compose/compositor";
+import { rasterizeText } from "../compose/text-raster";
 import { videoTracksInDrawOrder, visibleVideoClips } from "../edl/sampling";
 import { decideFormat } from "../media/capability";
 import { probeCapabilities } from "../media/capability-probe";
@@ -164,8 +165,26 @@ export async function runExport(
       // 导出侧一个都不自己算——预览侧拿的是同一个函数的同一份结果（硬规则 2）
       const layers: ComposeLayer[] = [];
       for (const visible of visibleVideoClips(timeline, outputFrame)) {
-        // 文字层要等文字渲染那一步才有画面；预览侧同样跳过，两条路径仍然一致
-        if (visible.kind === "text") continue;
+        if (visible.kind === "text") {
+          // 与预览侧调的是同一个 rasterizeText、同一份缓存，所以字形一致是
+          // 结构性的而不是靠对齐（硬规则 2）。缓存命中时这里不做任何排版工作
+          const raster = rasterizeText(
+            visible.clip.text,
+            visible.clip.style,
+            timeline.width,
+            timeline.height,
+          );
+          if (raster) {
+            layers.push({
+              kind: "image",
+              image: raster.canvas,
+              width: raster.width,
+              height: raster.height,
+              ...(visible.transform ? { transform: visible.transform } : {}),
+            });
+          }
+          continue;
+        }
         const sample = samples.get(visible.trackId);
         if (!sample) continue;
         layers.push({

@@ -27,13 +27,15 @@ import { readExportFile, removeExportFile } from "../export/write-target";
 import { createPreviewEngine } from "../preview/preview-engine";
 import { singleClipTimeline, type Timeline } from "../edl/types";
 import { frameDurationMicros, frameToMicros, MICROS_PER_SECOND } from "../time/timebase";
-import { measure, type Bands } from "./measure";
+import { measure, type Bands, type MeasureRegion } from "./measure";
 import type { Check } from "./verify-m0";
 
 /** 单帧比对结果的落盘文件名。 */
 const VERIFY_OUT = "kerf-verify-preview.mp4";
 /** 变换/关键帧比对的落盘文件名。 */
 const VERIFY_XFORM_OUT = "kerf-verify-preview-xform.mp4";
+/** 文字层比对的落盘文件名。 */
+const VERIFY_TEXT_OUT = "kerf-verify-preview-text.mp4";
 
 /** 方形输出：让 16:9 素材必然产生上下黑边，从而能比较留边几何。 */
 const OUT_SIZE = 320;
@@ -57,6 +59,32 @@ const XFORM_EXPECTED = [
   { top: 115, bottom: 115, left: 160, right: 0 },
 ] as const;
 
+/**
+ * 文字比对：文字块压在画面下三分之一。
+ *
+ * 用 `█` 而不是真实文案（**D6**）：实心块边缘少、面积大，位置偏一个像素就能被
+ * 黑边扫描抓到；真实文案的抗锯齿边缘只会让容差两头为难。真实文案的排版质量
+ * （断行、字重、描边）由 `text-raster.test.ts` 的断行单测 + 截图肉眼比对负责，
+ * 不进数值断言。
+ */
+const TEXT_CONTENT = "███";
+const TEXT_STYLE = { fontSizeRatio: 0.12, color: "#ffffff" } as const;
+/**
+ * 把文字块挪进**下方留边的黑区**（16:9 进方形 → 画面只占 y 70..250，下面 70px 是黑的）。
+ *
+ * 这一步很关键，第一版把文字放在 y 230 附近、与画面区重叠，结果两条文字断言
+ * 都是**假通过**：那一带的非黑像素来自视频而不是文字，把文字整层删掉照样绿。
+ * 挪进黑区后，区域里只剩文字，"非黑"和"四条边"才真的在量文字。
+ *
+ * 字号 0.12 × 320 = 38.4px，行高 1.25 → 块高 48；中心 160 + 125 = 285，
+ * 于是块落在 y 261..309，与画面下沿 250 留了 11px 余量（够 H.264 的色度渗出）。
+ */
+const TEXT_OFFSET_Y = 125;
+/** 背景取样区：画面区里避开文字的那一段。 */
+const BG_REGION = { x: 0, y: 74, width: OUT_SIZE, height: 90 };
+/** 文字取样区：只覆盖下方黑区，里面除了文字什么都没有。 */
+const TEXT_REGION = { x: 0, y: 254, width: OUT_SIZE, height: 64 };
+
 interface Edges {
   readonly top: number;
   readonly bottom: number;
@@ -77,12 +105,13 @@ function edgesText(b: Edges): string {
   return `${b.top}/${b.bottom}/${b.left}/${b.right}`;
 }
 
-/** 导出一段，再读回指定的几个输出帧并测量。 */
+/** 导出一段，再读回指定的几个输出帧并测量。`regions` 给了就按分区各测一份。 */
 async function exportAndMeasure(
   timeline: Timeline,
   outFrames: readonly number[],
   name: string,
-): Promise<Bands[]> {
+  regions?: readonly MeasureRegion[],
+): Promise<Bands[][]> {
   await removeExportFile(name);
   await runExport(
     {
@@ -109,7 +138,7 @@ async function exportAndMeasure(
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
     if (!ctx) throw new Error("比对画布没有 2D 上下文");
 
-    const out: Bands[] = [];
+    const out: Bands[][] = [];
     for (const frame of outFrames) {
       // 取帧中点：落在帧起点会拿到前一帧
       const micros = frameToMicros(frame, timeline.fps) + frameDurationMicros(timeline.fps) / 2;
@@ -123,7 +152,11 @@ async function exportAndMeasure(
         videoFrame.close();
         sample.close();
       }
-      out.push(measure(ctx, OUT_SIZE, OUT_SIZE));
+      out.push(
+        regions
+          ? regions.map((region) => measure(ctx, OUT_SIZE, OUT_SIZE, region))
+          : [measure(ctx, OUT_SIZE, OUT_SIZE)],
+      );
     }
     return out;
   } finally {
@@ -293,7 +326,9 @@ export async function verifyPreviewMatchesExport(): Promise<PreviewVerifyResult>
     engine2.dispose();
   }
 
-  const animatedExport = await exportAndMeasure(animated, XFORM_PROBES, VERIFY_XFORM_OUT);
+  const animatedExport = (await exportAndMeasure(animated, XFORM_PROBES, VERIFY_XFORM_OUT)).map(
+    (perRegion) => perRegion[0]!,
+  );
 
   // 1. 两条路径逐帧一致。几何来自变换求值，与 seek 精不精确无关，所以要求完全相等
   let worstPair = 0;
@@ -354,6 +389,119 @@ export async function verifyPreviewMatchesExport(): Promise<PreviewVerifyResult>
   );
 
   await removeExportFile(VERIFY_XFORM_OUT);
+
+  // ---- M2：文字层 + 分区测量（D6）----
+  // 文字压在下三分之一，V1 的画面在上面。背景区继续做色相比对（文字进画面之后
+  // 全幅平均色不再编码帧号，这正是 D6 要解决的问题），文字区单独看位置
+  const titled: Timeline = {
+    ...timeline,
+    durationFrames: 2,
+    tracks: [
+      {
+        id: "T1",
+        kind: "video",
+        clips: [
+          {
+            id: "title",
+            kind: "text",
+            text: TEXT_CONTENT,
+            style: TEXT_STYLE,
+            timelineIn: 0,
+            timelineOut: 2,
+            transform: { y: TEXT_OFFSET_Y },
+          },
+        ],
+      },
+      ...timeline.tracks
+        .filter((t) => t.kind === "video")
+        .map((t) => ({
+          ...t,
+          clips: t.clips.map((c) => ({ ...c, timelineIn: 0, timelineOut: 2 })),
+        })),
+    ],
+  };
+
+  const engine3 = createPreviewEngine(document.createElement("canvas"), OUT_SIZE, OUT_SIZE);
+  let previewBg: Bands;
+  let previewText: Bands;
+  let previewFull: Bands;
+  try {
+    const ctx = engine3.canvas.getContext("2d", { willReadFrequently: true });
+    if (!ctx) throw new Error("预览画布没有 2D 上下文");
+    await engine3.renderFrame(titled, 0);
+    previewBg = measure(ctx, OUT_SIZE, OUT_SIZE, BG_REGION);
+    previewText = measure(ctx, OUT_SIZE, OUT_SIZE, TEXT_REGION);
+    previewFull = measure(ctx, OUT_SIZE, OUT_SIZE);
+  } finally {
+    engine3.dispose();
+  }
+
+  const [exportRegions] = await exportAndMeasure(titled, [0], VERIFY_TEXT_OUT, [
+    BG_REGION,
+    TEXT_REGION,
+  ]);
+  const exportBg = exportRegions![0]!;
+  const exportText = exportRegions![1]!;
+
+  // 1. 文字真的画出来了，而且两条路径都画了。
+  //    "预览里有导出里没有"是硬规则 2 最经典的形态，而它不会报错
+  checks.push(
+    check(
+      "文字层在两条路径上都画出来了",
+      "都非黑",
+      `预览最大通道 ${previewText.maxChannel} · 导出 ${exportText.maxChannel}`,
+      previewText.maxChannel > 32 && exportText.maxChannel > 32,
+    ),
+  );
+
+  // 2. 文字块的位置逐条边一致。栅格化只有一份（两条路径调同一个
+  //    rasterizeText），所以这里差出像素只可能是摆位错了
+  const textDelta = worstEdgeDelta(previewText, exportText);
+  checks.push(
+    check(
+      "文字块在两条路径上的位置一致（分区内四条边）",
+      "≤ 1px",
+      textDelta === 0
+        ? `完全相同（${edgesText(previewText)}）`
+        : `差 ${textDelta}px · 预览 ${edgesText(previewText)} / 导出 ${edgesText(exportText)}`,
+      textDelta <= 1,
+    ),
+  );
+
+  // 3. 背景区的色相仍然可比。这是 D6 的核心：文字叠上去之后，靠"画面区平均色"
+  //    判断取到源片第几帧的那套断言必须改成分区测量才继续成立
+  const bgDelta = Math.max(
+    Math.abs(previewBg.meanR - exportBg.meanR),
+    Math.abs(previewBg.meanG - exportBg.meanG),
+    Math.abs(previewBg.meanB - exportBg.meanB),
+  );
+  checks.push(
+    check(
+      "有文字时背景区的主色调仍然一致（容差 24，容许 seek 落在相邻帧）",
+      "≤ 24",
+      String(bgDelta),
+      bgDelta <= 24,
+    ),
+  );
+
+  // 4. 分区参数真的起作用了。如果 measure() 悄悄忽略了 region，上面第 3 条
+  //    会退化成"比全幅平均色"——而那恰恰是被文字污染的那个量，可能碰巧也通过。
+  //    这一条把"分区 ≠ 全幅"钉住，防止分区测量变成一个摆设
+  const bgVsFull = Math.max(
+    Math.abs(previewBg.meanR - previewFull.meanR),
+    Math.abs(previewBg.meanG - previewFull.meanG),
+    Math.abs(previewBg.meanB - previewFull.meanB),
+  );
+  checks.push(
+    check(
+      "分区测量确实只测了那一块（背景区平均色 ≠ 全幅平均色）",
+      "> 4",
+      `差 ${bgVsFull}（背景区 ${previewBg.meanR},${previewBg.meanG},${previewBg.meanB} / 全幅 ${previewFull.meanR},${previewFull.meanG},${previewFull.meanB}）`,
+      bgVsFull > 4,
+    ),
+  );
+
+  await removeExportFile(VERIFY_TEXT_OUT);
 
   return {
     checks,

@@ -33,37 +33,60 @@ export interface Bands {
   readonly maxChannel: number;
 }
 
+/**
+ * 只测画面里的一块矩形。坐标是画布绝对坐标，黑边则相对**这块矩形**的四条边算。
+ *
+ * 这是 PLAN.md 的 **D6**：文字层一叠上去，整幅画面的平均色就不再精确编码帧号，
+ * 而那正是多片段自检判断"取到的是源片第几帧"的依据。做法是同一套测量分两块用——
+ * 背景区（避开文字）继续做色相断言，文字区单独看位置。
+ *
+ * 参数加在 `measure()` 上而不是另写一个函数：**两条自检必须共用同一套测量**，
+ * 各写一个"怎么算平均色"，两边的结果就不可比了。
+ */
+export interface MeasureRegion {
+  readonly x: number;
+  readonly y: number;
+  readonly width: number;
+  readonly height: number;
+}
+
 export function measure(
   ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
   width: number,
   height: number,
+  region?: MeasureRegion,
 ): Bands {
-  const { data } = ctx.getImageData(0, 0, width, height);
+  // 只读需要的那块，避免整幅取回来再自己裁——getImageData 是这里最贵的一步
+  const rx = region ? Math.max(0, Math.min(width - 1, Math.round(region.x))) : 0;
+  const ry = region ? Math.max(0, Math.min(height - 1, Math.round(region.y))) : 0;
+  const rw = region ? Math.max(1, Math.min(width - rx, Math.round(region.width))) : width;
+  const rh = region ? Math.max(1, Math.min(height - ry, Math.round(region.height))) : height;
+  const { data } = ctx.getImageData(rx, ry, rw, rh);
 
   const rowIsBlack = (y: number): boolean => {
-    for (let x = 0; x < width; x += 4) {
-      const i = (y * width + x) * 4;
+    for (let x = 0; x < rw; x += 4) {
+      const i = (y * rw + x) * 4;
       if (data[i]! + data[i + 1]! + data[i + 2]! > 24) return false;
     }
     return true;
   };
 
   const colIsBlack = (x: number): boolean => {
-    for (let y = 0; y < height; y += 4) {
-      const i = (y * width + x) * 4;
+    for (let y = 0; y < rh; y += 4) {
+      const i = (y * rw + x) * 4;
       if (data[i]! + data[i + 1]! + data[i + 2]! > 24) return false;
     }
     return true;
   };
 
   let top = 0;
-  while (top < height && rowIsBlack(top)) top++;
+  while (top < rh && rowIsBlack(top)) top++;
   let bottom = 0;
-  while (bottom < height && rowIsBlack(height - 1 - bottom)) bottom++;
+  while (bottom < rh && rowIsBlack(rh - 1 - bottom)) bottom++;
   let left = 0;
-  while (left < width && colIsBlack(left)) left++;
+  while (left < rw && colIsBlack(left)) left++;
   let right = 0;
-  while (right < width && colIsBlack(width - 1 - right)) right++;
+  while (right < rw && colIsBlack(rw - 1 - right)) right++;
 
   let maxChannel = 0;
   for (let i = 0; i < data.length; i += 4) {
@@ -77,11 +100,13 @@ export function measure(
   let g = 0;
   let b = 0;
   let n = 0;
-  const y0 = Math.min(top + 4, height - 1);
-  const y1 = Math.max(height - bottom - 4, y0 + 1);
+  const y0 = Math.min(top + 4, rh - 1);
+  const y1 = Math.max(rh - bottom - 4, y0 + 1);
+  const x0 = Math.min(4, rw - 1);
+  const x1 = Math.max(rw - 4, x0 + 1);
   for (let y = y0; y < y1; y += 2) {
-    for (let x = 4; x < width - 4; x += 2) {
-      const i = (y * width + x) * 4;
+    for (let x = x0; x < x1; x += 2) {
+      const i = (y * rw + x) * 4;
       r += data[i]!;
       g += data[i + 1]!;
       b += data[i + 2]!;

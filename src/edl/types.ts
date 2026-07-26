@@ -10,6 +10,7 @@
 
 import type { KeyframeChannels } from "../anim/keyframes";
 import type { LayerTransform } from "../compose/compositor";
+import type { TextStyle } from "../compose/text-raster";
 import type { Rational } from "../time/rational";
 
 export type SourceId = string;
@@ -76,14 +77,16 @@ export interface MediaClip extends ClipBase {
 }
 
 /**
- * 文字 / 字幕片段。没有源素材，画面由合成层现场生成。
+ * 文字 / 字幕片段。没有源素材，画面由 `compose/text-raster.ts` 现场生成。
  *
- * 只有内容，**没有样式和位置**：字体、字号、颜色、描边随文字渲染那一步一起加，
- * 位置和缩放属于 `ComposeLayer` 的变换（M2 第 2 步），不该在两处各存一份。
+ * **样式里没有位置**：文字在栅格里恒定居中，往哪儿放、放多大一律由 `transform`
+ * 表达（见 text-raster.ts 的文件头）。位置有两个来源就必然打架。
  */
 export interface TextClip extends ClipBase {
   readonly kind: "text";
   readonly text: string;
+  /** 省略则用默认样式（白色、居中、字号占输出高度 8%）。 */
+  readonly style?: TextStyle;
 }
 
 /**
