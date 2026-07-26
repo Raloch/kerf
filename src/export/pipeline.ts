@@ -1,43 +1,48 @@
 /**
- * 导出流水线：decode → compose → encode → mux。
+ * 导出流水线：decode → compose → encode → mux，按**整份 EDL**驱动。
  *
- * M0 的验证目标就是这条链路和时间基模型。几个刻意的实现选择：
+ * M1 的版本只认单个文件加一对帧号。EDL 化之后的形态：
  *
- * - **帧对齐由输出驱动**：外层循环走输出帧号，内层从源片拉取"覆盖该时刻"的帧。
- *   这样源片帧率与时间轴帧率不一致时也正确（M0 两者相同，但代码不假设相同）。
- * - **不逐帧 seek**：用 `VideoSampleSink.samples(start, end)` 顺序解码，
- *   mediabunny 内部会从 in 点之前的关键帧开始解并丢弃多余帧（硬规则 7 的 GOP 边界）。
- *   逐帧 `getSample()` 会反复触发 seek，慢一个量级。
+ *   输出帧 i ──┬─ V1 reader → 该帧的 VideoSample ─┐
+ *              ├─ V2 reader → 该帧的 VideoSample ─┼→ compose() → CanvasSource
+ *              └─ （空档）→ null ────────────────┘
+ *   音频       └─ 主线程混好的 PCM → 按 0.5 秒切块，与视频帧交错 add
+ *
+ * 几个刻意的实现选择：
+ *
+ * - **帧对齐由输出驱动**：外层循环走输出帧号，内层由每条轨的 reader 拉"覆盖该时刻"
+ *   的源片帧。源片帧率与时间轴帧率不一致时也正确（见 `edl/sampling.ts`）。
+ * - **不逐帧 seek**：每个片段一个 `VideoSampleSink.samples(start, end)` 生成器顺序
+ *   解码，mediabunny 内部会从入点之前的关键帧开始解并丢弃多余帧（硬规则 7）。
+ * - **图层顺序与"该画哪个片段"由 `edl/sampling.ts` 决定**，预览走同一个函数。
+ *   这里只管把拿到的图层交给 `compose()`（硬规则 2）。
  * - **背压靠 await**：`source.add()` 的 Promise 在编码器就绪时才 resolve，
  *   await 它就等于给编码队列施加背压，不需要自己盯 encodeQueueSize（硬规则 5）。
- * - **每个 sample / VideoFrame 都显式 close**（硬规则 4），漏一个几秒就 OOM。
+ * - **VideoSample 的所有权在 reader**（硬规则 4）：时间轴帧率高于源片帧率时同一个
+ *   sample 会被多个输出帧复用，这里 close 会造成 use-after-close。
+ * - **流式写盘**：`StreamTarget` 直接写进用户选定的文件或 OPFS，不攒 Blob（硬规则 9）。
+ * - **音频与视频交错写**：把整段音频先 add 完再写视频，封装器必须把音频全缓存在
+ *   内存里等视频，流式写盘就白做了。
  */
 
 import {
-  ALL_FORMATS,
-  AudioSampleSink,
+  AudioSample,
   AudioSampleSource,
-  BlobSource,
-  BufferTarget,
   CanvasSource,
-  Input,
   Mp4OutputFormat,
   Output,
-  VideoSampleSink,
+  StreamTarget,
   WebMOutputFormat,
-  type AudioSample,
-  type VideoSample,
 } from "mediabunny";
 
-import { createCanvas2DCompositor } from "../compose/compositor";
-import { decideFormat, probeCapabilities } from "../media/capability";
-import {
-  FRAME_ALIGN_EPSILON_SECONDS,
-  frameDurationMicros,
-  frameToSeconds,
-  MICROS_PER_SECOND,
-} from "../time/timebase";
+import { createCanvas2DCompositor, type ComposeLayer } from "../compose/compositor";
+import { videoTracksInDrawOrder } from "../edl/sampling";
+import { decideFormat } from "../media/capability";
+import { probeCapabilities } from "../media/capability-probe";
+import { frameToSeconds, frameDurationMicros, MICROS_PER_SECOND } from "../time/timebase";
+import { VideoTrackReader } from "./frame-reader";
 import type { ExportDone, ExportProgress, ExportRequest } from "./protocol";
+import { removeExportFile, resolveHandle } from "./write-target";
 
 export interface PipelineHooks {
   onProgress(progress: ExportProgress): void;
@@ -52,228 +57,206 @@ export class ExportCanceled extends Error {
   }
 }
 
+/**
+ * 一次 add 进编码器的音频长度（秒）。
+ *
+ * 太小则 add 次数过多（每次都有跨线程开销），太大则封装器要缓存更多音频等视频。
+ * 0.5 秒在两者之间，且远小于 MP4 默认的 1 秒分片粒度。
+ */
+const AUDIO_CHUNK_SECONDS = 0.5;
+
 export async function runExport(
   request: ExportRequest,
   hooks: PipelineHooks,
 ): Promise<ExportDone> {
   const startedAt = performance.now();
-  const totalFrames = request.outFrame - request.inFrame;
+  const { timeline, range, audio } = request;
+  const totalFrames = range.outFrame - range.inFrame;
   if (totalFrames <= 0) throw new Error("导出范围为空：出点必须大于入点");
 
   const checkCancel = () => {
     if (hooks.isCanceled()) throw new ExportCanceled();
   };
 
-  const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(request.file) });
-  const compositor = createCanvas2DCompositor(request.width, request.height);
-
-  let output: Output | null = null;
-  let videoSource: CanvasSource | null = null;
-  let audioSource: AudioSampleSource | null = null;
-
-  try {
+  const report = (stage: ExportProgress["stage"], encodedFrames: number) => {
     hooks.onProgress({
-      stage: "prepare",
-      encodedFrames: 0,
-      totalFrames,
-      elapsedMs: performance.now() - startedAt,
-    });
-
-    const videoTrack = await input.getPrimaryVideoTrack();
-    if (!videoTrack) throw new Error("源文件没有视频轨");
-    const audioTrack = request.includeAudio ? await input.getPrimaryAudioTrack() : null;
-    const audioUsable = audioTrack !== null && (await audioTrack.canDecode());
-
-    // 能力探测放在建 Output 之前：编码器不可用要在写出任何字节之前就失败
-    const caps = await probeCapabilities(request.width, request.height);
-    const decision = decideFormat(caps, request.container, audioUsable);
-    if (decision.mp4BlockedByAudio) {
-      throw new Error(
-        "这个浏览器不能编码 AAC，导出 MP4 会没有声音。请改用 WebM，或换 Chrome / Safari。",
-      );
-    }
-
-    output = new Output({
-      format: request.container === "mp4" ? new Mp4OutputFormat() : new WebMOutputFormat(),
-      target: new BufferTarget(),
-    });
-
-    videoSource = new CanvasSource(compositor.canvas, {
-      codec: decision.videoCodec,
-      bitrate: request.videoBitrate,
-    });
-    // frameRate 传浮点是 mediabunny 的接口要求（它内部据此吸附时间戳）。
-    // 我们自己的时间戳仍然由帧号换算，不依赖这个浮点值做运算。
-    output.addVideoTrack(videoSource, {
-      frameRate: request.fps.num / request.fps.den,
-    });
-
-    const willWriteAudio = audioUsable && decision.audioCodec !== null;
-    if (willWriteAudio && audioTrack) {
-      audioSource = new AudioSampleSource({
-        codec: decision.audioCodec!,
-        bitrate: request.audioBitrate,
-      });
-      output.addAudioTrack(audioSource);
-    }
-
-    await output.start();
-    checkCancel();
-
-    // ---- 音频：M0 是单轨转封装，不需要混音，直接 sink → source ----
-    if (willWriteAudio && audioTrack && audioSource) {
-      await copyAudio(audioTrack, audioSource, request, checkCancel);
-    }
-
-    // ---- 视频：按输出帧号驱动，从源片顺序拉帧 ----
-    const inSeconds = frameToSeconds(request.inFrame, request.fps);
-    const outSeconds = frameToSeconds(request.outFrame, request.fps);
-    const videoSink = new VideoSampleSink(videoTrack);
-    const samples = videoSink.samples(inSeconds, outSeconds);
-
-    // 单帧时长只用于告知编码器"这帧覆盖多久"，不参与时间戳累加
-    const frameDurationSeconds = frameDurationMicros(request.fps) / MICROS_PER_SECOND;
-
-    let current: VideoSample | null = null;
-    let next: VideoSample | null = null;
-    let encodedFrames = 0;
-    let lastReportedAt = 0;
-
-    try {
-      for (let i = 0; i < totalFrames; i++) {
-        checkCancel();
-
-        // 输出帧 i 对应的源片时刻（用帧号换算，只在此处落到秒）
-        const targetSeconds = frameToSeconds(request.inFrame + i, request.fps);
-
-        if (!current) {
-          const first = await samples.next();
-          if (first.done) break; // 源片提前结束
-          current = first.value;
-        }
-
-        // 向前推进，直到 current 是"最后一个不晚于 target 的帧"
-        for (;;) {
-          if (!next) {
-            const step = await samples.next();
-            next = step.done ? null : step.value;
-          }
-          if (next && next.timestamp <= targetSeconds + FRAME_ALIGN_EPSILON_SECONDS) {
-            current.close();
-            current = next;
-            next = null;
-            continue;
-          }
-          break;
-        }
-
-        compositor.composeFrame([{ kind: "sample", sample: current }]);
-
-        // await = 背压：编码队列满时这里会等，不会无限堆积 VideoFrame
-        await videoSource.add(
-          frameToSeconds(i, request.fps),
-          frameDurationSeconds,
-          // 每 2 秒一个关键帧，与 mediabunny 默认一致，显式写出便于将来调
-          i === 0 ? { keyFrame: true } : undefined,
-        );
-        encodedFrames++;
-
-        const now = performance.now();
-        if (now - lastReportedAt > 100 || encodedFrames === totalFrames) {
-          lastReportedAt = now;
-          hooks.onProgress({
-            stage: "video",
-            encodedFrames,
-            totalFrames,
-            elapsedMs: now - startedAt,
-          });
-        }
-      }
-    } finally {
-      current?.close();
-      next?.close();
-      // 提前退出时要让生成器释放解码器
-      await samples.return?.(undefined);
-    }
-
-    checkCancel();
-    hooks.onProgress({
-      stage: "finalize",
+      stage,
       encodedFrames,
       totalFrames,
       elapsedMs: performance.now() - startedAt,
     });
+  };
+
+  report("prepare", 0);
+
+  // 能力探测放在建 Output 之前：编码器不可用要在写出任何字节之前就失败
+  const caps = await probeCapabilities(timeline.width, timeline.height);
+  const decision = decideFormat(caps, request.container, audio !== null);
+  if (decision.mp4BlockedByAudio) {
+    throw new Error(
+      "这个浏览器不能编码 AAC，导出 MP4 会没有声音。请改用 WebM，或换 Chrome / Safari。",
+    );
+  }
+
+  const drawOrder = videoTracksInDrawOrder(timeline);
+  if (drawOrder.length === 0) throw new Error("时间轴上没有可见的视频轨");
+
+  const readers = drawOrder.map((track) => new VideoTrackReader(timeline, track, range));
+  const compositor = createCanvas2DCompositor(timeline.width, timeline.height);
+
+  const handle = await resolveHandle(request.target);
+  const writable = await handle.createWritable();
+
+  const output = new Output({
+    format: request.container === "mp4" ? new Mp4OutputFormat() : new WebMOutputFormat(),
+    // chunked：攒到 16MiB 再落盘，减少写次数。峰值内存仍与片长无关
+    target: new StreamTarget(writable, { chunked: true }),
+  });
+
+  const videoSource = new CanvasSource(compositor.canvas, {
+    codec: decision.videoCodec,
+    bitrate: request.videoBitrate,
+  });
+  // frameRate 传浮点是 mediabunny 的接口要求（它内部据此吸附时间戳）。
+  // 我们自己的时间戳仍然由帧号换算，不依赖这个浮点值做运算。
+  output.addVideoTrack(videoSource, {
+    frameRate: timeline.fps.num / timeline.fps.den,
+  });
+
+  const willWriteAudio = audio !== null && decision.audioCodec !== null;
+  const audioSource = willWriteAudio
+    ? new AudioSampleSource({ codec: decision.audioCodec!, bitrate: request.audioBitrate })
+    : null;
+  if (audioSource) output.addAudioTrack(audioSource);
+
+  let encodedFrames = 0;
+
+  try {
+    await output.start();
+    checkCancel();
+
+    const frameDurationSeconds = frameDurationMicros(timeline.fps) / MICROS_PER_SECOND;
+    const pumpAudio = makeAudioPump(audio, audioSource, request.audioBitrate);
+
+    let lastReportedAt = 0;
+    for (let i = 0; i < totalFrames; i++) {
+      checkCancel();
+      const outputFrame = range.inFrame + i;
+
+      // 每条轨都要问一次，包括空档的：让 reader 在空档处主动释放解码器，
+      // 而不是把上一个片段的解码器一直挂着
+      const layers: ComposeLayer[] = [];
+      for (const reader of readers) {
+        const sample = await reader.sampleAt(outputFrame);
+        // sample 归 reader 所有，这里不能 close（硬规则 4）
+        if (sample) layers.push({ kind: "sample", sample });
+      }
+
+      // layers 为空 → 合成器画纯黑，这正是时间轴空隙该有的样子
+      compositor.composeFrame(layers);
+
+      // await = 背压：编码队列满时这里会等，不会无限堆积帧
+      await videoSource.add(
+        frameToSeconds(i, timeline.fps),
+        frameDurationSeconds,
+        i === 0 ? { keyFrame: true } : undefined,
+      );
+      encodedFrames++;
+
+      // 音频跟着视频往前喂，保持封装器里两条轨的时间戳接近
+      await pumpAudio(frameToSeconds(i, timeline.fps));
+
+      const now = performance.now();
+      if (now - lastReportedAt > 100 || encodedFrames === totalFrames) {
+        lastReportedAt = now;
+        report("video", encodedFrames);
+      }
+    }
+
+    checkCancel();
+    // 视频比音频短时把剩下的音频补完（例如末尾有一段只有音轨的片段）
+    await pumpAudio(Infinity);
+
+    report("finalize", encodedFrames);
 
     videoSource.close();
     audioSource?.close();
     const mimeType = await output.getMimeType();
     await output.finalize();
 
-    const buffer = (output.target as BufferTarget).buffer;
-    if (!buffer) throw new Error("封装完成但没有拿到输出数据");
+    const written = await handle.getFile();
 
     return {
-      bytes: new Uint8Array(buffer),
       mimeType,
       encodedFrames,
       elapsedMs: performance.now() - startedAt,
       audioIncluded: willWriteAudio,
+      bytesWritten: written.size,
+      ...(request.target.kind === "opfs" ? { opfsName: request.target.name } : {}),
     };
   } catch (error) {
-    // 取消或失败都要撤掉半成品，否则 BufferTarget 会留着已写入的字节
-    if (output && output.state !== "finalized") {
+    // 取消或失败都要撤掉半成品：output.cancel() 会 abort 掉 writable，
+    // 用户选定的文件不会留下一个放不出来的残片
+    if (output.state !== "finalized") {
       await output.cancel().catch(() => undefined);
+    }
+    // abort 只丢掉未提交的内容，**目录项还在**。OPFS 是我们自己建的条目，
+    // 得自己删掉，否则每取消一次就留一个 0 字节文件在浏览器存储里慢慢堆积。
+    // picker 路径不碰：那是用户自己选的文件，删掉等于替用户删文件
+    if (request.target.kind === "opfs") {
+      await removeExportFile(request.target.name);
     }
     throw error;
   } finally {
     compositor.dispose();
-    input.dispose();
+    await Promise.all(readers.map((reader) => reader.dispose()));
   }
 }
 
 /**
- * 音频转封装：解码源片音频再用目标编码器重编。
+ * 造一个"把音频喂到指定时刻"的函数。
  *
- * 边界帧用 AudioSample.trim() 精确裁掉——音频包的边界几乎不会正好落在
- * in/out 点上，不裁就会多出或少掉几毫秒，累积成音画偏移。
+ * 主线程混好的 PCM 是 f32-planar 的一组声道数组，切块时要把各声道的这一段
+ * **按平面顺序拼进一个连续数组**（ch0 全部帧，然后 ch1 全部帧），
+ * 这是 `f32-planar` 的内存布局；写成交错格式会得到左右声道互相穿插的噪音。
  */
-async function copyAudio(
-  audioTrack: NonNullable<Awaited<ReturnType<Input["getPrimaryAudioTrack"]>>>,
-  audioSource: AudioSampleSource,
-  request: ExportRequest,
-  checkCancel: () => void,
-): Promise<void> {
-  const inSeconds = frameToSeconds(request.inFrame, request.fps);
-  const outSeconds = frameToSeconds(request.outFrame, request.fps);
-  const sink = new AudioSampleSink(audioTrack);
+function makeAudioPump(
+  audio: ExportRequest["audio"],
+  audioSource: AudioSampleSource | null,
+  _bitrate: number,
+): (untilSeconds: number) => Promise<void> {
+  if (!audio || !audioSource) return async () => undefined;
 
-  for await (const sample of sink.samples(inSeconds, outSeconds)) {
-    let toAdd: AudioSample | null = sample;
-    let trimmed: AudioSample | null = null;
-    try {
-      checkCancel();
+  const { sampleRate, numberOfChannels, frameCount, channels } = audio;
+  const chunkFrames = Math.max(1, Math.round(sampleRate * AUDIO_CHUNK_SECONDS));
+  let written = 0;
 
-      const sampleStart = sample.timestamp;
-      const sampleEnd = sampleStart + sample.duration;
-      const rate = sample.sampleRate;
+  return async (untilSeconds: number) => {
+    while (written < frameCount) {
+      // 已经喂到比视频还超前一整块了就先停，等视频追上来
+      if (written / sampleRate > untilSeconds + AUDIO_CHUNK_SECONDS) return;
 
-      // 计算需要保留的帧区间（音频帧，不是视频帧）
-      const startOffset = Math.max(0, Math.round((inSeconds - sampleStart) * rate));
-      const endOffset = Math.min(
-        sample.numberOfFrames,
-        Math.round((Math.min(outSeconds, sampleEnd) - sampleStart) * rate),
-      );
-
-      if (endOffset <= startOffset) continue;
-      if (startOffset > 0 || endOffset < sample.numberOfFrames) {
-        trimmed = sample.trim(startOffset, endOffset);
-        toAdd = trimmed;
+      const length = Math.min(chunkFrames, frameCount - written);
+      const data = new Float32Array(length * numberOfChannels);
+      for (let ch = 0; ch < numberOfChannels; ch++) {
+        const plane = channels[ch];
+        if (!plane) continue;
+        data.set(plane.subarray(written, written + length), ch * length);
       }
 
-      await audioSource.add(toAdd);
-    } finally {
-      trimmed?.close();
-      sample.close();
+      const sample = new AudioSample({
+        format: "f32-planar",
+        sampleRate,
+        numberOfChannels,
+        timestamp: written / sampleRate,
+        data,
+      });
+      try {
+        await audioSource.add(sample);
+      } finally {
+        sample.close();
+      }
+      written += length;
     }
-  }
+  };
 }

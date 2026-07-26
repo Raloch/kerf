@@ -1,20 +1,18 @@
 /**
- * 编码能力探测。
+ * 编码能力的**类型与决策**：不碰 mediabunny 运行时。
  *
  * 客户端导出的成败取决于本机能力，所以探测结果必须在用户点导出**之前**就摆出来，
- * 并且绝不静默降级格式（CLAUDE.md 硬规则 9、PLAN.md 决策 D3）。
+ * 并且绝不静默降级格式（CLAUDE.md 硬规则 10、PLAN.md 决策 D3）。
  *
  * 2026-07 的现实：Firefox 桌面与 Linux 桌面浏览器不能编码 AAC，
  * 因此那些环境下 MP4 不可用（连"仅音频"也只能出 Opus）。
+ *
+ * **真正的探测在 [capability-probe.ts](./capability-probe.ts)**，它要 import
+ * mediabunny 的运行时（约 500KB）。这里只留类型和纯函数，让 UI 能静态 import
+ * 决策逻辑与徽标文案，而不把整个 mediabunny 拖进首屏 chunk。
  */
 
-import {
-  canEncodeAudio,
-  canEncodeVideo,
-  getFirstEncodableVideoCodec,
-  type AudioCodec,
-  type VideoCodec,
-} from "mediabunny";
+import type { AudioCodec, VideoCodec } from "mediabunny";
 
 export interface ExportCapabilities {
   /** MP4 优先用的视频编码，null 表示本机没有可用的 MP4 视频编码器。 */
@@ -39,33 +37,6 @@ export interface FormatDecision {
   readonly audioCodec: AudioCodec | null;
   /** 用户要 MP4 但本机不能编 AAC 时为 true——此时必须挡住，不是降级。 */
   readonly mp4BlockedByAudio: boolean;
-}
-
-export async function probeCapabilities(
-  width: number,
-  height: number,
-): Promise<ExportCapabilities> {
-  const videoConfig = { width, height };
-
-  const [mp4Video, webmVideo, aac, opus] = await Promise.all([
-    // MP4 容器：优先 H.264（通用性最好），退 HEVC，再退 AV1
-    getFirstEncodableVideoCodec(["avc", "hevc", "av1"], videoConfig),
-    // WebM 容器只吃 VP9 / VP8 / AV1
-    getFirstEncodableVideoCodec(["vp9", "av1", "vp8"], videoConfig),
-    canEncodeAudio("aac"),
-    canEncodeAudio("opus"),
-  ]);
-
-  return {
-    mp4Video,
-    webmVideo,
-    aac,
-    opus,
-    mp4WithAudio: mp4Video !== null && aac,
-    webmWithAudio: webmVideo !== null && opus,
-    probedWidth: width,
-    probedHeight: height,
-  };
 }
 
 /**
@@ -107,17 +78,4 @@ export function describeCapabilities(caps: ExportCapabilities): string[] {
   lines.push(caps.aac ? "AAC 音频编码：可用" : "AAC 音频编码：此浏览器不支持");
   lines.push(caps.opus ? "Opus 音频编码：可用" : "Opus 音频编码：不可用");
   return lines;
-}
-
-/** 单独查某个组合能不能编，给 UI 做即时校验用。 */
-export async function canEncodeCombo(
-  videoCodec: VideoCodec,
-  audioCodec: AudioCodec | null,
-  width: number,
-  height: number,
-): Promise<boolean> {
-  const video = await canEncodeVideo(videoCodec, { width, height });
-  if (!video) return false;
-  if (!audioCodec) return true;
-  return canEncodeAudio(audioCodec);
 }

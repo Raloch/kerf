@@ -6,8 +6,7 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
-import { probeFile, wasFpsSnapped } from "../media/probe";
-import { probeCapabilities, type ExportCapabilities } from "../media/capability";
+import type { ExportCapabilities } from "../media/capability";
 import { proxyManager } from "../media/proxy-client";
 import type { ProxyInfo } from "../media/proxy";
 import { useTimeline } from "../state/timeline-store";
@@ -17,6 +16,7 @@ import { formatDuration, framesToTimecode } from "../time/timebase";
 import { formatFps } from "../time/rational";
 import { Preview } from "./Preview";
 import { TimelinePanel } from "./Timeline";
+import { ExportDialog } from "./ExportDialog";
 import {
   IconCheck,
   IconDownload,
@@ -51,9 +51,23 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
   const [proxies, setProxies] = useState<Record<string, ProxyInfo>>({});
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [exportOpen, setExportOpen] = useState(false);
 
+  // 能力探测和素材探针都动态 import：它们各自拖着 mediabunny 的运行时，
+  // 静态 import 会把约 500KB 塞进首屏 chunk，而两者都是"页面出来之后"才需要的。
   useEffect(() => {
-    probeCapabilities(timeline.width, timeline.height).then(setCaps).catch(() => setCaps(null));
+    let stale = false;
+    void import("../media/capability-probe")
+      .then(({ probeCapabilities }) => probeCapabilities(timeline.width, timeline.height))
+      .then((next) => {
+        if (!stale) setCaps(next);
+      })
+      .catch(() => {
+        if (!stale) setCaps(null);
+      });
+    return () => {
+      stale = true;
+    };
   }, [timeline.width, timeline.height]);
 
   // 代理状态：素材库要显示进度，预览要在就绪时切过去
@@ -75,6 +89,7 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
       setBusy("读取素材…");
       setError(null);
       try {
+        const { probeFile, wasFpsSnapped } = await import("../media/probe");
         const result = await probeFile(file);
         loadSource(result.source);
         void proxyManager.request(result.source);
@@ -100,6 +115,9 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
       if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return;
+      // 导出对话框开着时不响应编辑快捷键：⌫ 会删掉正在导出的片段，
+      // 而 Worker 拿的是发起时的 EDL 快照，用户会看到"删了但成片里还有"
+      if (exportOpen) return;
 
       const meta = e.metaKey || e.ctrlKey;
       if (meta && e.key.toLowerCase() === "z") {
@@ -128,7 +146,7 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [playhead, redo, removeSelected, setPlayhead, splitAtPlayhead, undo]);
+  }, [exportOpen, playhead, redo, removeSelected, setPlayhead, splitAtPlayhead, undo]);
 
   const selected = selectedClipId ? findClip(timeline, selectedClipId) : undefined;
   const hasContent = timeline.durationFrames > 0;
@@ -175,7 +193,13 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
         <button type="button" className="chip-btn" onClick={onOpenSelfCheck}>
           M0 自检
         </button>
-        <button type="button" className="btn-primary" disabled={!hasContent} title="M1 后续接入导出面板">
+        <button
+          type="button"
+          className="btn-primary"
+          disabled={!hasContent}
+          title={hasContent ? "导出成片" : "先导入素材"}
+          onClick={() => setExportOpen(true)}
+        >
           <IconDownload />
           导出
         </button>
@@ -227,7 +251,9 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
           </div>
         </div>
 
-        <Preview />
+        {/* 导出时禁掉预览播放：预览和导出会抢同一批解码器，
+            而且用户此时的注意力在进度上，播放只会拖慢导出 */}
+        <Preview disabled={exportOpen} />
 
         <div className="pane right">
           <div className="pane-hd">
@@ -345,6 +371,19 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
           </i>
         </div>
       </div>
+
+      {exportOpen && (
+        <ExportDialog
+          timeline={timeline}
+          caps={caps}
+          selectedRange={
+            selected
+              ? { inFrame: selected.clip.timelineIn, outFrame: selected.clip.timelineOut }
+              : null
+          }
+          onClose={() => setExportOpen(false)}
+        />
+      )}
     </div>
   );
 }

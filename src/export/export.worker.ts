@@ -4,6 +4,12 @@
  *
  * 解码、合成、编码、封装全在这里，主线程只负责 UI 和进度显示——
  * 否则导出期间界面完全卡死（CLAUDE.md 硬规则 6）。
+ *
+ * **音频混流不在这里**：`OfflineAudioContext` 在 Worker 里不可用，
+ * PCM 由主线程混好 transfer 进来（见 `audio/mixdown.ts`）。
+ *
+ * 结果也不再回传字节：`StreamTarget` 已经把成品写进用户选定的文件或 OPFS
+ * （硬规则 9），回传的只有元信息。
  */
 
 import { ExportCanceled, runExport } from "./pipeline";
@@ -12,8 +18,8 @@ import type { WorkerRequest, WorkerResponse } from "./protocol";
 let canceled = false;
 let running = false;
 
-function post(message: WorkerResponse, transfer?: Transferable[]): void {
-  self.postMessage(message, { transfer: transfer ?? [] });
+function post(message: WorkerResponse): void {
+  self.postMessage(message);
 }
 
 self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
@@ -38,8 +44,7 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       onProgress: (progress) => post({ type: "progress", progress }),
       isCanceled: () => canceled,
     });
-    // 把结果字节 transfer 出去，避免几十 MB 的结构化克隆拷贝
-    post({ type: "done", result }, [result.bytes.buffer]);
+    post({ type: "done", result });
   } catch (error) {
     if (error instanceof ExportCanceled || canceled) {
       post({ type: "canceled" });

@@ -18,23 +18,19 @@ import { ALL_FORMATS, BlobSource, Input, VideoSampleSink } from "mediabunny";
 import { makeSampleVideo } from "./make-sample";
 import { probeFile } from "../media/probe";
 import { runExport } from "../export/pipeline";
+import { readExportFile, removeExportFile } from "../export/write-target";
 import { createPreviewEngine } from "../preview/preview-engine";
 import { singleClipTimeline } from "../edl/types";
-import { frameToSeconds } from "../time/timebase";
+import { measure, type Bands } from "./measure";
 import type { Check } from "./verify-m0";
+
+/** 单帧比对结果的落盘文件名。 */
+const VERIFY_OUT = "kerf-verify-preview.mp4";
 
 /** 方形输出：让 16:9 素材必然产生上下黑边，从而能比较留边几何。 */
 const OUT_SIZE = 320;
 /** 取样帧：避开首尾，落在片段中段。 */
 const PROBE_FRAME = 150;
-
-interface Bands {
-  readonly top: number;
-  readonly bottom: number;
-  readonly meanR: number;
-  readonly meanG: number;
-  readonly meanB: number;
-}
 
 export interface PreviewVerifyResult {
   readonly checks: readonly Check[];
@@ -49,47 +45,6 @@ function check(name: string, expected: unknown, actual: unknown, pass?: boolean)
     expected: String(expected),
     actual: String(actual),
     pass: pass ?? String(expected) === String(actual),
-  };
-}
-
-/** 量出上下黑边高度，以及画面区的平均色。 */
-function measure(ctx: CanvasRenderingContext2D, size: number): Bands {
-  const { data } = ctx.getImageData(0, 0, size, size);
-  const rowIsBlack = (y: number): boolean => {
-    for (let x = 0; x < size; x += 4) {
-      const i = (y * size + x) * 4;
-      if (data[i]! + data[i + 1]! + data[i + 2]! > 24) return false;
-    }
-    return true;
-  };
-
-  let top = 0;
-  while (top < size && rowIsBlack(top)) top++;
-  let bottom = 0;
-  while (bottom < size && rowIsBlack(size - 1 - bottom)) bottom++;
-
-  // 只在画面区取平均色，避开黑边
-  let r = 0;
-  let g = 0;
-  let b = 0;
-  let n = 0;
-  const y0 = Math.min(top + 4, size - 1);
-  const y1 = Math.max(size - bottom - 4, y0 + 1);
-  for (let y = y0; y < y1; y += 2) {
-    for (let x = 4; x < size - 4; x += 2) {
-      const i = (y * size + x) * 4;
-      r += data[i]!;
-      g += data[i + 1]!;
-      b += data[i + 2]!;
-      n++;
-    }
-  }
-  return {
-    top,
-    bottom,
-    meanR: Math.round(r / Math.max(1, n)),
-    meanG: Math.round(g / Math.max(1, n)),
-    meanB: Math.round(b / Math.max(1, n)),
   };
 }
 
@@ -115,33 +70,29 @@ export async function verifyPreviewMatchesExport(): Promise<PreviewVerifyResult>
     await engine.renderFrame(timeline, PROBE_FRAME);
     const pctx = previewCanvas.getContext("2d");
     if (!pctx) throw new Error("预览画布没有 2D 上下文");
-    previewBands = measure(pctx, OUT_SIZE);
+    previewBands = measure(pctx, OUT_SIZE, OUT_SIZE);
   } finally {
     engine.dispose();
   }
 
   // ---- 导出路径：只导这一帧 ----
+  await removeExportFile(VERIFY_OUT);
   const exported = await runExport(
     {
-      file: probe.source.file,
+      timeline,
+      range: { inFrame: PROBE_FRAME, outFrame: PROBE_FRAME + 1 },
       container: "mp4",
-      fps: probe.source.fps,
-      width: OUT_SIZE,
-      height: OUT_SIZE,
-      inFrame: PROBE_FRAME,
-      outFrame: PROBE_FRAME + 1,
       videoBitrate: 8e6,
       audioBitrate: 128e3,
-      includeAudio: false,
+      audio: null,
+      target: { kind: "opfs", name: VERIFY_OUT },
     },
     { onProgress: () => undefined, isCanceled: () => false },
   );
   checks.push(check("导出单帧成功", 1, exported.encodedFrames));
 
   // ---- 读回导出结果，解码首帧 ----
-  const outFile = new File([new Uint8Array(exported.bytes)], "one-frame.mp4", {
-    type: exported.mimeType,
-  });
+  const outFile = await readExportFile(VERIFY_OUT);
   const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(outFile) });
   let exportedBands: Bands;
   try {
@@ -163,7 +114,7 @@ export async function verifyPreviewMatchesExport(): Promise<PreviewVerifyResult>
       frame.close();
       first.close();
     }
-    exportedBands = measure(ectx, OUT_SIZE);
+    exportedBands = measure(ectx, OUT_SIZE, OUT_SIZE);
   } finally {
     input.dispose();
   }

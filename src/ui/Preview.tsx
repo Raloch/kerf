@@ -14,7 +14,7 @@ import { proxyManager } from "../media/proxy-client";
 import { framesToTimecode } from "../time/timebase";
 import { IconNext, IconPause, IconPlay, IconPrev } from "./icons";
 
-export function Preview() {
+export function Preview({ disabled = false }: { readonly disabled?: boolean } = {}) {
   const timeline = useTimeline((s) => s.timeline());
   const playhead = useTimeline((s) => s.playhead);
   const setPlayhead = useTimeline((s) => s.setPlayhead);
@@ -121,8 +121,14 @@ export function Preview() {
     return () => cancelAnimationFrame(rafId.current);
   }, [playing, setPlayhead, stop, timeline]);
 
+  // 导出对话框开着时停下播放并交还解码器
+  useEffect(() => {
+    if (disabled && playing) stop();
+  }, [disabled, playing, stop]);
+
   // 空格播放/暂停
   useEffect(() => {
+    if (disabled) return;
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement | null;
       if (t && /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return;
@@ -132,7 +138,7 @@ export function Preview() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [playing, start, stop]);
+  }, [disabled, playing, start, stop]);
 
   const step = useCallback(
     (delta: number) => {

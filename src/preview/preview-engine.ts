@@ -19,25 +19,14 @@
  * 用户一个"听起来对但实际不对"的预览。多轨音频预览要等独立的音频引擎。
  */
 
-import { clipAt, toSourceFrame, type MediaSource, type Timeline } from "../edl/types";
+import type { MediaSource, Timeline } from "../edl/types";
+import { microsToSeconds, sourceCenterMicrosAt, visibleVideoClips } from "../edl/sampling";
 import { createCanvas2DCompositor, type ComposeLayer, type Compositor } from "../compose/compositor";
-import { frameDurationMicros, frameToSeconds, MICROS_PER_SECOND, secondsToFrame } from "../time/timebase";
+import { frameDurationMicros, MICROS_PER_SECOND } from "../time/timebase";
 import type { Rational } from "../time/rational";
 
-/** video 时间与期望时间的容许偏差（帧）。超过就重新 seek 纠正。 */
+/** video 时间与期望时间的容许偏差（源片帧数）。超过就重新 seek 纠正。 */
 const DRIFT_TOLERANCE_FRAMES = 3;
-
-/**
- * seek 目标要落在帧的**中点**，不能是帧起点。
- *
- * 帧 N 覆盖 [N/fps, (N+1)/fps)。seek 到恰好等于左边界时，浏览器常常返回前一帧
- * （currentTime 精度 + "最近可解码位置"的实现差异），于是时间码显示 30
- * 而画面是 frame 29——暂停逐帧检查时一眼就能看出来。落在帧内部就没有这个歧义。
- */
-function frameCenterSeconds(frame: number, fps: Parameters<typeof frameToSeconds>[1]): number {
-  const half = frameDurationMicros(fps) / 2 / MICROS_PER_SECOND;
-  return frameToSeconds(frame, fps) + half;
-}
 
 interface SourceHandle {
   readonly video: HTMLVideoElement;
@@ -147,26 +136,29 @@ export function createPreviewEngine(
   /**
    * 收集该帧要画的图层。
    *
-   * 轨道数组按 z 序从上到下排列（T1 在最上），画的时候要反过来：
-   * 先画底层再画上层，否则叠加轨会被主视频盖住。
+   * "该画哪个片段、按什么顺序、读源片哪一刻"全部委托给 `visibleVideoClips()`，
+   * 导出管道走同一个函数。这一层**不允许**自己判断可见性或算源片位置——
+   * 那样预览和导出就是两套取帧逻辑，而共用 compose() 只能保证画法一致（硬规则 2）。
+   *
+   * seek 目标用 `sourceCenterMicrosAt`（帧中点）：seek 到帧的左边界时浏览器常常
+   * 返回前一帧，于是时间码显示 30 而画面是 frame 29。
    */
   function layersFor(
     timeline: Timeline,
     frame: number,
-  ): { layers: ComposeLayer[]; active: { source: MediaSource; sourceFrame: number }[] } {
+  ): { layers: ComposeLayer[]; active: { source: MediaSource; seekSeconds: number }[] } {
     const layers: ComposeLayer[] = [];
-    const active: { source: MediaSource; sourceFrame: number }[] = [];
+    const active: { source: MediaSource; seekSeconds: number }[] = [];
 
-    for (const track of [...timeline.tracks].reverse()) {
-      if (track.kind !== "video" || track.hidden) continue;
-      const clip = clipAt(track, frame);
-      if (!clip) continue;
-      const source = timeline.sources.find((s) => s.id === clip.sourceId);
-      if (!source) continue;
-
+    for (const visible of visibleVideoClips(timeline, frame)) {
+      const { source, clip } = visible;
       const handle = handleFor(source);
-      const sourceFrame = toSourceFrame(clip, frame);
-      active.push({ source, sourceFrame });
+      active.push({
+        source,
+        seekSeconds: microsToSeconds(
+          sourceCenterMicrosAt(clip, frame, timeline.fps, source.fps),
+        ),
+      });
 
       // 用 readyState 而不是缓存的标志位：事件可能在我们订阅之前就已触发过
       if (handle.video.readyState >= 2) {
@@ -188,10 +180,10 @@ export function createPreviewEngine(
       const { layers, active } = layersFor(timeline, frame);
       // 暂停态要等素材就绪 + seek 完成再画，否则显示的是上一次的画面或纯黑
       await Promise.all(
-        active.map(async ({ source, sourceFrame }) => {
+        active.map(async ({ source, seekSeconds }) => {
           const handle = handleFor(source);
           await ensureLoaded(handle.video);
-          await seekTo(handle.video, frameCenterSeconds(sourceFrame, timeline.fps));
+          await seekTo(handle.video, seekSeconds);
         }),
       );
       // seek 期间 handle.ready 可能才变 true，重新收集一次
@@ -202,14 +194,16 @@ export function createPreviewEngine(
     renderLive(timeline, frame) {
       const { layers, active } = layersFor(timeline, frame);
 
-      // 漂移纠正：video 自己走，偏差超过阈值才拉回来，避免每帧 seek
-      for (const { source, sourceFrame } of active) {
+      // 漂移纠正：video 自己走，偏差超过阈值才拉回来，避免每帧 seek。
+      // 容差按**源片**帧长算：慢速素材放到高帧率时间轴上时，3 个时间轴帧
+      // 可能还不到源片的 1 帧，按时间轴帧算会导致每帧都判超差、每帧都 seek
+      for (const { source, seekSeconds } of active) {
         const handle = handleFor(source);
         if (handle.video.readyState < 2) continue;
-        const expected = frameCenterSeconds(sourceFrame, timeline.fps);
-        const actualFrame = secondsToFrame(handle.video.currentTime, timeline.fps);
-        if (Math.abs(actualFrame - sourceFrame) > DRIFT_TOLERANCE_FRAMES) {
-          handle.video.currentTime = expected;
+        const tolerance =
+          (DRIFT_TOLERANCE_FRAMES * frameDurationMicros(source.fps)) / MICROS_PER_SECOND;
+        if (Math.abs(handle.video.currentTime - seekSeconds) > tolerance) {
+          handle.video.currentTime = seekSeconds;
         }
       }
       compositor.composeFrame(layers);
@@ -219,10 +213,10 @@ export function createPreviewEngine(
       playing = true;
       const { active } = layersFor(timeline, frame);
       await Promise.all(
-        active.map(async ({ source, sourceFrame }) => {
+        active.map(async ({ source, seekSeconds }) => {
           const handle = handleFor(source);
           await ensureLoaded(handle.video);
-          await seekTo(handle.video, frameCenterSeconds(sourceFrame, timeline.fps));
+          await seekTo(handle.video, seekSeconds);
           if (!playing) return;
           // play() 在某些情况下会 reject（例如元素已被移除），静音播放不受自动播放策略限制
           await handle.video.play().catch(() => undefined);

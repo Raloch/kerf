@@ -12,8 +12,13 @@ import { ALL_FORMATS, BlobSource, Input, VideoSampleSink } from "mediabunny";
 import { makeSampleVideo } from "./make-sample";
 import { probeFile } from "../media/probe";
 import { startExport } from "../export/client";
+import { readExportFile, removeExportFile } from "../export/write-target";
+import { singleClipTimeline } from "../edl/types";
 import { FPS, toNumber } from "../time/rational";
 import { frameToSeconds } from "../time/timebase";
+
+/** 自检导出的落盘文件名。固定名字，每次跑覆盖上一次。 */
+const VERIFY_OUT = "kerf-verify-m0.mp4";
 
 export interface Check {
   readonly name: string;
@@ -81,23 +86,33 @@ export async function verifyM0(options: VerifyOptions = {}): Promise<VerifyResul
   );
 
   // ---- 3. 导出 trim 区间 ----
+  // "导出源片 90–210 帧"翻译成 EDL 就是"一个 sourceIn=90、长 120 帧的片段，整条导出"
+  const timeline = singleClipTimeline(probe.source, { inFrame, outFrame });
+  await removeExportFile(VERIFY_OUT);
   const handle = startExport(
     {
-      file: probe.source.file,
+      timeline,
+      range: { inFrame: 0, outFrame: timeline.durationFrames },
       container: "mp4",
-      fps: probe.source.fps,
-      width: probe.source.width,
-      height: probe.source.height,
-      inFrame,
-      outFrame,
       videoBitrate: 6e6,
       audioBitrate: 128e3,
       includeAudio: true,
+      target: { kind: "opfs", name: VERIFY_OUT },
+      // 自检不该往用户的下载目录里扔文件
+      autoDownload: false,
     },
     () => undefined,
   );
   const exported = await handle.done;
   if (!exported) throw new Error("导出被取消，无法验收");
+
+  checks.push(
+    check(
+      "EDL 片段长度等于 trim 区间",
+      expectedFrames,
+      timeline.durationFrames,
+    ),
+  );
 
   checks.push(check("导出帧数", expectedFrames, exported.encodedFrames));
   checks.push(check("导出含音频", true, exported.audioIncluded));
@@ -109,11 +124,12 @@ export async function verifyM0(options: VerifyOptions = {}): Promise<VerifyResul
   );
 
   // ---- 4. 读回导出文件断言 ----
-  // 复制一份：Worker transfer 过来的 Uint8Array 泛型参数是 ArrayBufferLike，
-  // 而 BlobPart 要求 ArrayBuffer；复制同时也避免读回时与下游共享同一 buffer
-  const outFile = new File([new Uint8Array(exported.bytes)], "verify.mp4", {
-    type: exported.mimeType,
-  });
+  // 从 OPFS 读回而不是从内存：管道已改成流式写盘，不再回传字节（硬规则 9）。
+  // 顺带也验证了写盘路径本身是通的——落盘失败会在这里读不出文件。
+  const outFile = await readExportFile(VERIFY_OUT);
+  checks.push(
+    check("落盘字节数与管道报告一致", exported.bytesWritten, outFile.size),
+  );
   const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(outFile) });
 
   try {
@@ -177,7 +193,7 @@ export async function verifyM0(options: VerifyOptions = {}): Promise<VerifyResul
     checks,
     passed: checks.every((c) => c.pass),
     elapsedMs: performance.now() - startedAt,
-    exportedBytes: exported.bytes.byteLength,
+    exportedBytes: exported.bytesWritten,
     realtimeFactor,
   };
 }

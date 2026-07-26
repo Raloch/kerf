@@ -7,15 +7,18 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { probeFile, wasFpsSnapped, type ProbeResult } from "../media/probe";
-import { describeCapabilities, probeCapabilities, type ExportCapabilities } from "../media/capability";
+import { describeCapabilities, type ExportCapabilities } from "../media/capability";
+import { probeCapabilities } from "../media/capability-probe";
 import { singleClipTimeline } from "../edl/types";
-import { downloadBytes, startExport, type ExportHandle } from "../export/client";
+import { startExport, type ExportHandle } from "../export/client";
+import { pickWriteTarget } from "../export/write-target";
 import type { ExportProgress } from "../export/protocol";
 import { framesToTimecode, formatDuration, frameToSeconds } from "../time/timebase";
 import { formatFps, toNumber } from "../time/rational";
 // dev 工具走动态 import：只在点击时加载，不进主包
 import type { VerifyResult } from "../dev/verify-m0";
 import type { PreviewVerifyResult } from "../dev/verify-preview";
+import type { TimelineVerifyResult } from "../dev/verify-timeline";
 
 type Status =
   | { kind: "idle" }
@@ -33,6 +36,7 @@ export function M0Panel({ onBack }: { readonly onBack: () => void }) {
   const [status, setStatus] = useState<Status>({ kind: "idle" });
   const [verify, setVerify] = useState<VerifyResult | null>(null);
   const [pv, setPv] = useState<PreviewVerifyResult | null>(null);
+  const [tv, setTv] = useState<TimelineVerifyResult | null>(null);
   const handleRef = useRef<ExportHandle | null>(null);
   const firstFrameRef = useRef<HTMLCanvasElement>(null);
   const lastFrameRef = useRef<HTMLCanvasElement>(null);
@@ -105,10 +109,41 @@ export function M0Panel({ onBack }: { readonly onBack: () => void }) {
     }
   }, []);
 
+  const runTimelineCheck = useCallback(async () => {
+    setTv(null);
+    setStatus({
+      kind: "busy",
+      label: "运行多片段一致性自检（两个片段 + 中间空档，整条导出后逐帧比对）…",
+    });
+    try {
+      const { verifyTimelineConsistency } = await import("../dev/verify-timeline");
+      const result = await verifyTimelineConsistency();
+      setTv(result);
+      setStatus({
+        kind: result.passed ? "done" : "error",
+        text: result.passed
+          ? `多片段一致性通过：${result.checks.length} 项断言全部成立 · ${(result.elapsedMs / 1000).toFixed(1)} 秒`
+          : `不一致：${result.checks.filter((c) => !c.pass).length} 项断言失败`,
+      });
+    } catch (error) {
+      setStatus({ kind: "error", text: error instanceof Error ? error.message : String(error) });
+    }
+  }, []);
+
   const doExport = useCallback(async () => {
     if (!probe) return;
     const source = probe.source;
     const timeline = singleClipTimeline(source, { inFrame, outFrame });
+    const ext = container === "mp4" ? "mp4" : "webm";
+
+    // picker 必须在点击的同步链里调起，所以放在最前面（见 write-target.ts）
+    let target;
+    try {
+      target = await pickWriteTarget(`kerf-m0-${inFrame}-${outFrame}.${ext}`, container);
+    } catch {
+      setStatus({ kind: "done", text: "已取消：没有选择保存位置" });
+      return;
+    }
 
     setStatus({
       kind: "exporting",
@@ -117,16 +152,13 @@ export function M0Panel({ onBack }: { readonly onBack: () => void }) {
 
     const handle = startExport(
       {
-        file: source.file,
+        timeline,
+        range: { inFrame: 0, outFrame: timeline.durationFrames },
         container,
-        fps: source.fps,
-        width: source.width,
-        height: source.height,
-        inFrame,
-        outFrame,
         videoBitrate: 8e6,
         audioBitrate: 128e3,
         includeAudio: source.hasAudio,
+        target,
       },
       (progress) => setStatus({ kind: "exporting", progress }),
     );
@@ -140,14 +172,13 @@ export function M0Panel({ onBack }: { readonly onBack: () => void }) {
       }
       const seconds = result.elapsedMs / 1000;
       const realtime = frameToSeconds(result.encodedFrames, source.fps) / seconds;
-      const ext = container === "mp4" ? "mp4" : "webm";
-      downloadBytes(result.bytes, `kerf-m0-${inFrame}-${outFrame}.${ext}`, result.mimeType);
       setStatus({
         kind: "done",
         text:
-          `导出完成：${result.encodedFrames} 帧 · ${(result.bytes.byteLength / 1e6).toFixed(1)} MB · ` +
+          `导出完成：${result.encodedFrames} 帧 · ${(result.bytesWritten / 1e6).toFixed(1)} MB · ` +
           `${seconds.toFixed(1)} 秒（${realtime.toFixed(2)}× 实时）· ` +
-          `${result.audioIncluded ? "含音频" : "无音频"} · ${result.mimeType}`,
+          `${result.audioIncluded ? "含音频" : "无音频"} · ${result.mimeType} · ` +
+          `${result.opfsName ? "已触发下载" : "已写入所选文件"}`,
       });
     } catch (error) {
       setStatus({ kind: "error", text: error instanceof Error ? error.message : String(error) });
@@ -167,13 +198,16 @@ export function M0Panel({ onBack }: { readonly onBack: () => void }) {
         </button>
         <h1>Kerf · M0 管道验证</h1>
         <p className="lead">
-          验证 decode → compose → encode → mux 全链路与时间基模型。
-          编辑器界面在 M1 实现，见 <code>design/kerf-editor-mockup.html</code>。
+          三个自检覆盖的都是<b>不会报错、只会静默产出错误片子</b>的问题：帧数少一帧、
+          trim 起点偏一帧、跨片段边界读错源片位置、预览和导出画面不一致。
+          单元测试覆盖不到，只有真跑一遍导出再读回比对才能发现。
+          <br />
+          改过导出管道、取样映射或合成层之后，请把三个都跑一遍。
         </p>
       </header>
 
       <section>
-        <h2>1 · 素材</h2>
+        <h2>素材</h2>
         <div className="row">
           <label className="file-btn">
             选择视频文件
@@ -391,6 +425,70 @@ export function M0Panel({ onBack }: { readonly onBack: () => void }) {
         )}
       </section>
 
+      <section>
+        <h2>多片段一致性自检</h2>
+        <p className="hint" style={{ margin: "0 0 12px" }}>
+          单片段比对抓不住 EDL 化引入的那一类错误。这里造一条**两个片段 + 中间空档**的时间轴
+          （时间轴 0–60 读源片 0–60，60–80 空档，80–140 读源片 <b>200–260</b>），整条导出一次，
+          再对 7 个取样帧逐个比对预览与导出。素材背景色相随帧号线性渐变，所以色相直接编码了
+          "取到的是源片第几帧"——跨片段边界如果没换游标，色相会差 140 度，任何容差都盖不住。
+        </p>
+        <button
+          type="button"
+          onClick={() => void runTimelineCheck()}
+          disabled={exporting || status.kind === "busy"}
+        >
+          运行多片段一致性自检
+        </button>
+
+        {tv && (
+          <>
+            <table className="checks">
+              <tbody>
+                {tv.checks.map((c) => (
+                  <tr key={c.name} className={c.pass ? "ok" : "bad"}>
+                    <td>{c.pass ? "✓" : "✕"}</td>
+                    <td>{c.name}</td>
+                    <td className="mono">{c.actual}</td>
+                    <td className="mono dim">{c.pass ? "" : `期望 ${c.expected}`}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <table className="checks">
+              <tbody>
+                <tr className="dim">
+                  <td>取样帧</td>
+                  <td>位置</td>
+                  <td className="mono">预览色相</td>
+                  <td className="mono">导出色相</td>
+                  <td className="mono">期望</td>
+                  <td className="mono">留边 预览/导出</td>
+                </tr>
+                {tv.rows.map((r) => (
+                  <tr key={r.frame}>
+                    <td className="mono">{r.frame}</td>
+                    <td>{r.label}</td>
+                    <td className="mono">{r.previewBlack ? "黑" : `${r.previewHue}°`}</td>
+                    <td className="mono">{r.exportedBlack ? "黑" : `${r.exportedHue}°`}</td>
+                    <td className="mono dim">
+                      {r.expectedHue === null ? "黑" : `${r.expectedHue}°`}
+                    </td>
+                    <td className="mono dim">
+                      {r.previewBands} / {r.exportedBands}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <p className="hint">
+              导出 {tv.encodedFrames} 帧 · {(tv.bytesWritten / 1e6).toFixed(2)} MB ·
+              自检总耗时 {(tv.elapsedMs / 1000).toFixed(1)} 秒
+            </p>
+          </>
+        )}
+      </section>
+
       {status.kind === "busy" && <p className="mono">{status.label}</p>}
       {status.kind === "done" && <p className="done mono">{status.text}</p>}
       {status.kind === "error" && <p className="error mono">{status.text}</p>}
@@ -400,6 +498,7 @@ export function M0Panel({ onBack }: { readonly onBack: () => void }) {
 
 function stageLabel(stage: ExportProgress["stage"]): string {
   switch (stage) {
+    case "mix": return "混音（主线程，OfflineAudioContext）";
     case "prepare": return "准备（探测能力、建编码器）";
     case "video": return "解码 → 合成 → 编码";
     case "finalize": return "封装写出";

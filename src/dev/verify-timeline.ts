@@ -1,0 +1,309 @@
+/**
+ * 多片段时间轴的预览／导出一致性自检——硬规则 2 的第二道护栏。
+ *
+ * verify-preview.ts 只比对**单片段**的一帧：它能抓住"缩放几何分叉"，
+ * 但抓不住 EDL 化引入的那一整类错误，因为单片段时间轴根本走不到它们：
+ *
+ * - 跨片段边界后取到的是**下一个片段的源片位置**，还是继续读上一个片段？
+ *   （reader 没换游标 → 成片在切点之后画面完全错，但不报任何错）
+ * - 时间轴空档产出**黑帧**，还是被跳过？
+ *   （跳过 → 后面所有帧整体前移，音画从此不同步）
+ * - 空档之后的片段能不能**重新开出解码器**？
+ * - 预览在这三种情况下与导出是否仍然一致？
+ *
+ * ## 为什么能断言"取到的是源片第 N 帧"
+ *
+ * 测试素材的背景色随帧号线性渐变（`hue = i/frames*300`），所以**色相编码了源片帧号**。
+ * 于是"跨片段边界取对了没有"从"肉眼看水印"变成一个可比较的数字：
+ * 时间轴第 80 帧应该显示源片第 200 帧（色相 200°），如果 reader 没换游标，
+ * 它会显示源片第 60 帧（色相 60°）——差 140°，任何容差都盖不住。
+ *
+ * 仍然用**方形输出**跑，这样 16:9 素材必然留边，几何分叉也一并被覆盖。
+ */
+
+import { ALL_FORMATS, BlobSource, Input, VideoSampleSink } from "mediabunny";
+import { makeSampleVideo } from "./make-sample";
+import { probeFile } from "../media/probe";
+import { runExport } from "../export/pipeline";
+import { readExportFile, removeExportFile } from "../export/write-target";
+import { createPreviewEngine } from "../preview/preview-engine";
+import type { Clip, Timeline, Track } from "../edl/types";
+import { frameDurationMicros, frameToSeconds, MICROS_PER_SECOND } from "../time/timebase";
+import { hueDistance, measure, sampleHueAt, type Bands } from "./measure";
+import type { Check } from "./verify-m0";
+
+/** 方形输出：让 16:9 素材必然产生上下黑边，从而能比较留边几何。 */
+const OUT_SIZE = 320;
+/** 源片总帧数。色相 = frame/300*300，即色相数值恰好等于帧号，便于对照。 */
+const SOURCE_FRAMES = 300;
+
+/** 片段 A：时间轴 0–60，读源片 0–60。 */
+const A_IN = 0;
+const A_OUT = 60;
+const A_SOURCE_IN = 0;
+/** 空档：时间轴 60–80。 */
+/** 片段 B：时间轴 80–140，读源片 200–260。刻意让源片位置**不连续**。 */
+const B_IN = 80;
+const B_OUT = 140;
+const B_SOURCE_IN = 200;
+
+const TIMELINE_FRAMES = B_OUT;
+const VERIFY_OUT = "kerf-verify-timeline.mp4";
+
+/** 色相容差。素材每帧变 1°，编码有损再加几度，20° 足够区分"差一帧"和"差一个片段"。 */
+const HUE_TOLERANCE = 20;
+/** "纯黑"的最大通道阈值。H.264 有损压缩后纯黑不会正好是 0。 */
+const BLACK_MAX_CHANNEL = 24;
+
+interface Probe {
+  readonly frame: number;
+  readonly label: string;
+  /** 期望读到的源片帧号；null 表示这一帧应该是黑的（空档）。 */
+  readonly expectSourceFrame: number | null;
+}
+
+const PROBES: readonly Probe[] = [
+  { frame: 10, label: "片段 A 内部", expectSourceFrame: A_SOURCE_IN + 10 },
+  { frame: A_OUT - 1, label: "片段 A 末帧", expectSourceFrame: A_SOURCE_IN + A_OUT - 1 },
+  { frame: A_OUT, label: "空档首帧", expectSourceFrame: null },
+  { frame: B_IN - 1, label: "空档末帧", expectSourceFrame: null },
+  { frame: B_IN, label: "片段 B 首帧（跨片段边界）", expectSourceFrame: B_SOURCE_IN },
+  { frame: B_IN + 30, label: "片段 B 内部", expectSourceFrame: B_SOURCE_IN + 30 },
+  { frame: B_OUT - 1, label: "片段 B 末帧", expectSourceFrame: B_SOURCE_IN + B_OUT - B_IN - 1 },
+];
+
+export interface TimelineVerifyRow {
+  readonly label: string;
+  readonly frame: number;
+  readonly previewHue: number;
+  readonly exportedHue: number;
+  readonly expectedHue: number | null;
+  readonly previewBlack: boolean;
+  readonly exportedBlack: boolean;
+  readonly previewBands: string;
+  readonly exportedBands: string;
+}
+
+export interface TimelineVerifyResult {
+  readonly checks: readonly Check[];
+  readonly passed: boolean;
+  readonly rows: readonly TimelineVerifyRow[];
+  readonly encodedFrames: number;
+  readonly bytesWritten: number;
+  readonly elapsedMs: number;
+}
+
+function check(name: string, expected: unknown, actual: unknown, pass?: boolean): Check {
+  return {
+    name,
+    expected: String(expected),
+    actual: String(actual),
+    pass: pass ?? String(expected) === String(actual),
+  };
+}
+
+export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult> {
+  const startedAt = performance.now();
+  const checks: Check[] = [];
+
+  // ---- 1. 素材与多片段 EDL ----
+  const sample = await makeSampleVideo({ durationFrames: SOURCE_FRAMES, withAudio: false });
+  const probe = await probeFile(sample.file);
+
+  const clipA: Clip = {
+    id: "A",
+    sourceId: probe.source.id,
+    timelineIn: A_IN,
+    timelineOut: A_OUT,
+    sourceIn: A_SOURCE_IN,
+  };
+  const clipB: Clip = {
+    id: "B",
+    sourceId: probe.source.id,
+    timelineIn: B_IN,
+    timelineOut: B_OUT,
+    sourceIn: B_SOURCE_IN,
+  };
+  const track: Track = { id: "V1", kind: "video", clips: [clipA, clipB] };
+  const timeline: Timeline = {
+    fps: probe.source.fps,
+    width: OUT_SIZE,
+    height: OUT_SIZE,
+    durationFrames: TIMELINE_FRAMES,
+    tracks: [track],
+    sources: [probe.source],
+  };
+
+  // ---- 2. 预览路径：逐个取样帧渲染并测量 ----
+  const previewCanvas = document.createElement("canvas");
+  const engine = createPreviewEngine(previewCanvas, OUT_SIZE, OUT_SIZE);
+  const previewBands = new Map<number, Bands>();
+  try {
+    const pctx = previewCanvas.getContext("2d");
+    if (!pctx) throw new Error("预览画布没有 2D 上下文");
+    for (const p of PROBES) {
+      await engine.renderFrame(timeline, p.frame);
+      previewBands.set(p.frame, measure(pctx, OUT_SIZE, OUT_SIZE));
+    }
+  } finally {
+    engine.dispose();
+  }
+
+  // ---- 3. 导出路径：整条时间轴一次导出 ----
+  // 刻意导整条而不是逐帧单独导：只有连续跑一遍才会走到"换片段游标"、
+  // "空档释放解码器"、"空档之后重开解码器"这些真实路径
+  await removeExportFile(VERIFY_OUT);
+  const exported = await runExport(
+    {
+      timeline,
+      range: { inFrame: 0, outFrame: TIMELINE_FRAMES },
+      container: "mp4",
+      videoBitrate: 8e6,
+      audioBitrate: 128e3,
+      audio: null,
+      target: { kind: "opfs", name: VERIFY_OUT },
+    },
+    { onProgress: () => undefined, isCanceled: () => false },
+  );
+
+  checks.push(
+    check("导出帧数等于时间轴总长（空档也要出帧，不能跳过）", TIMELINE_FRAMES, exported.encodedFrames),
+  );
+
+  // ---- 4. 读回导出结果，解码同样的取样帧 ----
+  const outFile = await readExportFile(VERIFY_OUT);
+  const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(outFile) });
+  const exportedBands = new Map<number, Bands>();
+  try {
+    const videoTrack = await input.getPrimaryVideoTrack();
+    if (!videoTrack) throw new Error("导出文件里没有视频轨");
+
+    const stats = await videoTrack.computePacketStats();
+    checks.push(check("读回视频帧数", TIMELINE_FRAMES, stats.packetCount));
+
+    const sink = new VideoSampleSink(videoTrack);
+    const canvas = document.createElement("canvas");
+    canvas.width = OUT_SIZE;
+    canvas.height = OUT_SIZE;
+    const ectx = canvas.getContext("2d");
+    if (!ectx) throw new Error("导出比对画布没有 2D 上下文");
+
+    // 半帧偏移：按帧起点查询容易落回前一帧（微秒取整误差）
+    const half = frameDurationMicros(timeline.fps) / 2 / MICROS_PER_SECOND;
+    for (const p of PROBES) {
+      const at = frameToSeconds(p.frame, timeline.fps) + half;
+      const decoded = await sink.getSample(at);
+      if (!decoded) throw new Error(`读不出导出文件的第 ${p.frame} 帧`);
+      const frame = decoded.toVideoFrame();
+      try {
+        ectx.drawImage(frame, 0, 0);
+      } finally {
+        frame.close();
+        decoded.close();
+      }
+      exportedBands.set(p.frame, measure(ectx, OUT_SIZE, OUT_SIZE));
+    }
+  } finally {
+    input.dispose();
+  }
+
+  // ---- 5. 比对 ----
+  const rows: TimelineVerifyRow[] = [];
+  for (const p of PROBES) {
+    const pv = previewBands.get(p.frame)!;
+    const ex = exportedBands.get(p.frame)!;
+    const expectedHue = p.expectSourceFrame === null ? null : sampleHueAt(p.expectSourceFrame, SOURCE_FRAMES);
+
+    rows.push({
+      label: p.label,
+      frame: p.frame,
+      previewHue: pv.hue,
+      exportedHue: ex.hue,
+      expectedHue,
+      previewBlack: pv.maxChannel <= BLACK_MAX_CHANNEL,
+      exportedBlack: ex.maxChannel <= BLACK_MAX_CHANNEL,
+      previewBands: `${pv.top}/${pv.bottom}`,
+      exportedBands: `${ex.top}/${ex.bottom}`,
+    });
+
+    if (p.expectSourceFrame === null) {
+      // 空档：两条路径都必须是纯黑，而不是"上一帧的残留画面"
+      checks.push(
+        check(
+          `帧 ${p.frame}（${p.label}）导出为纯黑`,
+          `maxChannel ≤ ${BLACK_MAX_CHANNEL}`,
+          ex.maxChannel,
+          ex.maxChannel <= BLACK_MAX_CHANNEL,
+        ),
+      );
+      checks.push(
+        check(
+          `帧 ${p.frame}（${p.label}）预览为纯黑`,
+          `maxChannel ≤ ${BLACK_MAX_CHANNEL}`,
+          pv.maxChannel,
+          pv.maxChannel <= BLACK_MAX_CHANNEL,
+        ),
+      );
+      continue;
+    }
+
+    // 内容帧：先断言"取到的确实是期望的源片帧"（这条能抓住跨片段没换游标），
+    // 再断言"预览和导出一致"（这条是硬规则 2 本身）
+    checks.push(
+      check(
+        `帧 ${p.frame}（${p.label}）导出取到源片第 ${p.expectSourceFrame} 帧`,
+        `色相 ${expectedHue}° ±${HUE_TOLERANCE}`,
+        `${ex.hue}°`,
+        hueDistance(ex.hue, expectedHue!) <= HUE_TOLERANCE,
+      ),
+    );
+    checks.push(
+      check(
+        `帧 ${p.frame}（${p.label}）预览与导出色相一致`,
+        `Δ ≤ ${HUE_TOLERANCE}°`,
+        `${hueDistance(pv.hue, ex.hue)}°`,
+        hueDistance(pv.hue, ex.hue) <= HUE_TOLERANCE,
+      ),
+    );
+    checks.push(
+      check(
+        `帧 ${p.frame}（${p.label}）留边几何一致`,
+        `${pv.top}/${pv.bottom}`,
+        `${ex.top}/${ex.bottom}`,
+        pv.top === ex.top && pv.bottom === ex.bottom,
+      ),
+    );
+  }
+
+  // 跨片段边界这条单独再断言一次：它是 EDL 化最容易错、后果最严重的地方
+  const boundary = rows.find((r) => r.frame === B_IN)!;
+  const wrongHue = sampleHueAt(A_SOURCE_IN + B_IN, SOURCE_FRAMES);
+  checks.push(
+    check(
+      "跨片段边界没有沿用上一个片段的源片位置",
+      `不接近色相 ${wrongHue}°（那是没换游标的表现）`,
+      `${boundary.exportedHue}°`,
+      hueDistance(boundary.exportedHue, wrongHue) > HUE_TOLERANCE,
+    ),
+  );
+
+  // 确实产生了留边，否则几何比对是空的
+  const first = rows[0]!;
+  checks.push(
+    check(
+      "确实产生了留边（方形输出 + 16:9 源片）",
+      "> 0",
+      first.exportedBands,
+      previewBands.get(PROBES[0]!.frame)!.top > 0,
+    ),
+  );
+
+  return {
+    checks,
+    passed: checks.every((c) => c.pass),
+    rows,
+    encodedFrames: exported.encodedFrames,
+    bytesWritten: exported.bytesWritten,
+    elapsedMs: performance.now() - startedAt,
+  };
+}

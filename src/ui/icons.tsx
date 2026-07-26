@@ -143,3 +143,22 @@ export const IconNo = () => (
     <path d="M4.5 4.5l7 7M11.5 4.5l-7 7" />
   </svg>
 );
+
+export const IconX = () => (
+  <svg viewBox="0 0 16 16" aria-hidden="true" {...stroke}>
+    <path d="M4 4l8 8M12 4l-8 8" />
+  </svg>
+);
+
+export const IconFolder = () => (
+  <svg viewBox="0 0 16 16" aria-hidden="true" {...stroke}>
+    <path d="M2 4.5A1.5 1.5 0 013.5 3h2.7l1.4 1.8h4.9A1.5 1.5 0 0114 6.3V12a1.5 1.5 0 01-1.5 1.5h-9A1.5 1.5 0 012 12z" />
+  </svg>
+);
+
+export const IconWarn = () => (
+  <svg viewBox="0 0 16 16" aria-hidden="true" {...stroke}>
+    <path d="M8 2.2l6 11.3H2z" />
+    <path d="M8 6.4v3.2M8 11.6h.01" />
+  </svg>
+);

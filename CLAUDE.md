@@ -5,11 +5,11 @@
 完整方案：[docs/PLAN.md](docs/PLAN.md)（选型理由、架构、兼容矩阵、决策记录、里程碑）
 界面设计稿：[design/kerf-editor-mockup.html](design/kerf-editor-mockup.html)（已定稿，四种状态）
 
-当前阶段：**M1 已完成**（编辑器骨架可用：导入、多轨时间轴、拖拽/裁切/磁吸、预览播放、OPFS 代理与缩略图）。下一步 M2 创作能力（文字层、关键帧、转场、滤镜、音量包络 + 音频波形）。
+当前阶段：**M1.5 导出闭环已完成**（编辑器骨架 + EDL 驱动的导出：多片段/多轨取帧、空档黑帧、多轨混音、流式写盘、导出面板）。下一步 M2 创作能力（文字层、关键帧、转场、滤镜、音量包络 + 音频波形）。
 
 ```bash
 pnpm dev          # 起开发服务器
-pnpm test         # 跑单元测试（时间基 25 项 + 状态层 65 项）
+pnpm test         # 跑单元测试（115 项：时间基 25 / 状态层 65 / 取样映射 15 / 预设 10）
 pnpm typecheck    # 类型检查，严格模式
 pnpm build        # 构建
 ```
@@ -30,9 +30,36 @@ pnpm build        # 构建
 - **浏览器实测要用 `window.__kerfStore`**（dev 环境自动挂载），不要在脚本里 `import('/src/state/timeline-store.ts')`：Vite 的 HMR URL 带参数，动态 import 会拿到**另一个模块实例**，脚本改了状态界面毫无反应，看起来像 UI 没绑定 store。
 - 拖拽类交互要**同时测水平和垂直**：跨轨道是纯垂直移动，只测水平会漏掉阈值判定的 bug。
 
-**改动预览或合成后，必须跑「预览 / 导出一致性自检」**（M0 自检面板里）：它用同一帧分别走两条路径逐像素比对，是硬规则 2 唯一的自动护栏。另外预览 seek 要落在**帧中点**（`frameCenterSeconds`），落在帧起点会拿到前一帧。
+## 导出层约定（M1.5 起）
 
-**改动导出管道或时间基后，必须跑 M0 自检**：`pnpm dev` → 页面上点「运行 M0 自检」，它会生成素材、导出 trim 区间、读回断言 14 项。帧数/时长/trim 起点错了不会报错，只会静默产出错误的片子，单元测试也覆盖不到——只有这个自检能发现。
+- **预览和导出的取帧决策只能来自 `src/edl/sampling.ts`**。共用 `compose()` 只保证"画法一致"；"该画哪个片段、按什么顺序、读源片哪一刻"如果各写一套，画面照样不一致。三个函数是唯一入口：`sourceMicrosAt`（帧 → 源片时刻）、`videoTracksInDrawOrder`（z 序反转只有一处）、`visibleVideoClips`（某帧的图层）。
+- **不要用 `toSourceFrame()` 做取帧位置**。它算的是帧号加减，隐含"源片帧率 = 时间轴帧率"。25fps 素材放到 30fps 时间轴上会慢 20% 且不报错。用 `sourceMicrosAt`。
+- **`VideoTrackReader` 返回的 `VideoSample` 归 reader 所有，调用方不要 `close()`**。时间轴帧率高于源片帧率时同一个 sample 会被多个输出帧复用。
+- **取帧只能向前**。倒着问会抛错——顺序解码是硬规则 3 的前提。
+- **每条轨一份 `Input`**，哪怕同一个源文件：Input 的 demuxer 有读取位置，两条轨交错拉包会互相打乱。
+- **音频混流只能在主线程**（`OfflineAudioContext` 在 Worker 里不可用），混好的 PCM 要 **transfer** 进 Worker，不能靠结构化克隆——几百 MB 会整份复制一遍。
+- **导出预设按"每像素每帧比特数"定档，不写死码率**。写死过一次：360p 素材上「标准发布」仍按 10 Mbps 编，白扔 5 倍字节，而「存档母版」倒挂成最低档。
+- **OPFS 目标在取消/失败时要自己删目录项**。`output.cancel()` 只 abort 内容，条目还在，会留 0 字节文件。picker 路径不能删——那是用户自己选的文件。
+
+## 三个自检，改到相关地方就得跑
+
+都在「M0 自检」面板里，`pnpm dev` 后从编辑器顶栏进。这三类错误**都不会报错**，只会静默产出错误的片子，单元测试覆盖不到。
+
+| 改了什么 | 必须跑 |
+|---|---|
+| 导出管道 / 时间基 | **M0 自检**（16 项）：生成素材 → 探测 → 导出 trim 区间 → 读回断言 |
+| 预览 / 合成 | **预览 / 导出一致性自检**（5 项）：同一帧两条路径逐像素比对 |
+| 取帧映射 / EDL / 多轨 | **多片段一致性自检**（23 项）：两片段 + 空档整条导出后比对 7 个取样帧 |
+
+多片段自检能断言"取到的是源片第 N 帧"，靠的是测试素材背景色相随帧号线性渐变（`hue = i/frames*300`）——色相编码了源片帧号。**改 `make-sample.ts` 的配色就要同步改 `measure.ts` 的 `sampleHueAt`**，否则自检开始误报。
+
+另外预览 seek 要落在**帧中点**（`sourceCenterMicrosAt`），落在帧起点会拿到前一帧。
+
+## 首屏体积
+
+**mediabunny（约 500KB）不能进主 chunk。** 它只能出现在 Worker 里，或被动态 `import()`。已经踩过两次：一次是 `probe`/`capability`/`thumbnails` 静态 import，一次是导出面板经 `client.ts` → `mixdown.ts` 把它拖回来。判断方法是 `pnpm build` 看主 chunk——正常在 250KB 上下，出现 600KB+ 就是又被拖进来了。
+
+拆分模式是**把"要 mediabunny 的那一半"单独成文件**：`capability.ts` / `capability-probe.ts`、`thumbnails.ts` / `thumbnail-extract.ts`。同步渲染路径上的函数（如 `drawStrip`）不能 await 动态 import，所以必须靠文件边界隔离，不能靠调用点。
 
 ## 技术栈（已定，不要另选）
 
@@ -60,7 +87,7 @@ ffmpeg.wasm 不进主路径（软编慢 10–50×，多线程版的 COOP/COEP �
 6. **解码 / 合成 / 编码全部在 Web Worker。** 主线程只跑 UI，否则导出期间界面完全卡死。注意 **`OfflineAudioContext` 在 Worker 里不可用**：M2 做多轨混音时 PCM 要在主线程算好再 transfer 进去。
 7. **裁剪要处理 GOP 边界**：clip 起点通常不在关键帧上，必须回退到前一个 keyframe 解码再丢弃多余帧，否则 trim 花屏。用 `VideoSampleSink.samples(start, end)` 顺序解码，mediabunny 内部已做这件事；不要逐帧 `getSample()`，那会反复 seek，慢一个量级。
 8. **时间轴时长按视频轨算**，不能用 `input.computeDuration()`——AAC 的 priming/padding 会让音轨更长，300 帧素材会被算成 303 帧。
-9. **导出结果流式写盘，不要攒成 Blob。**（M0 暂用 BufferTarget 出内存，M1 换 StreamTarget 写盘）
+9. **导出结果流式写盘，不要攒成 Blob。** 已落地：`StreamTarget` + `FileSystemWritableFileStream`，picker 拿到的句柄可直接 postMessage 进 Worker；没有 picker 的浏览器回退成"流式写 OPFS 再触发下载"。不要为了方便退回 `BufferTarget`。
 10. **不静默降级导出格式。** 能力不足时明确告知用户后果并给出路——用户点了 MP4 却拿到 WebM 是投诉源。相关设计见 PLAN.md 的 D3。
 
 ## 改动设计时
