@@ -24,6 +24,7 @@
 import {
   clipAt,
   findSource,
+  type Clip,
   type MediaClip,
   type MediaSource,
   type TextClip,
@@ -31,6 +32,8 @@ import {
   type Track,
 } from "./types";
 import { frameDurationMicros, frameToMicros, MICROS_PER_SECOND } from "../time/timebase";
+import { resolveTransform } from "../anim/keyframes";
+import type { LayerTransform } from "../compose/compositor";
 import type { Rational } from "../time/rational";
 
 /**
@@ -85,6 +88,11 @@ export interface VisibleMediaClip {
   readonly source: MediaSource;
   /** 该帧对应的源片时刻（整数微秒）。 */
   readonly sourceMicros: number;
+  /**
+   * 这一帧算完的变换（静态值 + 关键帧求值）。`undefined` 表示铺满默认留边位置，
+   * 合成器据此走恒等快路径——**不要**在这里补一个空对象，见 PLAN.md 的 D9 / D10。
+   */
+  readonly transform?: LayerTransform;
 }
 
 /** 某一帧要画的一层文字。没有源片，也就没有取帧位置。 */
@@ -92,6 +100,7 @@ export interface VisibleTextClip {
   readonly kind: "text";
   readonly trackId: string;
   readonly clip: TextClip;
+  readonly transform?: LayerTransform;
 }
 
 /**
@@ -102,6 +111,16 @@ export interface VisibleTextClip {
  * 这个字段只在下面两个函数里赋值，不存在第二个真值来源。
  */
 export type VisibleClip = VisibleMediaClip | VisibleTextClip;
+
+/**
+ * 算某片段在某帧的变换。**关键帧的帧偏移相对片段起点**（D10），换算只有这一处。
+ *
+ * 放在这个模块里是刻意的：预览和导出都从 `visibleVideoClips` 拿变换，谁都不自己算。
+ * 让导出侧再算一遍就又是两套渲染决策——那正是硬规则 2 要消灭的东西。
+ */
+function transformAt(clip: Clip, frame: number): LayerTransform | undefined {
+  return resolveTransform(clip.transform, clip.keyframes, frame - clip.timelineIn);
+}
 
 /**
  * 视频轨的**绘制顺序：从底到顶**。
@@ -130,8 +149,12 @@ export function visibleVideoClips(timeline: Timeline, frame: number): VisibleCli
   for (const track of videoTracksInDrawOrder(timeline)) {
     const clip = clipAt(track, frame);
     if (!clip) continue;
+    // `transform` 用条件展开而不是直接写 `transform: undefined`：
+    // exactOptionalPropertyTypes 下"字段不存在"和"字段是 undefined"是两回事，
+    // 而下游靠"没有变换"走恒等快路径
+    const transform = transformAt(clip, frame);
     if (clip.kind === "text") {
-      out.push({ kind: "text", trackId: track.id, clip });
+      out.push({ kind: "text", trackId: track.id, clip, ...(transform ? { transform } : {}) });
       continue;
     }
     const source = timeline.sources.find((s) => s.id === clip.sourceId);
@@ -142,6 +165,7 @@ export function visibleVideoClips(timeline: Timeline, frame: number): VisibleCli
       clip,
       source,
       sourceMicros: sourceMicrosAt(clip, frame, timeline.fps, source.fps),
+      ...(transform ? { transform } : {}),
     });
   }
   return out;

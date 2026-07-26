@@ -349,7 +349,9 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
                     </div>
                   </>
                 )}
-                <p className="empty">变换、速度、滤镜、音量包络在 M2 接入。</p>
+                <p className="empty">
+                  变换与关键帧已进入 EDL，编辑界面稍后接入。速度、滤镜、音量包络在 M2 后半段。
+                </p>
               </>
             )}
           </div>

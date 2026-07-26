@@ -172,6 +172,8 @@ export function createPreviewEngine(
           image: handle.video,
           width: source.width,
           height: source.height,
+          // 变换来自 visibleVideoClips，这一层不自己算——导出侧拿的是同一个值
+          ...(visible.transform ? { transform: visible.transform } : {}),
         });
       }
     }

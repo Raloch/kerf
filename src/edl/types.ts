@@ -8,6 +8,8 @@
  * 但类型按 M1/M2 的需要留好了扩展位（多轨、多片段、转场、效果）。
  */
 
+import type { KeyframeChannels } from "../anim/keyframes";
+import type { LayerTransform } from "../compose/compositor";
 import type { Rational } from "../time/rational";
 
 export type SourceId = string;
@@ -52,8 +54,18 @@ interface ClipBase {
   readonly timelineOut: number;
   /** 片段标签，缺省时 UI 回退到素材名 / 文字内容。冲突提示也用它。 */
   readonly name?: string | undefined;
-  /** M2 起承载滤镜/变换/关键帧。现在恒为空。 */
-  readonly effects?: readonly never[];
+  /**
+   * 静态变换：位置 / 缩放 / 旋转 / 不透明度。缺省 = 铺满默认留边位置。
+   *
+   * 与 `keyframes` **并存**，某属性有关键帧时以关键帧为准（见 PLAN.md 的 D10）。
+   * 这里存的是"用户调出来的那个值"，动画只是让它随时间变。
+   */
+  readonly transform?: LayerTransform;
+  /**
+   * 关键帧通道，每个属性一条独立序列。帧偏移**相对片段起点**（D10）——
+   * 所以在时间轴上平移片段不需要动它，但**裁入点时要跟着平移**。
+   */
+  readonly keyframes?: KeyframeChannels;
 }
 
 /** 引用一段导入素材的片段。`sourceIn` 是它引用源片的起始帧。 */

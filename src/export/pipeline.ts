@@ -14,8 +14,10 @@
  *   的源片帧。源片帧率与时间轴帧率不一致时也正确（见 `edl/sampling.ts`）。
  * - **不逐帧 seek**：每个片段一个 `VideoSampleSink.samples(start, end)` 生成器顺序
  *   解码，mediabunny 内部会从入点之前的关键帧开始解并丢弃多余帧（硬规则 7）。
- * - **图层顺序与"该画哪个片段"由 `edl/sampling.ts` 决定**，预览走同一个函数。
- *   这里只管把拿到的图层交给 `compose()`（硬规则 2）。
+ * - **图层顺序、每层的变换、"该画哪个片段"全部由 `edl/sampling.ts` 决定**，预览走
+ *   同一个函数。所以这里分两步：先把所有 reader 推进到这一帧（解码是有状态的），
+ *   再按 `visibleVideoClips` 给的顺序装配图层（硬规则 2）。两步不能合成一步——
+ *   见循环里的注释。
  * - **背压靠 await**：`source.add()` 的 Promise 在编码器就绪时才 resolve，
  *   await 它就等于给编码队列施加背压，不需要自己盯 encodeQueueSize（硬规则 5）。
  * - **VideoSample 的所有权在 reader**（硬规则 4）：时间轴帧率高于源片帧率时同一个
@@ -33,10 +35,11 @@ import {
   Output,
   StreamTarget,
   WebMOutputFormat,
+  type VideoSample,
 } from "mediabunny";
 
 import { createCanvas2DCompositor, type ComposeLayer } from "../compose/compositor";
-import { videoTracksInDrawOrder } from "../edl/sampling";
+import { videoTracksInDrawOrder, visibleVideoClips } from "../edl/sampling";
 import { decideFormat } from "../media/capability";
 import { probeCapabilities } from "../media/capability-probe";
 import { frameToSeconds, frameDurationMicros, MICROS_PER_SECOND } from "../time/timebase";
@@ -101,7 +104,11 @@ export async function runExport(
   const drawOrder = videoTracksInDrawOrder(timeline);
   if (drawOrder.length === 0) throw new Error("时间轴上没有可见的视频轨");
 
-  const readers = drawOrder.map((track) => new VideoTrackReader(timeline, track, range));
+  // 带上 trackId：装配图层时要按轨对上 `visibleVideoClips` 给的那一层
+  const readers = drawOrder.map((track) => ({
+    trackId: track.id,
+    reader: new VideoTrackReader(timeline, track, range),
+  }));
   const compositor = createCanvas2DCompositor(timeline.width, timeline.height);
 
   const handle = await resolveHandle(request.target);
@@ -143,17 +150,29 @@ export async function runExport(
       checkCancel();
       const outputFrame = range.inFrame + i;
 
-      // 每条轨都要问一次，包括空档的：让 reader 在空档处主动释放解码器，
-      // 而不是把上一个片段的解码器一直挂着
-      //
-      // 文字片段被 reader 当空档跳过，这里也就一层都不画——预览侧同样跳过，
-      // 两条路径仍然一致。接文字渲染时这个循环要改成按 `visibleVideoClips`
-      // 的图层顺序组装（reader 出素材层、文字层现场生成），两侧必须同时改。
-      const layers: ComposeLayer[] = [];
-      for (const reader of readers) {
+      // 第一步：把**每条**轨都推进到这一帧，包括这一帧没有片段的。
+      // 不能只问"有可见图层"的那几条轨——空档轨也要被问到才会主动释放解码器，
+      // 而且 reader 只允许向前问（硬规则 3），漏问一帧就再也补不回来。
+      // sample 归 reader 所有，这里不能 close（硬规则 4）
+      const samples = new Map<string, VideoSample>();
+      for (const { trackId, reader } of readers) {
         const sample = await reader.sampleAt(outputFrame);
-        // sample 归 reader 所有，这里不能 close（硬规则 4）
-        if (sample) layers.push({ kind: "sample", sample });
+        if (sample) samples.set(trackId, sample);
+      }
+
+      // 第二步：按图层顺序装配。顺序和每层的变换都来自 sampling.ts，
+      // 导出侧一个都不自己算——预览侧拿的是同一个函数的同一份结果（硬规则 2）
+      const layers: ComposeLayer[] = [];
+      for (const visible of visibleVideoClips(timeline, outputFrame)) {
+        // 文字层要等文字渲染那一步才有画面；预览侧同样跳过，两条路径仍然一致
+        if (visible.kind === "text") continue;
+        const sample = samples.get(visible.trackId);
+        if (!sample) continue;
+        layers.push({
+          kind: "sample",
+          sample,
+          ...(visible.transform ? { transform: visible.transform } : {}),
+        });
       }
 
       // layers 为空 → 合成器画纯黑，这正是时间轴空隙该有的样子
@@ -213,7 +232,7 @@ export async function runExport(
     throw error;
   } finally {
     compositor.dispose();
-    await Promise.all(readers.map((reader) => reader.dispose()));
+    await Promise.all(readers.map(({ reader }) => reader.dispose()));
   }
 }
 
