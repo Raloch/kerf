@@ -191,8 +191,12 @@ export const useTimeline = create<TimelineState>((set, get) => {
         target = snapDrag(target, length, targets).frame;
       }
 
+      // "没动"必须连轨道一起判。跨轨道拖拽是**纯垂直**移动，delta 恒为 0，
+      // 只看 delta 会把整个跨轨落点静默丢掉——既不移动也不给 lastRejection，
+      // 表现成"拖上去松手，片段弹回原轨"。见 CLAUDE.md 的"水平和垂直都要测"
       const delta = target - found.clip.timelineIn;
-      if (delta === 0) return; // 没动就不要产生历史条目
+      const sameTrack = toTrack === undefined || toTrack === found.track.id;
+      if (delta === 0 && sameTrack) return; // 真的没动才不产生历史条目
       apply(
         moveClip(timeline, clipId, delta, toTrack === undefined ? {} : { toTrack }),
         "移动片段",

@@ -142,6 +142,24 @@ describe("拖拽与磁吸", () => {
     expect(s().history.past.length).toBe(before);
   });
 
+  // 跨轨道是纯垂直移动，帧号一个都不变。"没动就不提交"的判断只看帧号时，
+  // 整个跨轨落点会被静默丢掉——不移动、也不给拒绝原因
+  it("同一帧号换轨道仍然要移动，不能当成没动", () => {
+    const s = () => useTimeline.getState();
+    s().loadSource(source(300)); // V1: [0,300)
+    s().dragClipTo("src1-v", 0, "V2");
+    expect(findClip(s().timeline(), "src1-v")!.track.id).toBe("V2");
+    expect(s().lastRejection).toBeNull();
+  });
+
+  it("同一帧号拖回原轨道仍然算没动", () => {
+    const s = () => useTimeline.getState();
+    s().loadSource(source(300));
+    const before = s().history.past.length;
+    s().dragClipTo("src1-v", 0, "V1");
+    expect(s().history.past.length).toBe(before);
+  });
+
   it("关掉磁吸后落点精确", () => {
     const s = () => useTimeline.getState();
     s().loadSource(source(300));
