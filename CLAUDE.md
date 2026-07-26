@@ -5,7 +5,9 @@
 完整方案：[docs/PLAN.md](docs/PLAN.md)（选型理由、架构、兼容矩阵、决策记录、里程碑）
 界面设计稿：[design/kerf-editor-mockup.html](design/kerf-editor-mockup.html)（已定稿，四种状态）
 
-当前阶段：**M1.5 导出闭环已完成**（编辑器骨架 + EDL 驱动的导出：多片段/多轨取帧、空档黑帧、多轨混音、流式写盘、导出面板）。下一步 M2 创作能力（文字层、关键帧、转场、滤镜、音量包络 + 音频波形）。
+当前阶段：**M1.5 导出闭环已完成**（编辑器骨架 + EDL 驱动的导出：多片段/多轨取帧、空档黑帧、多轨混音、流式写盘、导出面板），**M1.6 PixiJS 后端 spike 已完成**（结论见 PLAN.md §7 M1.6 与 §6 的 D5）。
+
+下一步 M2 创作能力，按 D5 分两段：先在 Canvas2D 上做文字层 / 关键帧 / 基础转场，滤镜和 shader 转场之前再换 Pixi 后端。**换后端之前先把 `ComposeLayer` 扩成渲染后端无关的描述**（加文字层和变换），扩完再换实现——否则接口和后端一起动，自检报错时没有基准可比。
 
 ```bash
 pnpm dev          # 起开发服务器
@@ -41,15 +43,27 @@ pnpm build        # 构建
 - **导出预设按"每像素每帧比特数"定档，不写死码率**。写死过一次：360p 素材上「标准发布」仍按 10 Mbps 编，白扔 5 倍字节，而「存档母版」倒挂成最低档。
 - **OPFS 目标在取消/失败时要自己删目录项**。`output.cancel()` 只 abort 内容，条目还在，会留 0 字节文件。picker 路径不能删——那是用户自己选的文件。
 
-## 三个自检，改到相关地方就得跑
+## 合成层约定（M1.6 起）
 
-都在「M0 自检」面板里，`pnpm dev` 后从编辑器顶栏进。这三类错误**都不会报错**，只会静默产出错误的片子，单元测试覆盖不到。
+- **留边几何只有 `containRect()` 一处**。两个后端各算一遍就会在「预览 / 导出一致性自检」里差一两个像素，而那条断言要求黑边高度**完全相等**。
+- **`pixi-compositor.ts` 对 pixi.js 只有 `import type`**，实例走函数里的动态 `import()`。所以谁静态 import 它都不会把 Pixi 拖进自己的 chunk——这和 mediabunny 的"文件边界"模式不同，靠的是**异步工厂 + 同步 `composeFrame`**。
+- **Pixi 后端里临时 `VideoFrame` 必须在 `render()` 之后才 `close()`**。纹理上传发生在 render 期间；Canvas2D 的 `drawImage` 是立即的，所以那边"画完就关"是对的。从 Canvas2D 迁过来最容易踩这条，且不报错。
+- **每个图层一个常驻 `ImageSource`，逐帧只换 `resource` 再 `update()`**。每帧 `Texture.from(frame)` 会逐帧新建 GPU 纹理，导出慢一个量级。自检里"GPU 纹理数不随帧数增长"就是锁这条。
+- **锁 WebGL，不要 WebGPU**，也不要关 `preserveDrawingBuffer`（实测开销为零，见 PLAN.md §7 M1.6）。
+- **Pixi 后端目前不接在预览和导出上**，只被 spike 自检使用。要接进去先读 PLAN.md 的 D5。
+
+## 四个自检，改到相关地方就得跑
+
+都在「M0 自检」面板里，`pnpm dev` 后从编辑器顶栏进。前三类错误**都不会报错**，只会静默产出错误的片子，单元测试覆盖不到。
 
 | 改了什么 | 必须跑 |
 |---|---|
 | 导出管道 / 时间基 | **M0 自检**（16 项）：生成素材 → 探测 → 导出 trim 区间 → 读回断言 |
 | 预览 / 合成 | **预览 / 导出一致性自检**（5 项）：同一帧两条路径逐像素比对 |
 | 取帧映射 / EDL / 多轨 | **多片段一致性自检**（23 项）：两片段 + 空档整条导出后比对 7 个取样帧 |
+| 合成层 / Pixi 后端 | **PixiJS 后端 spike**（11 项）：Worker 里起 WebGL，与 Canvas2D 跑同一份输入比对，外加两个只有 WebGL 才有的失效模式 |
+
+第四个不是回归自检，是**换渲染后端之前必须成立的前提**——它跑在写 M2 功能代码之前，不是之后。
 
 多片段自检能断言"取到的是源片第 N 帧"，靠的是测试素材背景色相随帧号线性渐变（`hue = i/frames*300`）——色相编码了源片帧号。**改 `make-sample.ts` 的配色就要同步改 `measure.ts` 的 `sampleHueAt`**，否则自检开始误报。
 
@@ -61,12 +75,14 @@ pnpm build        # 构建
 
 拆分模式是**把"要 mediabunny 的那一半"单独成文件**：`capability.ts` / `capability-probe.ts`、`thumbnails.ts` / `thumbnail-extract.ts`。同步渲染路径上的函数（如 `drawStrip`）不能 await 动态 import，所以必须靠文件边界隔离，不能靠调用点。
 
+**PixiJS 同理（412KB raw / gzip 119KB）。** 但它用的是另一个模式：`pixi-compositor.ts` 对 pixi.js 只有 `import type`，动态 `import()` 藏在 `createPixiCompositor()` 这个**异步工厂**里，返回的 `composeFrame()` 是同步的。边界划在"创建时"而不是"调用时"，因为调用点在 rAF 回调和导出逐帧循环里，每帧 await 不可接受。当前主 chunk 252,997 B（gzip 80,027），接 Pixi 之后这个数应该**一个字节都不变**。
+
 ## 技术栈（已定，不要另选）
 
 | 用途 | 用什么 |
 |---|---|
 | 编解码 / 封装 / 转码 | mediabunny |
-| 画面合成 / 滤镜 / 转场 | PixiJS v8 |
+| 画面合成 / 滤镜 / 转场 | PixiJS v8（锁 WebGL2，不用 WebGPU；M2 后半段接入） |
 | 音频离线混流 | OfflineAudioContext |
 | 状态 / 撤销栈 | Zustand + Immer |
 | 大文件存储 | OPFS + File System Access API |

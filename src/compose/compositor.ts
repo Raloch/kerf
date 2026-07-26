@@ -33,6 +33,42 @@ export type ComposeLayer =
       readonly opacity?: number;
     };
 
+/** 等比缩放居中（contain）后，图层在输出画布上占据的矩形。 */
+export interface ContainRect {
+  readonly dx: number;
+  readonly dy: number;
+  readonly width: number;
+  readonly height: number;
+}
+
+/**
+ * 等比缩放居中贴图（contain）的几何。
+ *
+ * **只有这一处**算这个。Canvas2D 后端把它喂给 `drawImage`，Pixi 后端把它变成
+ * sprite 的位置与缩放——两个后端各算一遍就会在留边上差一两个像素，而
+ * "预览 / 导出一致性自检"要求黑边高度**完全相等**，届时会失败得莫名其妙。
+ *
+ * 源片尺寸非法时返回 null（表示这一层不画），不要返回零尺寸矩形——
+ * 后者会让调用方画出一个不可见但仍占 draw call 的图层。
+ */
+export function containRect(
+  srcWidth: number,
+  srcHeight: number,
+  outWidth: number,
+  outHeight: number,
+): ContainRect | null {
+  if (srcWidth <= 0 || srcHeight <= 0) return null;
+  const scale = Math.min(outWidth / srcWidth, outHeight / srcHeight);
+  const width = srcWidth * scale;
+  const height = srcHeight * scale;
+  return {
+    dx: (outWidth - width) / 2,
+    dy: (outHeight - height) / 2,
+    width,
+    height,
+  };
+}
+
 export interface Compositor {
   readonly width: number;
   readonly height: number;
@@ -101,7 +137,7 @@ export function createCanvas2DCompositor(
   };
 }
 
-/** 等比缩放居中贴图（contain）。预览和导出必须用同一套几何，否则构图会不一致。 */
+/** 按 `containRect` 的几何贴图。几何本身不在这里算——见该函数的注释。 */
 function drawContain(
   ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
   image: CanvasImageSource,
@@ -111,14 +147,10 @@ function drawContain(
   outHeight: number,
   opacity?: number,
 ): void {
-  if (srcWidth <= 0 || srcHeight <= 0) return;
-  const scale = Math.min(outWidth / srcWidth, outHeight / srcHeight);
-  const w = srcWidth * scale;
-  const h = srcHeight * scale;
-  const dx = (outWidth - w) / 2;
-  const dy = (outHeight - h) / 2;
+  const rect = containRect(srcWidth, srcHeight, outWidth, outHeight);
+  if (!rect) return;
 
   if (opacity !== undefined) ctx.globalAlpha = opacity;
-  ctx.drawImage(image, dx, dy, w, h);
+  ctx.drawImage(image, rect.dx, rect.dy, rect.width, rect.height);
   ctx.globalAlpha = 1;
 }

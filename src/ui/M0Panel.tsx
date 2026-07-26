@@ -19,6 +19,7 @@ import { formatFps, toNumber } from "../time/rational";
 import type { VerifyResult } from "../dev/verify-m0";
 import type { PreviewVerifyResult } from "../dev/verify-preview";
 import type { TimelineVerifyResult } from "../dev/verify-timeline";
+import type { PixiVerifyResult } from "../dev/verify-pixi";
 
 type Status =
   | { kind: "idle" }
@@ -37,6 +38,7 @@ export function M0Panel({ onBack }: { readonly onBack: () => void }) {
   const [verify, setVerify] = useState<VerifyResult | null>(null);
   const [pv, setPv] = useState<PreviewVerifyResult | null>(null);
   const [tv, setTv] = useState<TimelineVerifyResult | null>(null);
+  const [px, setPx] = useState<PixiVerifyResult | null>(null);
   const handleRef = useRef<ExportHandle | null>(null);
   const firstFrameRef = useRef<HTMLCanvasElement>(null);
   const lastFrameRef = useRef<HTMLCanvasElement>(null);
@@ -124,6 +126,27 @@ export function M0Panel({ onBack }: { readonly onBack: () => void }) {
         text: result.passed
           ? `多片段一致性通过：${result.checks.length} 项断言全部成立 · ${(result.elapsedMs / 1000).toFixed(1)} 秒`
           : `不一致：${result.checks.filter((c) => !c.pass).length} 项断言失败`,
+      });
+    } catch (error) {
+      setStatus({ kind: "error", text: error instanceof Error ? error.message : String(error) });
+    }
+  }, []);
+
+  const runPixiSpike = useCallback(async () => {
+    setPx(null);
+    setStatus({
+      kind: "busy",
+      label: "运行 PixiJS 后端 spike（Worker 里起 WebGL，与 Canvas2D 跑同一份输入）…",
+    });
+    try {
+      const { verifyPixiBackend } = await import("../dev/verify-pixi");
+      const result = await verifyPixiBackend();
+      setPx(result);
+      setStatus({
+        kind: result.passed ? "done" : "error",
+        text: result.passed
+          ? `Pixi 后端可行：${result.checks.length} 项前提全部成立 · ${(result.elapsedMs / 1000).toFixed(1)} 秒`
+          : `${result.checks.filter((c) => !c.pass).length} 项前提不成立——M2 换后端前必须先解决`,
       });
     } catch (error) {
       setStatus({ kind: "error", text: error instanceof Error ? error.message : String(error) });
@@ -484,6 +507,80 @@ export function M0Panel({ onBack }: { readonly onBack: () => void }) {
             <p className="hint">
               导出 {tv.encodedFrames} 帧 · {(tv.bytesWritten / 1e6).toFixed(2)} MB ·
               自检总耗时 {(tv.elapsedMs / 1000).toFixed(1)} 秒
+            </p>
+          </>
+        )}
+      </section>
+
+      <section>
+        <h2>PixiJS 后端 spike（M2 前置）</h2>
+        <p className="hint" style={{ margin: "0 0 12px" }}>
+          这一项不是回归自检，是<b>换渲染后端之前必须成立的前提</b>。M2 的滤镜和 shader
+          转场要 GPU，而合成器同时被预览（主线程）和导出（Worker）依赖。这里在 Worker 里
+          起 Pixi 的 WebGL2 渲染器，和 Canvas2D 后端跑<b>同一份输入</b>，比对留边几何与色彩，
+          并主动制造两个只有 WebGL 才有的失效模式：跨 task 后 drawing buffer 被清空，
+          以及 GL 上下文丢失。后者在导出跑几分钟时会被切标签页或系统休眠触发，
+          默认行为是渲染变成 no-op——也就是静默写出几百帧黑画面。
+        </p>
+        <button
+          type="button"
+          onClick={() => void runPixiSpike()}
+          disabled={exporting || status.kind === "busy"}
+        >
+          运行 Pixi 后端 spike
+        </button>
+
+        {px && (
+          <>
+            <table className="checks">
+              <tbody>
+                {px.checks.map((c) => (
+                  <tr key={c.name} className={c.pass ? "ok" : "bad"}>
+                    <td>{c.pass ? "✓" : "✕"}</td>
+                    <td>{c.name}</td>
+                    <td className="mono">{c.actual}</td>
+                    <td className="mono dim">{c.pass ? "" : `期望 ${c.expected}`}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <table className="checks">
+              <tbody>
+                {/* 表头逐格 nowrap：最后一列较长，不加会把「取样帧」挤成竖排 */}
+                <tr className="dim" style={{ whiteSpace: "nowrap" }}>
+                  <td>取样帧</td>
+                  <td className="mono">期望色相</td>
+                  <td className="mono">Pixi</td>
+                  <td className="mono">Canvas2D</td>
+                  <td className="mono">留边 Pixi / Canvas2D</td>
+                </tr>
+                {px.report.frames.map((f) => (
+                  <tr key={f.index}>
+                    <td className="mono">{f.index}</td>
+                    <td className="mono dim">{f.expectedHue}°</td>
+                    <td className="mono">{f.pixi.hue}°</td>
+                    <td className="mono">{f.canvas2d.hue}°</td>
+                    <td className="mono dim">
+                      {f.pixi.top}/{f.pixi.bottom} · {f.canvas2d.top}/{f.canvas2d.bottom}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <p className="hint">
+              {px.report.contextVersion} · 封装 {px.report.container} / {px.report.codec} ·
+              GPU 纹理 {px.report.textures.afterFirstFrame} → {px.report.textures.afterLastFrame}
+              <br />
+              吞吐 {px.report.perf.width}×{px.report.perf.height} × {px.report.perf.frames} 帧：
+              Canvas2D {px.report.perf.canvas2dMs.toFixed(0)}ms · Pixi{" "}
+              {px.report.perf.pixiMs.toFixed(0)}ms · Pixi 关掉 preserveDrawingBuffer{" "}
+              {px.report.perf.pixiNoPreserveMs.toFixed(0)}ms
+              <br />
+              留边比对那组（320×320 × {px.report.frameCount} 帧）：Pixi{" "}
+              {px.report.encodeMs.pixi.toFixed(0)}ms / Canvas2D{" "}
+              {px.report.encodeMs.canvas2d.toFixed(0)}ms；纯合成（仅 CPU 提交）Pixi{" "}
+              {px.report.composeMs.pixi.toFixed(0)}ms / Canvas2D{" "}
+              {px.report.composeMs.canvas2d.toFixed(0)}ms
             </p>
           </>
         )}
