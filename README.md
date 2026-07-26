@@ -25,7 +25,7 @@
 - **时间轴**多轨、片段永不重叠、磁吸（拖拽时按 ⌥ 临时关闭）、⌘K 切分、⌘Z 撤销（连续拖拽合并成一步）。
 - **导出**按整份 EDL 走：多个片段分别指向不同源片、轨道空档产黑帧、多轨音频混流后编码，成品边编码边写盘（不在内存里攒 Blob）。Chrome / Edge 走系统保存对话框直写文件；Safari / Firefox 回退成先写浏览器存储再触发下载。
 
-实测约 **12–13× 实时**（640×360，H.264 硬编）。
+实测约 **11.6× 实时**（1080p30 一分钟片子，H.264 硬编 + AAC，Apple M3 Max）。历次测量记在 [docs/PLAN.md](docs/PLAN.md) 的性能基线表里，只追加不改旧行——没有对照的性能数字会悄悄烂掉。
 
 界面按 **[这份可交互设计稿](https://raloch.github.io/kerf/)** 实现（源文件 [design/kerf-editor-mockup.html](design/kerf-editor-mockup.html)，单文件零依赖，clone 后双击也能打开）。
 
