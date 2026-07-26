@@ -5,13 +5,13 @@
 完整方案：[docs/PLAN.md](docs/PLAN.md)（选型理由、架构、兼容矩阵、决策记录、里程碑）
 界面设计稿：[design/kerf-editor-mockup.html](design/kerf-editor-mockup.html)（已定稿，四种状态）
 
-当前阶段：**M2 前半段第 1 步已完成**——`Clip` 改成判别联合 `{kind:"media"} | {kind:"text"}`（决策见 PLAN.md 的 **D8**）。之前：M1.5 导出闭环、M1.6 PixiJS 后端 spike（见 PLAN.md §7 M1.6 与 §6 的 D5）。
+当前阶段：**M2 前半段第 1、2 步已完成**——`Clip` 改成判别联合 `{kind:"media"} | {kind:"text"}`（**D8**），`ComposeLayer` 加上了渲染后端无关的 `LayerTransform`（位置/缩放/旋转/不透明度，**D9**），两个后端都实现了同一套摆位语义。之前：M1.5 导出闭环、M1.6 PixiJS 后端 spike（见 PLAN.md §7 M1.6 与 §6 的 D5）。
 
-下一步是前半段第 2 步：**把 `ComposeLayer` 扩成渲染后端无关的描述**（加变换：位置/缩放/旋转/不透明度，`containRect()` 降级成默认变换），仍在 Canvas2D 上。扩完接口再换 Pixi 实现——否则接口和后端一起动，自检报错时没有基准可比。第 3 步是关键帧求值。文字**渲染**（字体/断行/描边）排在变换之后，模型已经就绪。
+下一步是前半段第 3 步：**关键帧求值**（纯函数、可脱离浏览器单测，时间用有理数帧号，拖拽合并键形如 `keyframe:${clipId}:${property}`）。它的作用目标就是 `LayerTransform` 的四个量。之后是把求值结果接进 EDL→`ComposeLayer` 的组装，以及文字**渲染**（字体/断行/描边）——两者的模型都已就绪。
 
 ```bash
 pnpm dev          # 起开发服务器
-pnpm test         # 跑单元测试（132 项：时间基 25 / 状态层 74 / 取样映射 19 / 预设 14）
+pnpm test         # 跑单元测试（146 项：时间基 25 / 状态层 74 / 取样映射 19 / 预设 14 / 合成几何 14）
 pnpm typecheck    # 类型检查，严格模式
 pnpm build        # 构建
 ```
@@ -48,7 +48,10 @@ pnpm build        # 构建
 
 ## 合成层约定（M1.6 起）
 
-- **留边几何只有 `containRect()` 一处**。两个后端各算一遍就会在「预览 / 导出一致性自检」里差一两个像素，而那条断言要求黑边高度**完全相等**。
+- **留边几何只有 `containRect()` 一处**，**变换摆位只有 `placeLayer()` 一处**。两个后端各算一遍就会在「预览 / 导出一致性自检」里差一两个像素，而那条断言要求黑边高度**完全相等**。
+- **`LayerTransform` 相对"默认留边位置"，不是绝对画布坐标**。关键帧要表达"放大到 1.2 倍""挪到右下角"，写成绝对像素一换输出分辨率就全错。省略 = 不动。旋转用**弧度**（两个后端的 API 都收弧度），度数转换留在 UI 层。
+- **恒等变换必须走"直接按 `containRect` 贴图"的原路径**（`isDefaultGeometry()`）。这不是性能优化：`translate(cx,cy)` + `drawImage(-w/2,…)` 数学上等于 `drawImage(dx,…)`，但浮点上 `(dx+w/2)-w/2` 未必精确回到 `dx`，而留边断言是逐行判黑的。改这块之后要验的不是"跑得过"，是**没用变换的输出逐像素不变**——做法见 PLAN.md 的 **D9**。
+- **Pixi 后端的 sprite 是跨帧复用的，`anchor` / `rotation` 两条分支都要显式写**。带变换的帧把 anchor 设成 0.5，下一帧走恒等路径时若不复位，整层会偏半个图层——且只在"某帧有变换、下一帧没有"时出现。
 - **`pixi-compositor.ts` 对 pixi.js 只有 `import type`**，实例走函数里的动态 `import()`。所以谁静态 import 它都不会把 Pixi 拖进自己的 chunk——这和 mediabunny 的"文件边界"模式不同，靠的是**异步工厂 + 同步 `composeFrame`**。
 - **Pixi 后端里临时 `VideoFrame` 必须在 `render()` 之后才 `close()`**。纹理上传发生在 render 期间；Canvas2D 的 `drawImage` 是立即的，所以那边"画完就关"是对的。从 Canvas2D 迁过来最容易踩这条，且不报错。
 - **每个图层一个常驻 `ImageSource`，逐帧只换 `resource` 再 `update()`**。每帧 `Texture.from(frame)` 会逐帧新建 GPU 纹理，导出慢一个量级。自检里"GPU 纹理数不随帧数增长"就是锁这条。
@@ -64,7 +67,7 @@ pnpm build        # 构建
 | 导出管道 / 时间基 | **M0 自检**（16 项）：生成素材 → 探测 → 导出 trim 区间 → 读回断言 |
 | 预览 / 合成 | **预览 / 导出一致性自检**（5 项）：同一帧两条路径逐像素比对 |
 | 取帧映射 / EDL / 多轨 | **多片段一致性自检**（23 项）：两片段 + 空档整条导出后比对 7 个取样帧 |
-| 合成层 / Pixi 后端 | **PixiJS 后端 spike**（11 项）：Worker 里起 WebGL，与 Canvas2D 跑同一份输入比对，外加两个只有 WebGL 才有的失效模式 |
+| 合成层 / Pixi 后端 | **PixiJS 后端 spike**（15 项）：Worker 里起 WebGL，与 Canvas2D 跑同一份输入比对，外加两个只有 WebGL 才有的失效模式，以及**图层变换的摆位**（5 个用例 × 两个后端，比对手算位置） |
 
 第四个不是回归自检，是**换渲染后端之前必须成立的前提**——它跑在写 M2 功能代码之前，不是之后。
 

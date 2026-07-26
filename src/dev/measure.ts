@@ -15,6 +15,13 @@
 export interface Bands {
   readonly top: number;
   readonly bottom: number;
+  /**
+   * 左右黑边宽度。等比缩放留边只会产生上下**或**左右其中一组，所以横屏素材上
+   * 这两个恒为 0；它们是给**图层变换**用的——缩放和位移只改水平位置时，
+   * 上下黑边一个像素都不变，只有左右能看出来。
+   */
+  readonly left: number;
+  readonly right: number;
   readonly meanR: number;
   readonly meanG: number;
   readonly meanB: number;
@@ -41,10 +48,22 @@ export function measure(
     return true;
   };
 
+  const colIsBlack = (x: number): boolean => {
+    for (let y = 0; y < height; y += 4) {
+      const i = (y * width + x) * 4;
+      if (data[i]! + data[i + 1]! + data[i + 2]! > 24) return false;
+    }
+    return true;
+  };
+
   let top = 0;
   while (top < height && rowIsBlack(top)) top++;
   let bottom = 0;
   while (bottom < height && rowIsBlack(height - 1 - bottom)) bottom++;
+  let left = 0;
+  while (left < width && colIsBlack(left)) left++;
+  let right = 0;
+  while (right < width && colIsBlack(width - 1 - right)) right++;
 
   let maxChannel = 0;
   for (let i = 0; i < data.length; i += 4) {
@@ -74,7 +93,7 @@ export function measure(
   const meanB = Math.round(b / Math.max(1, n));
   const { hue, chroma } = hueOf(meanR, meanG, meanB);
 
-  return { top, bottom, meanR, meanG, meanB, hue, chroma, maxChannel };
+  return { top, bottom, left, right, meanR, meanG, meanB, hue, chroma, maxChannel };
 }
 
 /** RGB → 色相（度）与彩度（max-min，0–255）。 */

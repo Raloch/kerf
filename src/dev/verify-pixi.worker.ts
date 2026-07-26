@@ -37,7 +37,11 @@ import {
   type VideoCodec,
 } from "mediabunny";
 
-import { createCanvas2DCompositor, type Compositor } from "../compose/compositor";
+import {
+  createCanvas2DCompositor,
+  type Compositor,
+  type LayerTransform,
+} from "../compose/compositor";
 import { createPixiCompositor, type PixiCompositor } from "../compose/pixi-compositor";
 import { measure, sampleHueAt, type Bands } from "./measure";
 
@@ -67,6 +71,22 @@ export interface FrameComparison {
   readonly canvas2d: Bands;
 }
 
+/** 四条黑边，用来把"图层落在哪"变成四个可断言的整数。 */
+export interface Edges {
+  readonly top: number;
+  readonly bottom: number;
+  readonly left: number;
+  readonly right: number;
+}
+
+export interface TransformComparison {
+  readonly name: string;
+  /** 手算的期望摆位。计算过程见 `TRANSFORM_CASES` 每条的注释。 */
+  readonly expected: Edges;
+  readonly pixi: Bands;
+  readonly canvas2d: Bands;
+}
+
 export interface PixiProbeReport {
   readonly contextVersion: string;
   readonly container: "mp4" | "webm";
@@ -85,6 +105,8 @@ export interface PixiProbeReport {
   readonly encodeMs: { readonly pixi: number; readonly canvas2d: number };
   readonly frames: readonly FrameComparison[];
   readonly frameCount: number;
+  /** 图层变换在两个后端上的摆位比对（M2 第 2 步加的）。 */
+  readonly transforms: readonly TransformComparison[];
   /** 720p 上的吞吐，`pixiNoPreserve` 用来量 preserveDrawingBuffer 的开销。 */
   readonly perf: {
     readonly width: number;
@@ -234,6 +256,90 @@ async function throughputPass(
   }
 }
 
+/**
+ * 图层变换的比对用例。
+ *
+ * 输出 320×320、源片 640×360，所以默认留边矩形是 **320×180 @ (0,70)**，中心 (160,160)。
+ * 下面每条的 `expected` 都由此手算——**不是**拿 `placeLayer()` 算出来再回填的，
+ * 否则这组断言只能证明"两个后端都按 placeLayer 摆"，证不出 placeLayer 摆得对。
+ * （placeLayer 自己的算式由 `compose/compositor.test.ts` 用手算数锁住。）
+ *
+ * 旋转刻意取 90°：任意角度会让边缘落在半个像素上，Canvas2D 的插值和 Pixi 的
+ * 无抗锯齿采样必然差一两个像素，那时断言只能放松到看不出真错误。90° 的四条边
+ * 仍落在整像素上，同时足够暴露旋转中心搞错或方向搞反——两者都会让位置整体偏掉。
+ */
+const TRANSFORM_CASES: readonly {
+  readonly name: string;
+  readonly transform: LayerTransform;
+  readonly expected: Edges;
+}[] = [
+  {
+    // 对照组：恒等变换必须与"不传变换"完全一样，也就是默认留边
+    name: "恒等变换 = 默认留边",
+    transform: {},
+    expected: { top: 70, bottom: 70, left: 0, right: 0 },
+  },
+  {
+    // 320×180 缩一半 = 160×90，中心不动 → x 80..240，y 115..205
+    name: "缩到一半，绕中心缩",
+    transform: { scaleX: 0.5, scaleY: 0.5 },
+    expected: { top: 115, bottom: 115, left: 80, right: 80 },
+  },
+  {
+    // 160×90 的中心从 (160,160) 挪到 (200,130) → x 120..280，y 85..175
+    name: "缩一半再挪到右上（画中画）",
+    transform: { scaleX: 0.5, scaleY: 0.5, x: 40, y: -30 },
+    expected: { top: 85, bottom: 145, left: 120, right: 40 },
+  },
+  {
+    // 160×90 绕中心转 90° → 外接框变成 90 宽 × 160 高 → x 115..205，y 80..240
+    name: "缩一半再转 90°，绕图层中心",
+    transform: { scaleX: 0.5, scaleY: 0.5, rotation: Math.PI / 2 },
+    expected: { top: 80, bottom: 80, left: 115, right: 115 },
+  },
+  {
+    // 只改不透明度：几何必须一点不动，仍是默认留边
+    name: "半透明不改几何",
+    transform: { opacity: 0.5 },
+    expected: { top: 70, bottom: 70, left: 0, right: 0 },
+  },
+];
+
+/**
+ * 两个后端各按同一组变换摆一遍，直接量画布——**不过编码器**。
+ *
+ * 这里要的是几何精度，而 H.264 的 4:2:0 色度下采样会把硬边糊开一两个像素，
+ * 刚好落在断言的量级上。编码捕获路径由上面那三个取样帧负责。
+ */
+async function transformPass(sample: VideoSample): Promise<TransformComparison[]> {
+  const probe = new OffscreenCanvas(OUT, OUT);
+  const probeCtx = probe.getContext("2d", { willReadFrequently: true });
+  if (!probeCtx) throw new Error("变换比对画布没有 2D 上下文");
+
+  const snapshot = (compositor: Compositor, transform: LayerTransform): Bands => {
+    compositor.composeFrame([{ kind: "sample", sample, transform }]);
+    probeCtx.clearRect(0, 0, OUT, OUT);
+    probeCtx.drawImage(compositor.canvas, 0, 0);
+    return measure(probeCtx, OUT, OUT);
+  };
+
+  const pixi = await createPixiCompositor(OUT, OUT);
+  const canvas2d = createCanvas2DCompositor(OUT, OUT);
+  try {
+    return TRANSFORM_CASES.map((testCase) => ({
+      name: testCase.name,
+      expected: testCase.expected,
+      // 刻意让同一个合成器连着跑所有用例：slot / sprite 是跨帧复用的，
+      // "上一帧有旋转、这一帧没有"是最容易残留状态的路径
+      pixi: snapshot(pixi, testCase.transform),
+      canvas2d: snapshot(canvas2d, testCase.transform),
+    }));
+  } finally {
+    pixi.dispose();
+    canvas2d.dispose();
+  }
+}
+
 /** 纯合成耗时。只测 CPU 提交，GPU 是否完成不在这里体现——真实耗时看 encodeMs。 */
 function timeCompose(compositor: Compositor, samples: readonly VideoSample[]): number {
   // 预热一轮：排除着色器编译和纹理首次分配
@@ -370,11 +476,14 @@ async function run(): Promise<PixiProbeReport> {
     const pixiBands = await measureFrames(pixiClip, PROBE_FRAMES);
     const canvas2dBands = await measureFrames(canvas2dClip, PROBE_FRAMES);
 
-    // ---- 5. 两个失效模式 ----
+    // ---- 5. 图层变换：两个后端摆位是否一致、是否落在手算的位置上 ----
+    const transforms = await transformPass(probeSample);
+
+    // ---- 6. 两个失效模式 ----
     const drawingBuffer = await probeDrawingBuffer(probeSample);
     const contextLoss = await probeContextLoss(probeSample);
 
-    // ---- 6. 吞吐（720p，不缩放）----
+    // ---- 7. 吞吐（720p，不缩放）----
     const perf = await throughputPass(container, codec);
 
     return {
@@ -393,6 +502,7 @@ async function run(): Promise<PixiProbeReport> {
         canvas2d: canvas2dBands[i]!,
       })),
       frameCount: FRAMES,
+      transforms,
       perf,
     };
   } finally {

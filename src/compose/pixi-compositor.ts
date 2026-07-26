@@ -40,7 +40,7 @@ import type {
   WebGLRenderer,
 } from "pixi.js";
 
-import { containRect, type Compositor, type ComposeLayer } from "./compositor";
+import { containRect, isDefaultGeometry, placeLayer, type Compositor } from "./compositor";
 
 /** 仅供自检使用的观察窗口。生产代码不要依赖这里的任何东西。 */
 export interface PixiCompositorDebug {
@@ -200,11 +200,27 @@ export async function createPixiCompositor(
           slot.source.update();
 
           slot.sprite.visible = true;
-          slot.sprite.position.set(rect.dx, rect.dy);
-          // 不用 sprite.width/height：那两个 setter 依赖纹理尺寸的记账，
-          // 换源尺寸时容易慢一帧。直接算缩放是确定的
-          slot.sprite.scale.set(rect.width / srcWidth, rect.height / srcHeight);
-          slot.sprite.alpha = layer.opacity ?? 1;
+          slot.sprite.alpha = layer.transform?.opacity ?? 1;
+
+          // anchor 和 rotation 两条分支都要显式写。slot 是**跨帧复用**的，
+          // 上一帧留下的 anchor 0.5 会让这一帧的恒等摆位整体偏半个图层——
+          // 而且只在"某帧有变换、下一帧没有"时才出现，最难复现的那种
+          if (isDefaultGeometry(layer.transform)) {
+            // 与加变换之前完全相同的摆法：anchor 留在左上角，直接摆到 containRect 的位置
+            slot.sprite.anchor.set(0, 0);
+            slot.sprite.rotation = 0;
+            slot.sprite.position.set(rect.dx, rect.dy);
+            // 不用 sprite.width/height：那两个 setter 依赖纹理尺寸的记账，
+            // 换源尺寸时容易慢一帧。直接算缩放是确定的
+            slot.sprite.scale.set(rect.width / srcWidth, rect.height / srcHeight);
+          } else {
+            // 旋转要绕图层中心，所以 anchor 挪到中心、position 跟着变成中心点
+            const placement = placeLayer(rect, layer.transform);
+            slot.sprite.anchor.set(0.5, 0.5);
+            slot.sprite.rotation = placement.rotation;
+            slot.sprite.position.set(placement.centerX, placement.centerY);
+            slot.sprite.scale.set(placement.width / srcWidth, placement.height / srcHeight);
+          }
           used++;
         }
 

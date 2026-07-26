@@ -10,9 +10,9 @@
  * Worker 只负责跑和量（见 `verify-pixi.worker.ts` 的文件头）。
  */
 
-import { hueDistance } from "./measure";
+import { hueDistance, type Bands } from "./measure";
 import type { Check } from "./verify-m0";
-import type { PixiProbeReport, PixiProbeResponse } from "./verify-pixi.worker";
+import type { Edges, PixiProbeReport, PixiProbeResponse } from "./verify-pixi.worker";
 
 /** Worker 里要起渲染器、编两遍、再解两遍，慢机器上给足时间。 */
 const TIMEOUT_MS = 180_000;
@@ -35,6 +35,20 @@ export interface PixiVerifyResult {
 
 function check(name: string, expected: string, actual: string, pass: boolean): Check {
   return { name, expected, actual, pass };
+}
+
+/** 四条黑边里差得最远的那一条，用来把"摆位对不对"压成一个数。 */
+function worstEdgeDelta(a: Edges | Bands, b: Edges | Bands): number {
+  return Math.max(
+    Math.abs(a.top - b.top),
+    Math.abs(a.bottom - b.bottom),
+    Math.abs(a.left - b.left),
+    Math.abs(a.right - b.right),
+  );
+}
+
+function edgesOf(b: Edges | Bands): string {
+  return `上${b.top} 下${b.bottom} 左${b.left} 右${b.right}`;
 }
 
 function runProbeWorker(): Promise<PixiProbeReport> {
@@ -186,7 +200,70 @@ export async function verifyPixiBackend(): Promise<PixiVerifyResult> {
     ),
   );
 
-  // ---- 9. 吞吐 ----
+  // ---- 9. 图层变换（M2 第 2 步）----
+  // 分三条断言，因为三种错法的定位成本完全不同：
+  //   两个后端都偏 → placeLayer 的算式错了（但两边一致，迁移时抓不到）
+  //   只有一个后端偏 → 那个后端的摆法错了（anchor / 旋转中心 / slot 残留）
+  // 合成一条只会告诉你"错了"，还得再手动拆一遍
+  for (const backend of ["canvas2d", "pixi"] as const) {
+    let worst = 0;
+    let worstCase = "";
+    for (const t of report.transforms) {
+      const delta = worstEdgeDelta(t[backend], t.expected);
+      if (delta > worst) {
+        worst = delta;
+        worstCase = `${t.name}：期望 ${edgesOf(t.expected)}，实际 ${edgesOf(t[backend])}`;
+      }
+    }
+    checks.push(
+      check(
+        `变换后的摆位落在手算的位置上（${backend === "pixi" ? "Pixi" : "Canvas2D"}）`,
+        `≤ ${BAND_TOLERANCE_PX}px`,
+        worst === 0 ? "全部精确命中" : `最差 ${worst}px · ${worstCase}`,
+        worst <= BAND_TOLERANCE_PX,
+      ),
+    );
+  }
+
+  let worstTransformBackend = 0;
+  let worstTransformCase = "";
+  for (const t of report.transforms) {
+    const delta = worstEdgeDelta(t.pixi, t.canvas2d);
+    if (delta > worstTransformBackend) {
+      worstTransformBackend = delta;
+      worstTransformCase = t.name;
+    }
+  }
+  checks.push(
+    check(
+      "两个后端在带变换时摆位一致（换后端不改构图）",
+      `≤ ${BAND_TOLERANCE_PX}px`,
+      worstTransformBackend === 0
+        ? `${report.transforms.length} 个用例全部一致`
+        : `最差 ${worstTransformBackend}px（${worstTransformCase}）`,
+      worstTransformBackend <= BAND_TOLERANCE_PX,
+    ),
+  );
+
+  // 不透明度单独看：几何一致不代表混色一致，而半透明叠加是转场的基础
+  const alphaCase = report.transforms.find((t) => t.name.includes("半透明"));
+  const alphaDelta = alphaCase
+    ? Math.max(
+        Math.abs(alphaCase.pixi.meanR - alphaCase.canvas2d.meanR),
+        Math.abs(alphaCase.pixi.meanG - alphaCase.canvas2d.meanG),
+        Math.abs(alphaCase.pixi.meanB - alphaCase.canvas2d.meanB),
+      )
+    : Number.POSITIVE_INFINITY;
+  checks.push(
+    check(
+      "两个后端的半透明混色一致（交叉溶解的基础）",
+      "≤ 4",
+      alphaCase ? String(alphaDelta) : "找不到半透明用例",
+      alphaDelta <= 4,
+    ),
+  );
+
+  // ---- 10. 吞吐 ----
   // 用 720p 那组，不用上面 320×320 的：小画布上每帧固定开销占比过高，
   // 拿它的比值下结论会把 Pixi 判得过重
   const { perf } = report;

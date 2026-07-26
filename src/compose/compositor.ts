@@ -16,13 +16,36 @@
 
 import type { VideoSample } from "mediabunny";
 
+/**
+ * 图层变换：位置 / 缩放 / 旋转 / 不透明度。**这四个量正是关键帧的作用目标。**
+ *
+ * 全部**相对默认留边位置**（`containRect` 的结果），不是绝对画布坐标：
+ * 关键帧要表达的是"放大到 1.2 倍""挪到右下角"，而不是"贴到第 480 像素"——
+ * 后者一换输出分辨率就全错。省略等于不动，所以 `undefined` 与"填满默认位置"同义。
+ *
+ * `rotation` 用**弧度**：Canvas2D 的 `ctx.rotate` 和 Pixi 的 `sprite.rotation`
+ * 都收弧度，度数转换留给 UI 层做，不要在这里出现第二种单位。
+ */
+export interface LayerTransform {
+  /** 相对默认位置的偏移，单位是输出画布像素。 */
+  readonly x?: number;
+  readonly y?: number;
+  /** 相对默认尺寸的缩放倍数。 */
+  readonly scaleX?: number;
+  readonly scaleY?: number;
+  /** 绕**图层中心**旋转，弧度。 */
+  readonly rotation?: number;
+  /** 0–1。 */
+  readonly opacity?: number;
+}
+
 /** 一个图层的画面来源。两种形态对应两条取帧路径，但走同一个合成函数。 */
 export type ComposeLayer =
   | {
       readonly kind: "sample";
       /** mediabunny 解码出的帧。生命周期由调用方负责，合成器只读不关。 */
       readonly sample: VideoSample;
-      readonly opacity?: number;
+      readonly transform?: LayerTransform;
     }
   | {
       readonly kind: "image";
@@ -30,7 +53,7 @@ export type ComposeLayer =
       readonly image: CanvasImageSource;
       readonly width: number;
       readonly height: number;
-      readonly opacity?: number;
+      readonly transform?: LayerTransform;
     };
 
 /** 等比缩放居中（contain）后，图层在输出画布上占据的矩形。 */
@@ -67,6 +90,52 @@ export function containRect(
     width,
     height,
   };
+}
+
+/**
+ * 图层最终落在输出画布上的位置。以**中心点 + 尺寸 + 旋转**描述，不用左上角矩形：
+ * 旋转必须绕中心，用左上角表达就得在两个后端各写一遍"先平移到中心再转回去"。
+ */
+export interface LayerPlacement {
+  readonly centerX: number;
+  readonly centerY: number;
+  readonly width: number;
+  readonly height: number;
+  readonly rotation: number;
+  readonly opacity: number;
+}
+
+/**
+ * 把默认留边矩形和变换合成最终摆位。**只有这一处**做这件事——
+ * 两个后端各算一遍就会在"两后端留边几何一致"那条断言上差出像素来。
+ */
+export function placeLayer(rect: ContainRect, transform?: LayerTransform): LayerPlacement {
+  const { x = 0, y = 0, scaleX = 1, scaleY = 1, rotation = 0, opacity = 1 } = transform ?? {};
+  return {
+    centerX: rect.dx + rect.width / 2 + x,
+    centerY: rect.dy + rect.height / 2 + y,
+    width: rect.width * scaleX,
+    height: rect.height * scaleY,
+    rotation,
+    opacity,
+  };
+}
+
+/**
+ * 变换有没有动过几何（位移 0、缩放 1、旋转 0）。
+ *
+ * 两个后端据此走"直接按 `containRect` 贴图"的原路径，让**没用变换的项目输出与
+ * 加变换之前逐字节相同**。这不是性能优化，是确定性：`translate(cx,cy)` 再
+ * `drawImage(-w/2,…)` 在数学上等于 `drawImage(dx,…)`，但浮点上 `(dx + w/2) - w/2`
+ * 未必精确回到 `dx`，边缘像素可能挪半个像素——而留边断言是逐行判黑的，
+ * 半个像素就够让"上黑边高度完全相等"变成差 1px。
+ *
+ * `opacity` 刻意不在判断条件里：它不改几何，两条路径都直接设 alpha。
+ */
+export function isDefaultGeometry(transform?: LayerTransform): boolean {
+  if (!transform) return true;
+  const { x = 0, y = 0, scaleX = 1, scaleY = 1, rotation = 0 } = transform;
+  return x === 0 && y === 0 && scaleX === 1 && scaleY === 1 && rotation === 0;
 }
 
 export interface Compositor {
@@ -121,12 +190,12 @@ export function createCanvas2DCompositor(
           // 它的生命周期与传入的 sample 是分开的（mediabunny 明确要求）
           const frame = layer.sample.toVideoFrame();
           try {
-            drawContain(ctx, frame, frame.displayWidth, frame.displayHeight, width, height, layer.opacity);
+            drawLayer(ctx, frame, frame.displayWidth, frame.displayHeight, width, height, layer.transform);
           } finally {
             frame.close();
           }
         } else {
-          drawContain(ctx, layer.image, layer.width, layer.height, width, height, layer.opacity);
+          drawLayer(ctx, layer.image, layer.width, layer.height, width, height, layer.transform);
         }
       }
     },
@@ -137,20 +206,45 @@ export function createCanvas2DCompositor(
   };
 }
 
-/** 按 `containRect` 的几何贴图。几何本身不在这里算——见该函数的注释。 */
-function drawContain(
+/**
+ * 按"默认留边 + 变换"的几何贴图。几何本身不在这里算——见 `containRect` / `placeLayer`。
+ *
+ * 两条路径不是重复代码：恒等变换那条必须保持与加变换之前**完全相同的 drawImage 调用**，
+ * 理由见 `isDefaultGeometry`。
+ */
+function drawLayer(
   ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
   image: CanvasImageSource,
   srcWidth: number,
   srcHeight: number,
   outWidth: number,
   outHeight: number,
-  opacity?: number,
+  transform?: LayerTransform,
 ): void {
   const rect = containRect(srcWidth, srcHeight, outWidth, outHeight);
   if (!rect) return;
+  const opacity = transform?.opacity ?? 1;
 
-  if (opacity !== undefined) ctx.globalAlpha = opacity;
-  ctx.drawImage(image, rect.dx, rect.dy, rect.width, rect.height);
-  ctx.globalAlpha = 1;
+  if (isDefaultGeometry(transform)) {
+    ctx.globalAlpha = opacity;
+    ctx.drawImage(image, rect.dx, rect.dy, rect.width, rect.height);
+    ctx.globalAlpha = 1;
+    return;
+  }
+
+  const placement = placeLayer(rect, transform);
+  // save/restore 而不是手工回滚：rotate 之后的 CTM 靠 setTransform(1,0,0,1,0,0) 复位
+  // 会连带把调用方可能设过的变换一起清掉，那是别人的状态
+  ctx.save();
+  ctx.globalAlpha = opacity;
+  ctx.translate(placement.centerX, placement.centerY);
+  if (placement.rotation !== 0) ctx.rotate(placement.rotation);
+  ctx.drawImage(
+    image,
+    -placement.width / 2,
+    -placement.height / 2,
+    placement.width,
+    placement.height,
+  );
+  ctx.restore();
 }
