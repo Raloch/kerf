@@ -40,7 +40,13 @@ import {
   type TrimEdge,
 } from "./operations";
 
-/** 空项目：没有素材时的初始时间轴。 */
+/**
+ * 空项目：没有素材时的初始时间轴。默认 5 轨，见 PLAN.md 决策 D1。
+ *
+ * T1 的 `kind` 是 `"video"`，这是对的而不是笔误：轨道只分画面/声音两条通道，
+ * 「字幕 / 标题」是**摆放约定**（文字层习惯放最上面），不是类型约束——
+ * 标题同样能压在叠加轨上。"这一段是素材还是文字"由 `Clip.kind` 判别（见 `edl/types.ts`）。
+ */
 export const EMPTY_TIMELINE: Timeline = {
   fps: FPS.ndf2997,
   width: 1920,

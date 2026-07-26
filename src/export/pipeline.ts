@@ -145,6 +145,10 @@ export async function runExport(
 
       // 每条轨都要问一次，包括空档的：让 reader 在空档处主动释放解码器，
       // 而不是把上一个片段的解码器一直挂着
+      //
+      // 文字片段被 reader 当空档跳过，这里也就一层都不画——预览侧同样跳过，
+      // 两条路径仍然一致。接文字渲染时这个循环要改成按 `visibleVideoClips`
+      // 的图层顺序组装（reader 出素材层、文字层现场生成），两侧必须同时改。
       const layers: ComposeLayer[] = [];
       for (const reader of readers) {
         const sample = await reader.sampleAt(outputFrame);

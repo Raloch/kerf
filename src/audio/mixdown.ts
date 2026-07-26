@@ -74,6 +74,8 @@ export async function mixdown(
   for (const track of timeline.tracks) {
     if (track.kind !== "audio" || track.muted) continue;
     for (const clip of track.clips) {
+      // 文字片段没有声音——落到音频轨上是类型允许但 UI 造不出来的组合
+      if (clip.kind !== "media") continue;
       const visibleIn = Math.max(clip.timelineIn, range.inFrame);
       const visibleOut = Math.min(clip.timelineOut, range.outFrame);
       if (visibleOut <= visibleIn) continue;

@@ -14,6 +14,14 @@ export type SourceId = string;
 export type ClipId = string;
 export type TrackId = string;
 
+/**
+ * 轨道只分两条通道：**画面**和**声音**。
+ *
+ * 刻意**不加** `"text"`——"这一段是素材还是文字"是**片段**的属性（见 `Clip.kind`），
+ * 不是轨道的属性。默认布局里的 T1 轨叫「字幕 / 标题」，那是约定俗成的摆放位置，
+ * 不是类型约束：标题要能压在叠加轨上，Premiere / Resolve 也都是这么分的。
+ * 一旦把文字锁进专用轨，`moveClip` 的"同类轨才能拖"检查就会把这件事直接禁掉。
+ */
 export type TrackKind = "video" | "audio";
 
 /** 导入的素材。M0 直接持有 File；M1 起改为 OPFS 句柄 + 代理文件。 */
@@ -33,22 +41,47 @@ export interface MediaSource {
 }
 
 /**
- * 时间轴上的一个片段。
+ * 所有片段共有的部分：**在时间轴上的占位**。
  *
- * `timelineIn` / `timelineOut` 是它在时间轴上的占位（左闭右开），
- * `sourceIn` 是它引用源片的起始帧。三者都是帧号。
+ * `timelineIn` / `timelineOut` 左闭右开，都是帧号。移动、切分、波纹删除、磁吸
+ * 只关心这几个字段，所以它们对两种片段一视同仁，不需要判别分支。
  */
-export interface Clip {
+interface ClipBase {
   readonly id: ClipId;
-  readonly sourceId: SourceId;
   readonly timelineIn: number;
   readonly timelineOut: number;
-  readonly sourceIn: number;
-  /** 片段标签，缺省时 UI 回退到素材名。冲突提示也用它。 */
+  /** 片段标签，缺省时 UI 回退到素材名 / 文字内容。冲突提示也用它。 */
   readonly name?: string | undefined;
-  /** M2 起承载滤镜/变换/关键帧。M0 恒为空。 */
+  /** M2 起承载滤镜/变换/关键帧。现在恒为空。 */
   readonly effects?: readonly never[];
 }
+
+/** 引用一段导入素材的片段。`sourceIn` 是它引用源片的起始帧。 */
+export interface MediaClip extends ClipBase {
+  readonly kind: "media";
+  readonly sourceId: SourceId;
+  readonly sourceIn: number;
+}
+
+/**
+ * 文字 / 字幕片段。没有源素材，画面由合成层现场生成。
+ *
+ * 只有内容，**没有样式和位置**：字体、字号、颜色、描边随文字渲染那一步一起加，
+ * 位置和缩放属于 `ComposeLayer` 的变换（M2 第 2 步），不该在两处各存一份。
+ */
+export interface TextClip extends ClipBase {
+  readonly kind: "text";
+  readonly text: string;
+}
+
+/**
+ * 时间轴上的一个片段。
+ *
+ * 用**判别联合**而不是"`sourceId` 可选"：可选会把 null 处理散到每一个消费点，
+ * 而且漏掉一处不会报错——只会在导出时静默少一层画面。判别联合让 TS 在
+ * strict + `noUncheckedIndexedAccess` 下强制每个取源片的地方先表态。
+ */
+export type Clip = MediaClip | TextClip;
 
 export interface Track {
   readonly id: TrackId;
@@ -98,7 +131,7 @@ export function clipAt(track: Track, frame: number): Clip | null {
 }
 
 /** 把时间轴帧号换算成源片帧号。 */
-export function toSourceFrame(clip: Clip, timelineFrame: number): number {
+export function toSourceFrame(clip: MediaClip, timelineFrame: number): number {
   return clip.sourceIn + (timelineFrame - clip.timelineIn);
 }
 
@@ -116,8 +149,9 @@ export function singleClipTimeline(
   const outFrame = Math.min(source.durationFrames, range?.outFrame ?? source.durationFrames);
   const length = Math.max(1, outFrame - inFrame);
 
-  const videoClip: Clip = {
+  const videoClip: MediaClip = {
     id: "clip-v1",
+    kind: "media",
     sourceId: source.id,
     timelineIn: 0,
     timelineOut: length,

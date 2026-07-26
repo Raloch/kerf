@@ -16,16 +16,33 @@ import {
   videoTracksInDrawOrder,
   visibleVideoClips,
 } from "./sampling";
-import { toSourceFrame, type Clip, type MediaSource, type Timeline, type Track } from "./types";
+import {
+  toSourceFrame,
+  type MediaClip,
+  type MediaSource,
+  type TextClip,
+  type Timeline,
+  type Track,
+} from "./types";
 import { FPS } from "../time/rational";
 import { frameToMicros } from "../time/timebase";
 
-const clip = (over: Partial<Clip> = {}): Clip => ({
+const clip = (over: Partial<MediaClip> = {}): MediaClip => ({
   id: "c1",
+  kind: "media",
   sourceId: "s1",
   timelineIn: 0,
   timelineOut: 100,
   sourceIn: 0,
+  ...over,
+});
+
+const textClip = (over: Partial<TextClip> = {}): TextClip => ({
+  id: "t1",
+  kind: "text",
+  text: "标题",
+  timelineIn: 0,
+  timelineOut: 100,
   ...over,
 });
 
@@ -169,7 +186,47 @@ describe("visibleVideoClips", () => {
       [{ id: "V1", kind: "video", clips: [clip({ timelineIn: 0, sourceIn: 30 })] }],
       [source()],
     );
-    expect(visibleVideoClips(tl, 30)[0]?.sourceMicros).toBe(2_000_000);
+    const got = visibleVideoClips(tl, 30)[0];
+    expect(got?.kind).toBe("media");
+    expect(got?.kind === "media" && got.sourceMicros).toBe(2_000_000);
+  });
+
+  // 文字层没有源片可查。这几条锁死的是那颗地雷：字幕轨的 kind 是 "video"，
+  // 一放文字进去就会被当视频轨，然后拿 sourceId 去查素材——判别联合之前
+  // 这里会静默丢掉整层，而不是报错
+  it("文字片段作为图层返回，不去查源片", () => {
+    const tl = timeline(
+      [{ id: "T1", kind: "video", clips: [textClip({ id: "title" })] }],
+      [source()],
+    );
+    expect(visibleVideoClips(tl, 10)).toEqual([
+      { kind: "text", trackId: "T1", clip: textClip({ id: "title" }) },
+    ]);
+  });
+
+  it("文字层和素材层按同一个 z 序混排：字幕轨在最上面，最后画", () => {
+    const tl = timeline(
+      [
+        { id: "T1", kind: "video", clips: [textClip({ id: "title", timelineIn: 0, timelineOut: 200 })] },
+        { id: "V2", kind: "video", clips: [clip({ id: "top", timelineIn: 50, timelineOut: 150 })] },
+        { id: "V1", kind: "video", clips: [clip({ id: "base", timelineIn: 0, timelineOut: 200 })] },
+      ],
+      [source()],
+    );
+    const got = visibleVideoClips(tl, 100);
+    expect(got.map((v) => v.clip.id)).toEqual(["base", "top", "title"]);
+    expect(got.map((v) => v.kind)).toEqual(["media", "media", "text"]);
+  });
+
+  it("素材源片缺失时只丢那一层，文字层照旧返回", () => {
+    const tl = timeline(
+      [
+        { id: "T1", kind: "video", clips: [textClip({ id: "title" })] },
+        { id: "V1", kind: "video", clips: [clip({ id: "orphan", sourceId: "missing" })] },
+      ],
+      [source()],
+    );
+    expect(visibleVideoClips(tl, 10).map((v) => v.clip.id)).toEqual(["title"]);
   });
 });
 
@@ -194,5 +251,16 @@ describe("audioClipsAt", () => {
       [source()],
     );
     expect(audioClipsAt(tl, 10).map((v) => v.clip.id)).toEqual(["a1"]);
+  });
+
+  it("跳过落在音频轨上的文字片段——它没有声音可混", () => {
+    const tl = timeline(
+      [
+        { id: "A1", kind: "audio", clips: [textClip({ id: "t" })] },
+        { id: "A2", kind: "audio", clips: [clip({ id: "a2" })] },
+      ],
+      [source()],
+    );
+    expect(audioClipsAt(tl, 10).map((v) => v.clip.id)).toEqual(["a2"]);
   });
 });

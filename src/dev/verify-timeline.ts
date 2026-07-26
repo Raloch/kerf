@@ -112,6 +112,7 @@ export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult>
 
   const clipA: Clip = {
     id: "A",
+    kind: "media",
     sourceId: probe.source.id,
     timelineIn: A_IN,
     timelineOut: A_OUT,
@@ -119,6 +120,7 @@ export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult>
   };
   const clipB: Clip = {
     id: "B",
+    kind: "media",
     sourceId: probe.source.id,
     timelineIn: B_IN,
     timelineOut: B_OUT,

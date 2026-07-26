@@ -165,7 +165,9 @@ describe("切分", () => {
     const v1 = s().timeline().tracks.find((t) => t.id === "V1")!;
     expect(v1.clips).toHaveLength(2);
     expect(v1.clips[0]!.timelineOut).toBe(120);
-    expect(v1.clips[1]!.sourceIn).toBe(120);
+    const right = v1.clips[1]!;
+    expect(right.kind).toBe("media");
+    expect(right.kind === "media" && right.sourceIn).toBe(120);
   });
 
   it("未选中时切播放头下的所有轨道", () => {

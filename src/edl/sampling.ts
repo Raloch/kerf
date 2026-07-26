@@ -21,7 +21,15 @@
  * 源帧率与时间轴帧率相同时，结果与 `toSourceFrame()` 完全一致。
  */
 
-import { clipAt, findSource, type Clip, type MediaSource, type Timeline, type Track } from "./types";
+import {
+  clipAt,
+  findSource,
+  type MediaClip,
+  type MediaSource,
+  type TextClip,
+  type Timeline,
+  type Track,
+} from "./types";
 import { frameDurationMicros, frameToMicros, MICROS_PER_SECOND } from "../time/timebase";
 import type { Rational } from "../time/rational";
 
@@ -31,7 +39,7 @@ import type { Rational } from "../time/rational";
  * @param timelineFrame 时间轴帧号，必须落在 clip 的占位区间内
  */
 export function sourceMicrosAt(
-  clip: Clip,
+  clip: MediaClip,
   timelineFrame: number,
   timelineFps: Rational,
   sourceFps: Rational,
@@ -53,7 +61,7 @@ export function sourceMicrosAt(
  * `FRAME_ALIGN_EPSILON_SECONDS` 判断即可，取中点反而会跳过边界帧。
  */
 export function sourceCenterMicrosAt(
-  clip: Clip,
+  clip: MediaClip,
   timelineFrame: number,
   timelineFps: Rational,
   sourceFps: Rational,
@@ -69,14 +77,31 @@ export function microsToSeconds(micros: number): number {
   return micros / MICROS_PER_SECOND;
 }
 
-/** 某一帧在某条视频轨上要画的东西。 */
-export interface VisibleClip {
+/** 某一帧要画的一层素材画面。 */
+export interface VisibleMediaClip {
+  readonly kind: "media";
   readonly trackId: string;
-  readonly clip: Clip;
+  readonly clip: MediaClip;
   readonly source: MediaSource;
   /** 该帧对应的源片时刻（整数微秒）。 */
   readonly sourceMicros: number;
 }
+
+/** 某一帧要画的一层文字。没有源片，也就没有取帧位置。 */
+export interface VisibleTextClip {
+  readonly kind: "text";
+  readonly trackId: string;
+  readonly clip: TextClip;
+}
+
+/**
+ * 某一帧在某条画面轨上要画的东西。
+ *
+ * `kind` 与 `clip.kind` 同值，冗余是刻意的：调用点写 `if (v.kind === "media")`
+ * 就能同时收窄 `clip` / `source` / `sourceMicros`，靠嵌套的 `v.clip.kind` 收窄不了外层。
+ * 这个字段只在下面两个函数里赋值，不存在第二个真值来源。
+ */
+export type VisibleClip = VisibleMediaClip | VisibleTextClip;
 
 /**
  * 视频轨的**绘制顺序：从底到顶**。
@@ -91,19 +116,28 @@ export function videoTracksInDrawOrder(timeline: Timeline): Track[] {
 }
 
 /**
- * 收集某帧要画的所有视频图层，**按 z 序从底到顶**排列。
+ * 收集某帧要画的所有图层，**按 z 序从底到顶**排列。素材层和文字层混在一起返回。
  *
  * 空档（该轨在该帧没有片段）不产生图层——所有轨都空时合成器画纯黑底，
  * 这正是时间轴空隙应有的样子。
+ *
+ * 文字层**不拆成第二个函数**：叠加轨的素材和字幕轨的文字谁压谁，是同一个 z 序问题，
+ * 拆开就等于让调用方自己再合并一次顺序，而那个反转只允许有一处
+ * （见 `videoTracksInDrawOrder`）。
  */
 export function visibleVideoClips(timeline: Timeline, frame: number): VisibleClip[] {
   const out: VisibleClip[] = [];
   for (const track of videoTracksInDrawOrder(timeline)) {
     const clip = clipAt(track, frame);
     if (!clip) continue;
+    if (clip.kind === "text") {
+      out.push({ kind: "text", trackId: track.id, clip });
+      continue;
+    }
     const source = timeline.sources.find((s) => s.id === clip.sourceId);
     if (!source) continue;
     out.push({
+      kind: "media",
       trackId: track.id,
       clip,
       source,
@@ -113,15 +147,21 @@ export function visibleVideoClips(timeline: Timeline, frame: number): VisibleCli
   return out;
 }
 
-/** 某一帧在某条音频轨上要混的东西。混流用，取值方式与视频轨一致。 */
-export function audioClipsAt(timeline: Timeline, frame: number): VisibleClip[] {
-  const out: VisibleClip[] = [];
+/**
+ * 某一帧在某条音频轨上要混的东西。混流用，取值方式与视频轨一致。
+ *
+ * 文字片段没有声音，落到音频轨上也直接跳过——不变量是"轨道只管画面/声音的通道，
+ * 片段类型由 `clip.kind` 定"，所以这个组合虽然没有 UI 能造出来，类型上仍然合法。
+ */
+export function audioClipsAt(timeline: Timeline, frame: number): VisibleMediaClip[] {
+  const out: VisibleMediaClip[] = [];
   for (const track of timeline.tracks) {
     if (track.kind !== "audio" || track.muted) continue;
     const clip = clipAt(track, frame);
-    if (!clip) continue;
+    if (!clip || clip.kind !== "media") continue;
     const source = findSource(timeline, clip.sourceId);
     out.push({
+      kind: "media",
       trackId: track.id,
       clip,
       source,

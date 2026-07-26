@@ -8,6 +8,10 @@
  * 同一轨道内片段**不允许重叠**。这是时间轴编辑的核心不变量：
  * 一旦允许重叠，compose() 就得决定"同一轨道同一帧取哪个片段"，
  * 而那个决定无论怎么定都会让用户困惑。越界的操作一律被夹紧或拒绝。
+ *
+ * 大部分操作对素材片段和文字片段一视同仁——它们改的是时间轴占位，那是
+ * `ClipBase` 的字段。**只有两处必须分岔**：裁切要看源素材够不够长，
+ * 切分要推进右半段的 `sourceIn`。文字层没有源素材，这两件事都不适用。
  */
 
 import {
@@ -123,7 +127,12 @@ export function moveClip(
   const targetTrack = findTrack(timeline, targetTrackId);
   if (!targetTrack) return reject(timeline, `找不到轨道 ${targetTrackId}`);
   if (targetTrack.kind !== found.track.kind) {
-    return reject(timeline, `不能把${found.track.kind === "video" ? "视频" : "音频"}片段拖到另一种轨道`);
+    // 措辞按**轨道通道**说而不是按片段类型说：文字片段也住在画面轨上，
+    // 说"不能把视频片段拖到另一种轨道"对着一个字幕片段是错的
+    return reject(
+      timeline,
+      found.track.kind === "video" ? "不能把画面片段拖到音频轨" : "不能把音频片段拖到画面轨",
+    );
   }
   if (targetTrack.locked) return reject(timeline, "目标轨道已锁定");
   if (found.track.locked) return reject(timeline, "片段所在轨道已锁定");
@@ -178,6 +187,9 @@ export type TrimEdge = "in" | "out";
  * 另外裁切不能超过源片可用范围：往左拖不能早于源片第 0 帧，
  * 往右拖不能超过源片总长。M0 的经验是这类越界不会报错，只会让导出时
  * 拉不到帧而静默少帧，所以在编辑层就必须夹住。
+ *
+ * **文字片段两头都不受源片限制**：画面是现场生成的，想拉多长有多长。
+ * 它唯一的下限仍是"至少 1 帧"和不撞邻居。
  */
 export function trimClip(
   timeline: Timeline,
@@ -193,22 +205,30 @@ export function trimClip(
   if (found.track.locked) return reject(timeline, "轨道已锁定");
 
   const { clip, track } = found;
-  const source = timeline.sources.find((s) => s.id === clip.sourceId);
-  const sourceLimit = source?.durationFrames ?? Number.MAX_SAFE_INTEGER;
 
   let next: Clip;
   if (edge === "in") {
     const newIn = clip.timelineIn + deltaFrames;
-    const newSourceIn = clip.sourceIn + deltaFrames;
     if (newIn < 0) return reject(timeline, "片段不能延伸到时间轴起点之前");
-    if (newSourceIn < 0) return reject(timeline, "已经到源片开头，没有更多素材");
+    // "源片开头"和"至少 1 帧"互斥，所以先后顺序不影响提示语：前者只可能在
+    // deltaFrames 为负时触发，那时 newIn 一定还小于 timelineOut
     if (newIn >= clip.timelineOut) return reject(timeline, "片段至少要保留 1 帧");
-    next = { ...clip, timelineIn: newIn, sourceIn: newSourceIn };
+    if (clip.kind === "media") {
+      const newSourceIn = clip.sourceIn + deltaFrames;
+      if (newSourceIn < 0) return reject(timeline, "已经到源片开头，没有更多素材");
+      next = { ...clip, timelineIn: newIn, sourceIn: newSourceIn };
+    } else {
+      next = { ...clip, timelineIn: newIn };
+    }
   } else {
     const newOut = clip.timelineOut + deltaFrames;
     if (newOut <= clip.timelineIn) return reject(timeline, "片段至少要保留 1 帧");
-    const usedSourceFrames = clip.sourceIn + (newOut - clip.timelineIn);
-    if (usedSourceFrames > sourceLimit) return reject(timeline, "已经到源片末尾，没有更多素材");
+    if (clip.kind === "media") {
+      const source = timeline.sources.find((s) => s.id === clip.sourceId);
+      const sourceLimit = source?.durationFrames ?? Number.MAX_SAFE_INTEGER;
+      const usedSourceFrames = clip.sourceIn + (newOut - clip.timelineIn);
+      if (usedSourceFrames > sourceLimit) return reject(timeline, "已经到源片末尾，没有更多素材");
+    }
     next = { ...clip, timelineOut: newOut };
   }
 
@@ -247,13 +267,18 @@ export function splitClipAt(timeline: Timeline, clipId: ClipId, frame: number): 
   }
 
   const left: Clip = { ...clip, timelineOut: frame };
-  const right: Clip = {
-    ...clip,
-    id: `${clip.id}-s${++splitSeq}`,
-    timelineIn: frame,
-    // 右半段引用源片的起点要跟着推进，否则右半段会重播左半段的内容
-    sourceIn: clip.sourceIn + (frame - clip.timelineIn),
-  };
+  const rightId = `${clip.id}-s${++splitSeq}`;
+  const right: Clip =
+    clip.kind === "media"
+      ? {
+          ...clip,
+          id: rightId,
+          timelineIn: frame,
+          // 右半段引用源片的起点要跟着推进，否则右半段会重播左半段的内容
+          sourceIn: clip.sourceIn + (frame - clip.timelineIn),
+        }
+      // 文字层没有源片游标，两半段显示同一段文字
+      : { ...clip, id: rightId, timelineIn: frame };
 
   return ok(
     mapTrack(timeline, track.id, (t) =>

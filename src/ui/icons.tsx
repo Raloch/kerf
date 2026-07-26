@@ -126,6 +126,12 @@ export const IconWave = () => (
   </svg>
 );
 
+export const IconText = () => (
+  <svg viewBox="0 0 16 16" aria-hidden="true" {...stroke} strokeWidth={1.4}>
+    <path d="M3.5 4h9M8 4v8.5" />
+  </svg>
+);
+
 export const IconDownload = () => (
   <svg viewBox="0 0 16 16" aria-hidden="true" {...stroke} strokeWidth={1.5}>
     <path d="M8 2.5v8M4.6 7.2L8 10.5l3.4-3.3M2.8 13.2h10.4" />

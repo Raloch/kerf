@@ -22,7 +22,7 @@
  */
 
 import { ALL_FORMATS, BlobSource, Input, VideoSampleSink, type VideoSample } from "mediabunny";
-import type { Clip, RenderRange, Timeline, Track } from "../edl/types";
+import type { MediaClip, RenderRange, Timeline, Track } from "../edl/types";
 import { microsToSeconds, sourceMicrosAt } from "../edl/sampling";
 import { FRAME_ALIGN_EPSILON_SECONDS, frameDurationMicros } from "../time/timebase";
 
@@ -121,7 +121,7 @@ export class VideoTrackReader {
     this.inputs.clear();
   }
 
-  private async openCursor(clip: Clip): Promise<ClipCursor | null> {
+  private async openCursor(clip: MediaClip): Promise<ClipCursor | null> {
     const source = this.timeline.sources.find((s) => s.id === clip.sourceId);
     if (!source) return null;
 
@@ -164,9 +164,15 @@ export class VideoTrackReader {
   }
 }
 
-/** 该轨在该帧的片段。与 `clipAt` 同义，但只在导出路径用，保留独立以便加断言。 */
-function clipCovering(track: Track, frame: number): Clip | null {
+/**
+ * 该轨在该帧的**素材**片段。与 `clipAt` 同义，但只在导出路径用，保留独立以便加断言。
+ *
+ * 文字片段在这里当空档处理：这个类只负责"从源文件顺序解码"，文字层没有源文件。
+ * 它的画面由合成层现场生成，取哪些文字层是 `visibleVideoClips` 的职责。
+ */
+function clipCovering(track: Track, frame: number): MediaClip | null {
   for (const clip of track.clips) {
+    if (clip.kind !== "media") continue;
     if (frame >= clip.timelineIn && frame < clip.timelineOut) return clip;
   }
   return null;

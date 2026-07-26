@@ -16,7 +16,7 @@ import { useTimeline } from "../state/timeline-store";
 import { ghostForTrack, useClipDrag, type ClipDragApi, type Ghost } from "./use-clip-drag";
 import { buildStrip, cachedStrip, drawStrip } from "../media/thumbnails";
 import { proxyManager } from "../media/proxy-client";
-import { IconCut, IconEye, IconFilm, IconLock, IconMagnet, IconMute, IconPlus, IconTrash, IconVolume, IconWave } from "./icons";
+import { IconCut, IconEye, IconFilm, IconLock, IconMagnet, IconMute, IconPlus, IconText, IconTrash, IconVolume, IconWave } from "./icons";
 
 /** 片段内缩略图条高度，与 .strip 的 CSS 保持一致。 */
 const STRIP_HEIGHT = 32;
@@ -299,7 +299,7 @@ function TrackRow({
             selected={clip.id === selectedClipId}
             onSelect={onSelect}
             drag={drag}
-            proxyUrl={proxyUrls[clip.sourceId]}
+            proxyUrl={clip.kind === "media" ? proxyUrls[clip.sourceId] : undefined}
           />
         ))}
         {ghost && <GhostView ghost={ghost} pxPerFrame={pxPerFrame} />}
@@ -345,13 +345,16 @@ function ClipView({
   drag: ClipDragApi;
   proxyUrl: string | undefined;
 }) {
-  const source = timeline.sources.find((s) => s.id === clip.sourceId);
-  const label = clip.name ?? source?.name ?? clip.id;
+  // 片段颜色和标签跟着**片段**类型走，不跟轨道类型：文字片段可以放在任意画面轨上
+  const isText = clip.kind === "text";
+  const source = clip.kind === "media" ? timeline.sources.find((s) => s.id === clip.sourceId) : undefined;
+  const sourceInFrame = clip.kind === "media" ? clip.sourceIn : 0;
+  const label = clip.name ?? (clip.kind === "text" ? clip.text : source?.name) ?? clip.id;
   const length = clipDuration(clip);
   const widthPx = length * pxPerFrame;
   const stripRef = useRef<HTMLCanvasElement>(null);
 
-  // 缩略图只画视频片段，且只在代理就绪后——从原片抽帧比转一遍代理还慢
+  // 缩略图只画素材片段，且只在代理就绪后——从原片抽帧比转一遍代理还慢
   useEffect(() => {
     if (kind !== "video" || !source) return;
     const canvas = stripRef.current;
@@ -371,7 +374,7 @@ function ClipView({
       drawStrip(ctx, strip, {
         widthPx,
         heightPx: h,
-        sourceInFrame: clip.sourceIn,
+        sourceInFrame,
         lengthFrames: length,
       });
     };
@@ -395,7 +398,7 @@ function ClipView({
     return () => {
       cancelled = true;
     };
-  }, [clip.sourceIn, kind, length, proxyUrl, pxPerFrame, source, widthPx]);
+  }, [sourceInFrame, kind, length, proxyUrl, pxPerFrame, source, widthPx]);
 
   return (
     <div
@@ -407,8 +410,16 @@ function ClipView({
       style={{
         left: `${clip.timelineIn * pxPerFrame}px`,
         width: `${widthPx}px`,
-        ["--fill" as string]: kind === "video" ? "var(--c-video)" : "var(--c-audio)",
-        ["--band" as string]: kind === "video" ? "var(--c-video-hi)" : "var(--c-audio-hi)",
+        ["--fill" as string]: isText
+          ? "var(--c-text)"
+          : kind === "video"
+            ? "var(--c-video)"
+            : "var(--c-audio)",
+        ["--band" as string]: isText
+          ? "var(--c-text-hi)"
+          : kind === "video"
+            ? "var(--c-video-hi)"
+            : "var(--c-audio-hi)",
       }}
       onPointerDown={(e) => drag.onClipPointerDown(e, clip, trackId)}
       onKeyDown={(e) => {
@@ -418,9 +429,9 @@ function ClipView({
         }
       }}
     >
-      {kind === "video" && <canvas className="strip" ref={stripRef} />}
+      {kind === "video" && !isText && <canvas className="strip" ref={stripRef} />}
       <span className="lbl">
-        {kind === "video" ? <IconFilm /> : <IconWave />}
+        {isText ? <IconText /> : kind === "video" ? <IconFilm /> : <IconWave />}
         {label}
       </span>
       {/* 片段太窄时藏掉帧数，否则会溢出成一团 */}
@@ -429,7 +440,7 @@ function ClipView({
       {/* 裁切手柄。窄片段也要留出可抓区域，否则短片段无法裁切 */}
       <span
         className="grip l"
-        title="裁切入点（拖动同时改变引用源片的起点）"
+        title={isText ? "裁切入点" : "裁切入点（拖动同时改变引用源片的起点）"}
         onPointerDown={(e) => drag.onHandlePointerDown(e, clip, trackId, "in")}
       />
       <span

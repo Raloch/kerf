@@ -5,13 +5,13 @@
 完整方案：[docs/PLAN.md](docs/PLAN.md)（选型理由、架构、兼容矩阵、决策记录、里程碑）
 界面设计稿：[design/kerf-editor-mockup.html](design/kerf-editor-mockup.html)（已定稿，四种状态）
 
-当前阶段：**M1.5 导出闭环已完成**（编辑器骨架 + EDL 驱动的导出：多片段/多轨取帧、空档黑帧、多轨混音、流式写盘、导出面板），**M1.6 PixiJS 后端 spike 已完成**（结论见 PLAN.md §7 M1.6 与 §6 的 D5）。
+当前阶段：**M2 前半段第 1 步已完成**——`Clip` 改成判别联合 `{kind:"media"} | {kind:"text"}`（决策见 PLAN.md 的 **D8**）。之前：M1.5 导出闭环、M1.6 PixiJS 后端 spike（见 PLAN.md §7 M1.6 与 §6 的 D5）。
 
-下一步 M2 创作能力，按 D5 分两段：先在 Canvas2D 上做文字层 / 关键帧 / 基础转场，滤镜和 shader 转场之前再换 Pixi 后端。**换后端之前先把 `ComposeLayer` 扩成渲染后端无关的描述**（加文字层和变换），扩完再换实现——否则接口和后端一起动，自检报错时没有基准可比。
+下一步是前半段第 2 步：**把 `ComposeLayer` 扩成渲染后端无关的描述**（加变换：位置/缩放/旋转/不透明度，`containRect()` 降级成默认变换），仍在 Canvas2D 上。扩完接口再换 Pixi 实现——否则接口和后端一起动，自检报错时没有基准可比。第 3 步是关键帧求值。文字**渲染**（字体/断行/描边）排在变换之后，模型已经就绪。
 
 ```bash
 pnpm dev          # 起开发服务器
-pnpm test         # 跑单元测试（119 项：时间基 25 / 状态层 65 / 取样映射 15 / 预设 14）
+pnpm test         # 跑单元测试（130 项：时间基 25 / 状态层 72 / 取样映射 19 / 预设 14）
 pnpm typecheck    # 类型检查，严格模式
 pnpm build        # 构建
 ```
@@ -21,6 +21,7 @@ pnpm build        # 构建
 - **改 Timeline 只能走 `useTimeline` 的 action**，它们内部统一经 `apply()` 进撤销栈。绕过去直接 `set({ history })` 会产生撤销不了的编辑，是最难查的一类 bug。
 - **编辑逻辑写在 `src/state/operations.ts` 的纯函数里**，不要写进组件或 store。那里能脱离浏览器单测，而移动/裁切/切分的边界条件多到必须靠测试锁死。
 - **同一轨道内片段永不重叠**，这是核心不变量。越界操作返回 `changed:false` + `reason`，不要静默失败。
+- **`Clip` 是判别联合，不要给它加可选字段来"兼容两种片段"**。`sourceId` / `sourceIn` 只在 `kind:"media"` 上；`TrackKind` 只有 `video | audio`，"这一段是素材还是文字"看 `clip.kind`，不看轨道（字幕轨 T1 的 `kind` 就是 `"video"`，这是对的）。编辑操作里**只有裁切和切分**需要分岔（源片够不够长、右半段要不要推进 `sourceIn`），其余都只动时间轴占位。理由和放弃过的方案见 PLAN.md 的 **D8**。
 - **播放头和选中不进撤销栈**；但撤销后要清掉指向已不存在片段的选中。
 - 连续拖拽必须传带对象标识的合并键（`move:${clipId}`），否则用户要按几十次 ⌘Z。
 
@@ -35,6 +36,7 @@ pnpm build        # 构建
 ## 导出层约定（M1.5 起）
 
 - **预览和导出的取帧决策只能来自 `src/edl/sampling.ts`**。共用 `compose()` 只保证"画法一致"；"该画哪个片段、按什么顺序、读源片哪一刻"如果各写一套，画面照样不一致。三个函数是唯一入口：`sourceMicrosAt`（帧 → 源片时刻）、`videoTracksInDrawOrder`（z 序反转只有一处）、`visibleVideoClips`（某帧的图层）。
+- **取帧三函数只接 `MediaClip`**（`sourceMicrosAt` / `sourceCenterMicrosAt` / `toSourceFrame`），文字片段编译期就传不进去。`visibleVideoClips` 返回的是**素材层和文字层混排的联合**（`VisibleClip`），不拆成两个函数——谁压谁是同一个 z 序问题，拆开等于让调用方再合并一次顺序。
 - **不要用 `toSourceFrame()` 做取帧位置**。它算的是帧号加减，隐含"源片帧率 = 时间轴帧率"。25fps 素材放到 30fps 时间轴上会慢 20% 且不报错。用 `sourceMicrosAt`。
 - **`VideoTrackReader` 返回的 `VideoSample` 归 reader 所有，调用方不要 `close()`**。时间轴帧率高于源片帧率时同一个 sample 会被多个输出帧复用。
 - **取帧只能向前**。倒着问会抛错——顺序解码是硬规则 3 的前提。

@@ -151,6 +151,14 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
   const selected = selectedClipId ? findClip(timeline, selectedClipId) : undefined;
   const hasContent = timeline.durationFrames > 0;
 
+  // 先落到 const 局部变量再判别：`selected.clip.kind` 这种属性路径的收窄
+  // 进不到 `find()` 的回调里（TS 只对 const 变量保留收窄），在 JSX 里直接写会编译不过
+  const selectedClip = selected?.clip;
+  const selectedSourceName =
+    selectedClip?.kind === "media"
+      ? timeline.sources.find((s) => s.id === selectedClip.sourceId)?.name
+      : undefined;
+
   return (
     <div className="ed">
       {/* ---------- 顶栏 ---------- */}
@@ -269,17 +277,26 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
                     className="swatch"
                     style={{
                       background:
-                        selected.track.kind === "video" ? "var(--c-video-hi)" : "var(--c-audio-hi)",
+                        selected.clip.kind === "text"
+                          ? "var(--c-text-hi)"
+                          : selected.track.kind === "video"
+                            ? "var(--c-video-hi)"
+                            : "var(--c-audio-hi)",
                     }}
                   />
                   <div style={{ minWidth: 0 }}>
                     <div className="n">
                       {selected.clip.name ??
-                        timeline.sources.find((s) => s.id === selected.clip.sourceId)?.name ??
+                        (selected.clip.kind === "text" ? selected.clip.text : selectedSourceName) ??
                         selected.clip.id}
                     </div>
                     <div className="s">
-                      {selected.track.kind === "video" ? "视频" : "音频"} · {selected.track.id}
+                      {selected.clip.kind === "text"
+                        ? "文字"
+                        : selected.track.kind === "video"
+                          ? "视频"
+                          : "音频"}{" "}
+                      · {selected.track.id}
                     </div>
                   </div>
                 </div>
@@ -305,19 +322,33 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
                     </span>
                   </div>
                 </div>
-                <div className="grp-title">源片引用</div>
-                <div className="fields">
-                  <div className="f">
-                    <label>源起始帧</label>
-                    <span className="val">{selected.clip.sourceIn}</span>
-                  </div>
-                  <div className="f">
-                    <label>源时间码</label>
-                    <span className="val">
-                      {framesToTimecode(selected.clip.sourceIn, timeline.fps)}
-                    </span>
-                  </div>
-                </div>
+                {selected.clip.kind === "text" ? (
+                  <>
+                    <div className="grp-title">文字内容</div>
+                    <div className="fields">
+                      <div className="f">
+                        <label>文本</label>
+                        <span className="val">{selected.clip.text}</span>
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="grp-title">源片引用</div>
+                    <div className="fields">
+                      <div className="f">
+                        <label>源起始帧</label>
+                        <span className="val">{selected.clip.sourceIn}</span>
+                      </div>
+                      <div className="f">
+                        <label>源时间码</label>
+                        <span className="val">
+                          {framesToTimecode(selected.clip.sourceIn, timeline.fps)}
+                        </span>
+                      </div>
+                    </div>
+                  </>
+                )}
                 <p className="empty">变换、速度、滤镜、音量包络在 M2 接入。</p>
               </>
             )}

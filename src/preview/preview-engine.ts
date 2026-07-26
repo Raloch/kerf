@@ -142,6 +142,10 @@ export function createPreviewEngine(
    *
    * seek 目标用 `sourceCenterMicrosAt`（帧中点）：seek 到帧的左边界时浏览器常常
    * 返回前一帧，于是时间码显示 30 而画面是 frame 29。
+   *
+   * 文字图层现在还画不出来（`ComposeLayer` 只有 sample / image 两种形态），
+   * 所以这里显式跳过。导出路径同样一层都不画，两条路径仍然一致（硬规则 2）——
+   * 接文字渲染时这个分支和导出侧的图层组装要一起改，缺一半就是"预览有导出没有"。
    */
   function layersFor(
     timeline: Timeline,
@@ -151,6 +155,7 @@ export function createPreviewEngine(
     const active: { source: MediaSource; seekSeconds: number }[] = [];
 
     for (const visible of visibleVideoClips(timeline, frame)) {
+      if (visible.kind === "text") continue;
       const { source, clip } = visible;
       const handle = handleFor(source);
       active.push({
