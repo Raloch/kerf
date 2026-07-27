@@ -16,11 +16,16 @@
 
 import {
   ANIMATABLE_PROPERTIES,
+  COLOR_PROPERTIES,
+  TRANSFORM_PROPERTIES,
   type AnimatableProperty,
+  type ColorProperty,
   type Easing,
   type Keyframe,
   type KeyframeChannels,
+  type TransformProperty,
 } from "../anim/keyframes";
+import type { ColorAdjust } from "../compose/color";
 import type { LayerTransform } from "../compose/compositor";
 import type { TextStyle } from "../compose/text-raster";
 import {
@@ -404,7 +409,7 @@ export function rippleDeleteClip(timeline: Timeline, clipId: ClipId): EditResult
 }
 
 // ---------------------------------------------------------------------------
-// 变换 / 关键帧 / 文字
+// 变换 / 调色 / 关键帧 / 文字
 // ---------------------------------------------------------------------------
 
 /** 检查器里的属性名。与错误提示共用一套字面量，避免同一个属性有两种叫法。 */
@@ -415,25 +420,30 @@ export const PROPERTY_LABELS: Record<AnimatableProperty, string> = {
   scaleY: "缩放 Y",
   rotation: "旋转",
   opacity: "不透明度",
+  brightness: "亮度",
+  contrast: "对比度",
+  saturation: "饱和度",
+  hue: "色相",
 };
 
 export interface PropertyRange {
-  /** 缺省值。等于它的属性会被归一化掉——见 `normalizeTransform`。 */
+  /** 缺省值。等于它的属性会被归一化掉——见 `normalizeGroup`。 */
   readonly fallback: number;
   readonly min: number;
   readonly max: number;
 }
 
 /**
- * 每个属性的缺省值与取值范围。
+ * 每个属性的缺省值与取值范围。**摆位和调色共用这一张表。**
  *
  * 和 `PROPERTY_LABELS` 一样按 `Record<AnimatableProperty, …>` 声明：将来往
  * `ANIMATABLE_PROPERTIES` 里加一个属性，这两处会**编译不过**，而不是静默漏配。
+ * （加调色四项时它确实当场报了这两处，这是这个声明方式唯一的用处。）
  *
  * 检查器的输入框也从这里取上下限和缺省值——夹紧规则写两份，就会出现
  * "界面拦不住但纯函数拦得住"的诡异反馈（滑块能拖到底，松手却弹回来）。
  */
-export const TRANSFORM_RANGES: Record<AnimatableProperty, PropertyRange> = {
+export const PROPERTY_RANGES: Record<AnimatableProperty, PropertyRange> = {
   // 位移单位是输出画布像素，允许移出画面外（飞入飞出要用），只挡住离谱的值
   x: { fallback: 0, min: -100_000, max: 100_000 },
   y: { fallback: 0, min: -100_000, max: 100_000 },
@@ -445,64 +455,112 @@ export const TRANSFORM_RANGES: Record<AnimatableProperty, PropertyRange> = {
   // 弧度（合成层的单位，见 D9）。±100 圈足够任何"转起来"，也挡住手滑输入
   rotation: { fallback: 0, min: -200 * Math.PI, max: 200 * Math.PI },
   opacity: { fallback: 1, min: 0, max: 1 },
+
+  // 调色三项都是**倍数、1 = 不变**（对齐 CSS filter，见 compose/color.ts）。
+  // 上限取 4：再往上画面已经全部溢出到纯色，滑块的后半段等于没用
+  brightness: { fallback: 1, min: 0, max: 4 },
+  contrast: { fallback: 1, min: 0, max: 4 },
+  saturation: { fallback: 1, min: 0, max: 4 },
+  // 色相是**弧度**（合成层单位，度数换算在 UI 层）。±1 圈就够——色相是循环量，
+  // 转 3 圈和转 1 圈画面完全相同，放宽只会让关键帧插值走冤枉路
+  hue: { fallback: 0, min: -2 * Math.PI, max: 2 * Math.PI },
 };
 
 /** 变换补丁：给数值就设，显式给 `undefined` 就**删掉**这个属性（回到缺省）。 */
 export type TransformPatch = {
-  readonly [K in AnimatableProperty]?: number | undefined;
+  readonly [K in TransformProperty]?: number | undefined;
+};
+
+/** 调色补丁。语义同 `TransformPatch`。 */
+export type ColorPatch = {
+  readonly [K in ColorProperty]?: number | undefined;
 };
 
 function clampProperty(property: AnimatableProperty, value: number): number {
-  const range = TRANSFORM_RANGES[property];
+  const range = PROPERTY_RANGES[property];
   return Math.min(range.max, Math.max(range.min, value));
 }
 
 /**
- * 丢掉所有等于缺省值的属性；全都是缺省则返回 `undefined`（= 没有变换）。
+ * 丢掉所有等于缺省值的属性；全都是缺省则返回 `undefined`（= 这项能力没被用过）。
  *
- * 这样"调上去又调回来"的片段会回到**真的没有 transform 字段**的状态，
- * 而不是留一个 `{ x: 0 }`。合成器的恒等判定看的是值不是字段，所以这不是
- * 正确性问题；但它让"这个片段动过变换没有"在数据层一眼可判，
- * UI 的重置按钮和 D9 那条"没用变换的输出逐像素不变"也就有了同一个依据。
+ * 这样"调上去又调回来"的片段会回到**真的没有那个字段**的状态，
+ * 而不是留一个 `{ x: 0 }` / `{ brightness: 1 }`。合成器的恒等判定看的是值不是字段，
+ * 所以这不是正确性问题；但它让"这个片段动过变换/调过色没有"在数据层一眼可判，
+ * UI 的重置按钮和"没用这项能力的输出逐像素不变"也就有了同一个依据。
+ *
+ * 摆位和调色共用这一段：两组的归一化规则一模一样，各写一遍必然在
+ * "什么时候该整个删掉字段"上分叉，而那正是上面这条可判性的唯一支点。
  */
-function normalizeTransform(
-  transform: { readonly [K in AnimatableProperty]?: number },
-): LayerTransform | undefined {
-  const next: { -readonly [K in AnimatableProperty]?: number } = {};
+function normalizeGroup<K extends AnimatableProperty, T>(
+  properties: readonly K[],
+  values: { readonly [P in K]?: number },
+): T | undefined {
+  const next: Record<string, number> = {};
   let any = false;
-  for (const property of ANIMATABLE_PROPERTIES) {
-    const value = transform[property];
-    if (value === undefined || value === TRANSFORM_RANGES[property].fallback) continue;
+  for (const property of properties) {
+    const value = values[property];
+    if (value === undefined || value === PROPERTY_RANGES[property].fallback) continue;
     next[property] = value;
     any = true;
   }
-  return any ? next : undefined;
+  return any ? (next as T) : undefined;
 }
 
-function sameTransform(a: LayerTransform | undefined, b: LayerTransform | undefined): boolean {
+function sameGroup<K extends AnimatableProperty>(
+  properties: readonly K[],
+  a: { readonly [P in K]?: number } | undefined,
+  b: { readonly [P in K]?: number } | undefined,
+): boolean {
   if (a === b) return true;
   if (!a || !b) return false;
-  return ANIMATABLE_PROPERTIES.every((property) => a[property] === b[property]);
+  return properties.every((property) => a[property] === b[property]);
 }
 
-/** 校验 + 夹紧 + 归一化。返回错误文案或合并后的变换。 */
-function applyTransformPatch(
-  base: LayerTransform | undefined,
-  patch: TransformPatch,
-): { readonly ok: true; readonly transform: LayerTransform | undefined } | { readonly ok: false; readonly reason: string } {
-  const merged: { -readonly [K in AnimatableProperty]?: number } = { ...base };
-  for (const property of ANIMATABLE_PROPERTIES) {
+type PatchResult<T> =
+  | { readonly ok: true; readonly value: T | undefined }
+  | { readonly ok: false; readonly reason: string };
+
+/** 校验 + 夹紧 + 归一化。返回错误文案或合并后的那一组值。 */
+function applyGroupPatch<K extends AnimatableProperty, T>(
+  properties: readonly K[],
+  base: { readonly [P in K]?: number } | undefined,
+  patch: { readonly [P in K]?: number | undefined },
+): PatchResult<T> {
+  const merged: Record<string, number> = { ...base };
+  for (const property of properties) {
     if (!(property in patch)) continue;
     const raw = patch[property];
     if (raw === undefined) {
       delete merged[property];
       continue;
     }
-    // NaN 会一路传到 drawImage，画面整层消失且不报错——必须在入口挡掉
+    // NaN 会一路传到 drawImage / 色彩矩阵，画面整层消失或整层变黑，且不报错
     if (!Number.isFinite(raw)) return { ok: false, reason: `${PROPERTY_LABELS[property]}必须是有限数` };
     merged[property] = clampProperty(property, raw);
   }
-  return { ok: true, transform: normalizeTransform(merged) };
+  return { ok: true, value: normalizeGroup<K, T>(properties, merged as { [P in K]?: number }) };
+}
+
+const applyTransformPatch = (
+  base: LayerTransform | undefined,
+  patch: TransformPatch,
+): PatchResult<LayerTransform> => applyGroupPatch(TRANSFORM_PROPERTIES, base, patch);
+
+const applyColorPatch = (
+  base: ColorAdjust | undefined,
+  patch: ColorPatch,
+): PatchResult<ColorAdjust> => applyGroupPatch(COLOR_PROPERTIES, base, patch);
+
+/**
+ * 这个属性作用到调色还是摆位。
+ *
+ * 判据是 `COLOR_PROPERTIES` 这份名单本身，不是"名字里有没有 color"之类的约定——
+ * 名单是求值时的同一份（`resolveColor` 也用它），所以加一个调色属性只需要改
+ * 一处，不会出现"求值当它是颜色、编辑当它是摆位"。
+ */
+export function isColorProperty(property: AnimatableProperty): property is ColorProperty {
+  return (COLOR_PROPERTIES as readonly AnimatableProperty[]).includes(property);
 }
 
 /**
@@ -522,11 +580,31 @@ export function setClipTransform(
 
   const result = applyTransformPatch(found.clip.transform, patch);
   if (!result.ok) return reject(timeline, result.reason);
-  if (sameTransform(result.transform, found.clip.transform)) return unchanged(timeline);
+  if (sameGroup(TRANSFORM_PROPERTIES, result.value, found.clip.transform)) {
+    return unchanged(timeline);
+  }
 
   return ok(
-    replaceClip(timeline, found.track.id, setOptional(found.clip, "transform", result.transform)),
+    replaceClip(timeline, found.track.id, setOptional(found.clip, "transform", result.value)),
   );
+}
+
+/**
+ * 改片段的**静态**调色。与 `setClipTransform` 完全同构，见其注释。
+ *
+ * 文字片段也能调色——栅格化出来的文字层在合成器眼里就是一张普通图片，
+ * 给它加饱和度/色相和给视频加是同一条路径。刻意不在这里禁掉。
+ */
+export function setClipColor(timeline: Timeline, clipId: ClipId, patch: ColorPatch): EditResult {
+  const found = findClip(timeline, clipId);
+  if (!found) return reject(timeline, `找不到片段 ${clipId}`);
+  if (found.track.locked) return reject(timeline, "轨道已锁定");
+
+  const result = applyColorPatch(found.clip.color, patch);
+  if (!result.ok) return reject(timeline, result.reason);
+  if (sameGroup(COLOR_PROPERTIES, result.value, found.clip.color)) return unchanged(timeline);
+
+  return ok(replaceClip(timeline, found.track.id, setOptional(found.clip, "color", result.value)));
 }
 
 /** 把某个属性的关键帧序列换成新的；空序列会连通道一起删掉。 */
@@ -622,9 +700,18 @@ export function clearKeyframes(
 
   let next = withChannel(found.clip, property, []);
   if (bakeValue !== undefined) {
-    const baked = applyTransformPatch(next.transform, { [property]: bakeValue });
-    if (!baked.ok) return reject(timeline, baked.reason);
-    next = setOptional(next, "transform", baked.transform);
+    // 烘到哪一组由属性自己决定。写死成 transform 的话，关掉「亮度」的动画会把
+    // `brightness` 塞进 LayerTransform——合成器不认识那个字段，也不会报错，
+    // 表现是"关掉动画之后调色整个丢了"
+    if (isColorProperty(property)) {
+      const baked = applyColorPatch(next.color, { [property]: bakeValue });
+      if (!baked.ok) return reject(timeline, baked.reason);
+      next = setOptional(next, "color", baked.value);
+    } else {
+      const baked = applyTransformPatch(next.transform, { [property]: bakeValue });
+      if (!baked.ok) return reject(timeline, baked.reason);
+      next = setOptional(next, "transform", baked.value);
+    }
   }
   return ok(replaceClip(timeline, found.track.id, next));
 }

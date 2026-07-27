@@ -17,6 +17,10 @@
  * 严格：几何来自变换求值，与 seek 精不精确无关，所以四条边必须逐帧完全相等，
  * 而且还要跟手算的位置对得上。另外专门断言"摆位逐帧在变"——变换要是被整条丢掉，
  * 两条路径同样是"一致"的，只比一致性抓不到这种错。
+ *
+ * 第三段（M2 后半段）验**一级调色**，套路完全一样：一致 + 真的生效 + 落在
+ * 参照实现算出来的数上 + 没顺手挪动几何。"调色只在一个后端生效"和"调色被整层
+ * 丢掉"是这一块最可能的两种静默失效，前者靠一致性抓、后者靠"画面必须变灰"抓。
  */
 
 import { ALL_FORMATS, BlobSource, Input, VideoSampleSink } from "mediabunny";
@@ -25,6 +29,7 @@ import { probeFile } from "../media/probe";
 import { runExport } from "../export/pipeline";
 import { readExportFile, removeExportFile } from "../export/write-target";
 import { createPreviewEngine } from "../preview/preview-engine";
+import { applyColorMatrix8, colorMatrixOf } from "../compose/color";
 import { singleClipTimeline, type Timeline } from "../edl/types";
 import { frameDurationMicros, frameToMicros, MICROS_PER_SECOND } from "../time/timebase";
 import { measure, type Bands, type MeasureRegion } from "./measure";
@@ -36,6 +41,18 @@ const VERIFY_OUT = "kerf-verify-preview.mp4";
 const VERIFY_XFORM_OUT = "kerf-verify-preview-xform.mp4";
 /** 文字层比对的落盘文件名。 */
 const VERIFY_TEXT_OUT = "kerf-verify-preview-text.mp4";
+/** 调色比对的落盘文件名。 */
+const VERIFY_COLOR_OUT = "kerf-verify-preview-color.mp4";
+
+/**
+ * 比对用的调色：**只把饱和度打到 0**。
+ *
+ * 挑这一项是因为它有个不需要参照图就能判的后果——画面必须变灰（`chroma` 归零），
+ * 于是"调色被整层丢掉"这种最要命的失效有个独立的判据。同时灰度值本身是
+ * 亮度加权的确定数，能拿 `colorMatrixOf` 在 CPU 上算出来当真值比对。
+ * 换成亮度或对比度就没有这个便利：调完仍然是彩色的，只能靠"和原来不一样"。
+ */
+const GRADE = { saturation: 0 } as const;
 
 /** 方形输出：让 16:9 素材必然产生上下黑边，从而能比较留边几何。 */
 const OUT_SIZE = 320;
@@ -288,6 +305,97 @@ export async function verifyPreviewMatchesExport(): Promise<PreviewVerifyResult>
       maxDelta <= 24,
     ),
   );
+
+  // ---- M2 后半段：一级调色在两条路径上是否一致，以及**是否真的生效** ----
+  // 复用上面那份 EDL 和同一个取样帧，只加一层调色，于是 `previewBands` /
+  // `exportedBands` 就是现成的"不调色"对照——省一次导出，而且两组数据的
+  // 唯一差异确实只有调色这一件事
+  const graded: Timeline = {
+    ...timeline,
+    tracks: timeline.tracks.map((track) =>
+      track.kind !== "video"
+        ? track
+        : { ...track, clips: track.clips.map((clip) => ({ ...clip, color: GRADE })) },
+    ),
+  };
+
+  const engineC = await createPreviewEngine(document.createElement("div"), OUT_SIZE, OUT_SIZE);
+  let gradedPreview: Bands;
+  try {
+    await engineC.renderFrame(graded, PROBE_FRAME);
+    gradedPreview = measureCanvas(engineC.canvas as CanvasImageSource, OUT_SIZE);
+  } finally {
+    engineC.dispose();
+  }
+
+  const gradedExport = (
+    await exportAndMeasure(
+      { ...graded, durationFrames: PROBE_FRAME + 1 },
+      [PROBE_FRAME],
+      VERIFY_COLOR_OUT,
+    )
+  )[0]![0]!;
+
+  // 1. 两条路径的调色结果一致。这是硬规则 2 在颜色维度上的落点——
+  //    调色只在一个后端上生效、或者两边矩阵算得不一样，都在这里现形
+  const gradeDelta = Math.max(
+    Math.abs(gradedPreview.meanR - gradedExport.meanR),
+    Math.abs(gradedPreview.meanG - gradedExport.meanG),
+    Math.abs(gradedPreview.meanB - gradedExport.meanB),
+  );
+  checks.push(
+    check(
+      "调色后预览与导出的颜色一致（容差 24，容许 seek 落在相邻帧）",
+      "≤ 24",
+      String(gradeDelta),
+      gradeDelta <= 24,
+    ),
+  );
+
+  // 2. 调色**真的生效了**。少了这条，"调色被整层丢掉"时上一条照样通过——
+  //    两条路径会一致地都不调色。和摆位那边第 3 条是同一类护栏
+  checks.push(
+    check(
+      "调色确实生效（饱和度归零后画面变灰）",
+      `原始彩度 ${previewBands.chroma} → 应 ≤ 4`,
+      `预览 ${gradedPreview.chroma} · 导出 ${gradedExport.chroma}`,
+      previewBands.chroma > 20 && gradedPreview.chroma <= 4 && gradedExport.chroma <= 4,
+    ),
+  );
+
+  // 3. 灰度值落在**参照实现算出来的**那个数上。只判"变灰了"的话，权重抄错
+  //    （或者 shader 在预乘 alpha 上算）仍然会变灰，只是灰得不对
+  const [expectR] = applyColorMatrix8(colorMatrixOf(GRADE), [
+    previewBands.meanR,
+    previewBands.meanG,
+    previewBands.meanB,
+    255,
+  ]);
+  const lumaDelta = Math.abs(gradedExport.meanR - expectR);
+  checks.push(
+    check(
+      "灰度值等于 colorMatrixOf() 在 CPU 上算出来的值（容差 8）",
+      `${expectR}`,
+      `${gradedExport.meanR}（差 ${lumaDelta}）`,
+      lumaDelta <= 8,
+    ),
+  );
+
+  // 4. 挂滤镜没有把图层挪位置。Pixi 给 sprite 挂 filter 会先渲进一张临时纹理
+  //    再合成，摆位算错就会整体偏几个像素——而画面本身是对的，只看颜色抓不到
+  const gradeEdgeDelta = worstEdgeDelta(gradedExport, exportedBands);
+  checks.push(
+    check(
+      "调色不改变几何（黑边与不调色时完全相同）",
+      "0px",
+      gradeEdgeDelta === 0
+        ? `完全相同（${edgesText(gradedExport)}）`
+        : `差 ${gradeEdgeDelta}px · 调色 ${edgesText(gradedExport)} / 原始 ${edgesText(exportedBands)}`,
+      gradeEdgeDelta === 0,
+    ),
+  );
+
+  await removeExportFile(VERIFY_COLOR_OUT);
 
   // ---- M2：图层变换 + 关键帧在两条路径上是否一致 ----
   // 单独造一份带动画的 EDL，不动上面那份：上面几条断言的期望值依赖"没有变换"，

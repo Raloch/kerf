@@ -190,10 +190,14 @@ export async function runExport(
         if (sample) samples.set(trackId, sample);
       }
 
-      // 第二步：按图层顺序装配。顺序和每层的变换都来自 sampling.ts，
+      // 第二步：按图层顺序装配。顺序、每层的变换和调色都来自 sampling.ts，
       // 导出侧一个都不自己算——预览侧拿的是同一个函数的同一份结果（硬规则 2）
       const layers: ComposeLayer[] = [];
       for (const visible of visibleVideoClips(timeline, outputFrame)) {
+        const looks = {
+          ...(visible.transform ? { transform: visible.transform } : {}),
+          ...(visible.color ? { color: visible.color } : {}),
+        };
         if (visible.kind === "text") {
           // 与预览侧调的是同一个 rasterizeText、同一份缓存，所以字形一致是
           // 结构性的而不是靠对齐（硬规则 2）。缓存命中时这里不做任何排版工作
@@ -209,18 +213,14 @@ export async function runExport(
               image: raster.canvas,
               width: raster.width,
               height: raster.height,
-              ...(visible.transform ? { transform: visible.transform } : {}),
+              ...looks,
             });
           }
           continue;
         }
         const sample = samples.get(visible.trackId);
         if (!sample) continue;
-        layers.push({
-          kind: "sample",
-          sample,
-          ...(visible.transform ? { transform: visible.transform } : {}),
-        });
+        layers.push({ kind: "sample", sample, ...looks });
       }
 
       // layers 为空 → 合成器画纯黑，这正是时间轴空隙该有的样子。

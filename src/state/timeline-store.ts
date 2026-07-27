@@ -35,6 +35,7 @@ import {
   removeClip,
   removeKeyframe,
   rippleDeleteClip,
+  setClipColor,
   setClipTransform,
   setKeyframe,
   setTextContent,
@@ -44,6 +45,7 @@ import {
   splitClipAt,
   trimClip,
   type AddTextOptions,
+  type ColorPatch,
   type EditResult,
   type MoveOptions,
   type TextStylePatch,
@@ -103,6 +105,8 @@ export interface TimelineState {
   removeSelected: (ripple?: boolean) => void;
   /** 改静态变换。连续拖滑块按"片段 + 改的是哪几个属性"合并成一步撤销。 */
   setClipTransform: (clipId: ClipId, patch: TransformPatch) => void;
+  /** 改静态调色。合并策略同上。 */
+  setClipColor: (clipId: ClipId, patch: ColorPatch) => void;
   /** 在**时间轴帧号** `frame` 处打关键帧；内部换算成片段内偏移。 */
   setKeyframeAt: (
     clipId: ClipId,
@@ -296,6 +300,11 @@ export const useTimeline = create<TimelineState>((set, get) => {
         "调整变换",
         `transform:${clipId}:${keys}`,
       );
+    },
+
+    setClipColor(clipId, patch) {
+      const keys = Object.keys(patch).sort().join(",");
+      apply(setClipColor(get().timeline(), clipId, patch), "调色", `color:${clipId}:${keys}`);
     },
 
     setKeyframeAt(clipId, property, frame, value, easing) {

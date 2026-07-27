@@ -30,7 +30,8 @@ import { formatBytes } from "../export/residency";
 import { canPickSaveFile, pickWriteTarget } from "../export/write-target";
 import type { ExportCapabilities } from "../media/capability";
 import type { ContainerChoice } from "../media/capability";
-import type { RenderRange, Timeline } from "../edl/types";
+import { clipsUsingColor, type RenderRange, type Timeline } from "../edl/types";
+import { observedCapabilities } from "../compose/backend";
 import { formatDuration, frameToSeconds } from "../time/timebase";
 import { formatFps } from "../time/rational";
 import { IconCheck, IconDownload, IconFolder, IconNo, IconWarn, IconX } from "./icons";
@@ -64,6 +65,13 @@ export function ExportDialog({ timeline, caps, selectedRange, onClose }: ExportD
   // 缺 AAC 只在"这次导出真的有音频"时才挡住 MP4：纯画面的片子导 MP4 没问题
   const mp4Blocked = caps !== null && (!caps.mp4Video || (hasAudio && !caps.aac));
   const webmBlocked = caps !== null && !caps.webmVideo;
+
+  // 这台机器起不来 GPU 合成，而项目里有调色 → **在这里就拦住**。
+  // 和缺 AAC 时禁掉 MP4 是同一套做法（D3）：不静默交付一个丢了效果的片子，
+  // 但把原因和出路写在旁边。`null` 表示还没造过合成器，那时不拦
+  const colorClips = useMemo(() => clipsUsingColor(timeline), [timeline]);
+  const gpuCaps = observedCapabilities();
+  const colorBlocked = colorClips.length > 0 && gpuCaps !== null && !gpuCaps.supportsColor;
 
   // MP4 被挡住时自动落到 WebM，但**不是静默降级**：MP4 选项就地写着原因，
   // 用户看到的是"MP4 不可用 + 已经帮你选了 WebM"，而不是点了 MP4 拿到 WebM
@@ -287,6 +295,20 @@ export function ExportDialog({ timeline, caps, selectedRange, onClose }: ExportD
                     />
                     <CapRow ok={Boolean(caps?.aac)} label="AAC 音频编码" value={caps?.aac ? "可用" : "不支持"} />
                     <CapRow ok={Boolean(caps?.opus)} label="Opus 音频编码" value={caps?.opus ? "可用" : "不支持"} />
+                    {/* GPU 合成排在这里而不是等导出跑完再报：调色 / LUT / 转场
+                        全都吊在它上面，用户点导出之前就该知道本机做不做得了 */}
+                    <CapRow
+                      ok={gpuCaps?.supportsColor ?? true}
+                      label="GPU 合成"
+                      value={
+                        gpuCaps === null
+                          ? "未探测"
+                          : gpuCaps.supportsColor
+                            ? "可用（调色生效）"
+                            : "不可用（调色画不出）"
+                      }
+                      warn={gpuCaps !== null && !gpuCaps.supportsColor}
+                    />
                     <CapRow
                       ok={canPickSaveFile()}
                       label="流式写盘"
@@ -322,6 +344,22 @@ export function ExportDialog({ timeline, caps, selectedRange, onClose }: ExportD
               </div>
             </div>
 
+            {colorBlocked && (
+              <div className="dlg-warn">
+                <span className="wi">
+                  <IconWarn />
+                </span>
+                <div>
+                  <b>这台机器起不来 GPU 合成，调色画不出来。</b>
+                  <span>
+                    有 {colorClips.length} 个片段用了调色，现在导出会得到一个没有调色的片子。
+                    出路：把这些片段的调色重置掉再导，或换一个支持 WebGL2 的浏览器 / 机器。
+                    {gpuCaps?.reason ? `（起不来的原因：${gpuCaps.reason}）` : ""}
+                  </span>
+                </div>
+              </div>
+            )}
+
             <div className="dlg-foot">
               <span className="note">导出全程在本机完成，素材不会上传。</span>
               <button type="button" className="btn-ghost" onClick={onClose}>
@@ -330,7 +368,7 @@ export function ExportDialog({ timeline, caps, selectedRange, onClose }: ExportD
               <button
                 type="button"
                 className="btn-primary"
-                disabled={totalFrames <= 0 || (mp4Blocked && webmBlocked)}
+                disabled={totalFrames <= 0 || (mp4Blocked && webmBlocked) || colorBlocked}
                 onClick={() => void start()}
               >
                 开始导出

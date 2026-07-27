@@ -1,12 +1,12 @@
 /**
- * PixiJS v8 后端的合成器——**M2 滤镜 / shader 转场的落点，目前只被 spike 自检使用**。
+ * PixiJS v8 后端的合成器——**预览和导出的默认后端**（2026-07-27 接入，见 D16），
+ * 也是一级调色 / LUT / shader 转场这些只有 GPU 才做得了的能力的落点。
  *
- * 它实现的是 `compositor.ts` 里那个 `Compositor` 接口，和 Canvas2D 后端可互换。
- * 现在不接进预览和导出：换渲染后端的风险应该和"新增图层类型"的风险分开承担，
- * 同时动两边，画面一旦不对就分不清是关键帧算错了还是纹理上传错了。
- * 先让 `src/dev/verify-pixi.ts` 把下面这些前提验掉，M2 后半段再切。
+ * 它实现的是 `compositor.ts` 里那个 `Compositor` 接口，和 Canvas2D 后端可互换；
+ * 选哪个只在 `backend.ts` 一处决定，起不来才退回 Canvas2D。谁静态 import 本文件
+ * 都不会把 Pixi 拖进自己的 chunk——见下面第 1 条。
  *
- * 五条实现约束，每一条都对应一个"不这么写就会静默出错"的坑：
+ * 六条实现约束，每一条都对应一个"不这么写就会静默出错"的坑：
  *
  * 1. **工厂 async、`composeFrame` 同步。** Pixi 走动态 `import()`（不能进主 chunk，
  *    见 CLAUDE.md 的体积一节），但调用点在 rAF 回调和导出逐帧循环里，每帧 await
@@ -23,6 +23,9 @@
  * 5. **临时 `VideoFrame` 必须在 `render()` 之后才 close。** 纹理上传发生在
  *    render 期间，提前 close 会上传到一个已关闭的帧。Canvas2D 后端里
  *    `drawImage` 是立即的，所以那边可以画完就关——这条差异换后端时最容易踩。
+ * 6. **没调色的图层不能挂滤镜。** 挂上 filter（哪怕是单位阵）Pixi 就会先把
+ *    sprite 渲进临时纹理再合成，多一次重采样；而且滤镜也是跨帧复用的槽位状态，
+ *    上一帧的调色不清掉会画到这一帧头上。见 `applyColor`。
  *
  * 另外开了 `preserveDrawingBuffer`。WebGL 的 drawing buffer 默认在下一帧被丢弃，
  * 而导出是"合成一帧、立刻把画布交给编码器"——两者在同一个 task 里时本来没问题，
@@ -31,6 +34,7 @@
  */
 
 import type {
+  ColorMatrixFilter,
   Container,
   ICanvas,
   ImageResource,
@@ -40,6 +44,7 @@ import type {
   WebGLRenderer,
 } from "pixi.js";
 
+import { colorMatrixOf, isDefaultColor, type ColorAdjust } from "./color";
 import { containRect, isDefaultGeometry, placeLayer, type Compositor } from "./compositor";
 
 /** 仅供自检使用的观察窗口。生产代码不要依赖这里的任何东西。 */
@@ -61,6 +66,12 @@ interface LayerSlot {
   readonly source: ImageSource;
   readonly texture: Texture;
   readonly sprite: Sprite;
+  /**
+   * 调色滤镜。**懒建并跨帧复用**——和 `ImageSource` 是同一个理由：
+   * 每帧 `new ColorMatrixFilter()` 会逐帧新建 GPU 资源，导出慢一个量级。
+   * 没调过色的图层永远不会建它（`null`）。
+   */
+  colorFilter: ColorMatrixFilter | null;
 }
 
 /** `recover()` 等上下文回来的上限。浏览器主动恢复通常在一两帧内，给足富余。 */
@@ -171,9 +182,41 @@ export async function createPixiCompositor(
     const texture = new pixi.Texture({ source });
     const sprite = new pixi.Sprite(texture);
     stage.addChild(sprite);
-    const slot: LayerSlot = { source, texture, sprite };
+    const slot: LayerSlot = { source, texture, sprite, colorFilter: null };
     slots[index] = slot;
     return slot;
+  };
+
+  /**
+   * 按这一层的调色决定挂不挂滤镜。
+   *
+   * **恒等调色必须把 `filters` 设回 null**，不能挂一个单位阵滤镜了事：挂了滤镜
+   * Pixi 就会先把 sprite 渲进一张临时纹理再合成，多一次重采样。所以"没调色的
+   * 项目输出逐像素不变"这条保证靠的是这条分支——和 `isDefaultGeometry` 完全同构
+   * （见 D9），也同样**不是性能优化**。
+   *
+   * 而且 slot 是**跨帧复用**的：上一帧留下的滤镜不清掉，这一帧就会带着别人的
+   * 调色画出去——只在"某帧有调色、下一帧没有"时出现，最难复现的那种。
+   */
+  const applyColor = (slot: LayerSlot, color: ColorAdjust | undefined): void => {
+    // 空数组而不是 null：Pixi v8 据 `filters.length` 决定挂不挂那一遍 filter pass，
+    // 空数组就是"不挂"。判空要带 `?.`——`filters` 在从没设过时是 undefined
+    if (isDefaultColor(color)) {
+      if (slot.sprite.filters?.length) slot.sprite.filters = [];
+      return;
+    }
+    let filter = slot.colorFilter;
+    if (!filter) {
+      filter = new pixi.ColorMatrixFilter();
+      slot.colorFilter = filter;
+    }
+    // 矩阵由 `compose/color.ts` 算，这里只负责搬——两个地方各算一遍就是
+    // "预览和成片颜色不一样"的入口（硬规则 2）
+    // Pixi 的 matrix 类型是个 20 长的元组，我们这边是 readonly number[]；
+    // 布局完全相同（5×4 行主序，偏移在第 5 列），只是类型表达方式不同
+    filter.matrix = colorMatrixOf(color) as unknown as ColorMatrixFilter["matrix"];
+    // 只在真的没挂时才赋值：这个 setter 会增删渲染组上的 effect，逐帧重设是白费
+    if (slot.sprite.filters?.[0] !== filter) slot.sprite.filters = [filter];
   };
 
   return {
@@ -184,6 +227,8 @@ export async function createPixiCompositor(
       return height;
     },
     canvas,
+
+    supportsColor: true,
 
     /**
      * 就地改尺寸。**必须就地，不能销毁重建**——`renderer.destroy()` 会
@@ -292,6 +337,7 @@ export async function createPixiCompositor(
 
           slot.sprite.visible = true;
           slot.sprite.alpha = layer.transform?.opacity ?? 1;
+          applyColor(slot, layer.color);
 
           // anchor 和 rotation 两条分支都要显式写。slot 是**跨帧复用**的，
           // 上一帧留下的 anchor 0.5 会让这一帧的恒等摆位整体偏半个图层——
@@ -333,6 +379,9 @@ export async function createPixiCompositor(
       for (const slot of slots) {
         // 先断开 resource，避免纹理销毁时还攥着某个 VideoFrame
         slot.source.resource = null as unknown as ImageResource;
+        slot.sprite.filters = [];
+        slot.colorFilter?.destroy();
+        slot.colorFilter = null;
         slot.sprite.destroy();
         slot.texture.destroy(true);
       }

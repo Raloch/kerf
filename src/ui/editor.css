@@ -1452,6 +1452,37 @@
   color: var(--tx);
   font-weight: 600;
 }
+/* 阻断性提示：贴在页脚上方，和「开始导出」禁用是同一件事的两面。
+   不做成 toast——它不会自己消失，因为用户必须处理它才能继续 */
+.ed .dlg-warn {
+  display: flex;
+  gap: 9px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--line);
+  background: color-mix(in srgb, var(--warn) 12%, var(--panel-2));
+}
+.ed .dlg-warn .wi {
+  flex: 0 0 auto;
+  color: var(--warn);
+  display: flex;
+  padding-top: 1px;
+}
+.ed .dlg-warn .wi svg {
+  width: 13px;
+  height: 13px;
+}
+.ed .dlg-warn b {
+  display: block;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--tx);
+}
+.ed .dlg-warn span {
+  display: block;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--tx-dim);
+}
 .ed .dlg-foot {
   display: flex;
   align-items: center;

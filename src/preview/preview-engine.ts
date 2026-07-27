@@ -191,6 +191,12 @@ export async function createPreviewEngine(
     const active: { source: MediaSource; seekSeconds: number }[] = [];
 
     for (const visible of visibleVideoClips(timeline, frame)) {
+      // 摆位和调色都来自 visibleVideoClips，这一层一个都不自己算——
+      // 导出侧拿的是同一份（硬规则 2 的第二个落点，见 edl/sampling.ts）
+      const looks = {
+        ...(visible.transform ? { transform: visible.transform } : {}),
+        ...(visible.color ? { color: visible.color } : {}),
+      };
       if (visible.kind === "text") {
         const raster = rasterizeText(
           visible.clip.text,
@@ -204,7 +210,7 @@ export async function createPreviewEngine(
             image: raster.canvas,
             width: raster.width,
             height: raster.height,
-            ...(visible.transform ? { transform: visible.transform } : {}),
+            ...looks,
           });
         }
         continue;
@@ -225,8 +231,7 @@ export async function createPreviewEngine(
           image: handle.video,
           width: source.width,
           height: source.height,
-          // 变换来自 visibleVideoClips，这一层不自己算——导出侧拿的是同一个值
-          ...(visible.transform ? { transform: visible.transform } : {}),
+          ...looks,
         });
       }
     }

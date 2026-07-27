@@ -8,7 +8,8 @@
  * 但类型按 M1/M2 的需要留好了扩展位（多轨、多片段、转场、效果）。
  */
 
-import type { KeyframeChannels } from "../anim/keyframes";
+import { COLOR_PROPERTIES, type KeyframeChannels } from "../anim/keyframes";
+import type { ColorAdjust } from "../compose/color";
 import type { LayerTransform } from "../compose/compositor";
 import type { TextStyle } from "../compose/text-raster";
 import type { Rational } from "../time/rational";
@@ -63,8 +64,19 @@ interface ClipBase {
    */
   readonly transform?: LayerTransform;
   /**
+   * 静态一级调色：亮度 / 对比度 / 饱和度 / 色相。缺省 = 不调。
+   *
+   * 和 `transform` 完全同构（静态值 + 关键帧并存、缺省时字段整个不存在），
+   * 但**必须是两个字段**：它们作用在合成层的两个不同环节（摆位 vs 颜色），
+   * 混成一个的话合成器就得靠字段名去猜这个数该进哪儿。见 PLAN.md 的 D17。
+   */
+  readonly color?: ColorAdjust;
+  /**
    * 关键帧通道，每个属性一条独立序列。帧偏移**相对片段起点**（D10）——
    * 所以在时间轴上平移片段不需要动它，但**裁入点时要跟着平移**。
+   *
+   * 摆位和调色**共用这一张表**（见 `anim/keyframes.ts` 的 `ANIMATABLE_PROPERTIES`）：
+   * 打点、删点、平移、撤销都与"这个属性最后作用到哪儿"无关。
    */
   readonly keyframes?: KeyframeChannels;
 }
@@ -143,6 +155,30 @@ export function clipAt(track: Track, frame: number): Clip | null {
     if (frame >= clip.timelineIn && frame < clip.timelineOut) return clip;
   }
   return null;
+}
+
+/**
+ * 用了一级调色的片段（静态值或关键帧任一算数）。
+ *
+ * 存在的理由是**导出前的能力闸门**：这台机器起不来 WebGL 时调色画不出来，
+ * 界面要在开始导出之前就拦下来并说明（见 `ui/ExportDialog.tsx`）。
+ *
+ * 判据必须**同时看两处**。只看 `clip.color` 会漏掉"静态值是缺省、全靠关键帧动"
+ * 的片段——那种片段的 `color` 字段根本不存在（归一化会把全缺省的整个删掉，
+ * 见 `state/operations.ts`），于是闸门放行，用户拿到一个丢了调色的成片。
+ */
+export function clipsUsingColor(timeline: Timeline): Clip[] {
+  const out: Clip[] = [];
+  for (const track of timeline.tracks) {
+    if (track.kind !== "video") continue;
+    for (const clip of track.clips) {
+      const animated = clip.keyframes
+        ? COLOR_PROPERTIES.some((p) => (clip.keyframes?.[p]?.length ?? 0) > 0)
+        : false;
+      if (clip.color !== undefined || animated) out.push(clip);
+    }
+  }
+  return out;
 }
 
 /** 把时间轴帧号换算成源片帧号。 */

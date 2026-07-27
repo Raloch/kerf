@@ -32,7 +32,8 @@ import {
   type Track,
 } from "./types";
 import { frameDurationMicros, frameToMicros, MICROS_PER_SECOND } from "../time/timebase";
-import { resolveTransform } from "../anim/keyframes";
+import { resolveColor, resolveTransform } from "../anim/keyframes";
+import type { ColorAdjust } from "../compose/color";
 import type { LayerTransform } from "../compose/compositor";
 import type { Rational } from "../time/rational";
 
@@ -93,6 +94,11 @@ export interface VisibleMediaClip {
    * 合成器据此走恒等快路径——**不要**在这里补一个空对象，见 PLAN.md 的 D9 / D10。
    */
   readonly transform?: LayerTransform;
+  /**
+   * 这一帧算完的调色。`undefined` 表示不调色，合成器据此**不挂滤镜**——
+   * 同样不要补空对象，理由和 `transform` 完全相同（见 D17）。
+   */
+  readonly color?: ColorAdjust;
 }
 
 /** 某一帧要画的一层文字。没有源片，也就没有取帧位置。 */
@@ -101,6 +107,7 @@ export interface VisibleTextClip {
   readonly trackId: string;
   readonly clip: TextClip;
   readonly transform?: LayerTransform;
+  readonly color?: ColorAdjust;
 }
 
 /**
@@ -120,6 +127,11 @@ export type VisibleClip = VisibleMediaClip | VisibleTextClip;
  */
 function transformAt(clip: Clip, frame: number): LayerTransform | undefined {
   return resolveTransform(clip.transform, clip.keyframes, frame - clip.timelineIn);
+}
+
+/** 同上，调色那一组。 */
+function colorAt(clip: Clip, frame: number): ColorAdjust | undefined {
+  return resolveColor(clip.color, clip.keyframes, frame - clip.timelineIn);
 }
 
 /**
@@ -149,12 +161,14 @@ export function visibleVideoClips(timeline: Timeline, frame: number): VisibleCli
   for (const track of videoTracksInDrawOrder(timeline)) {
     const clip = clipAt(track, frame);
     if (!clip) continue;
-    // `transform` 用条件展开而不是直接写 `transform: undefined`：
+    // `transform` / `color` 用条件展开而不是直接写 `transform: undefined`：
     // exactOptionalPropertyTypes 下"字段不存在"和"字段是 undefined"是两回事，
-    // 而下游靠"没有变换"走恒等快路径
+    // 而下游靠"没有变换 / 没有调色"走恒等快路径
     const transform = transformAt(clip, frame);
+    const color = colorAt(clip, frame);
+    const extras = { ...(transform ? { transform } : {}), ...(color ? { color } : {}) };
     if (clip.kind === "text") {
-      out.push({ kind: "text", trackId: track.id, clip, ...(transform ? { transform } : {}) });
+      out.push({ kind: "text", trackId: track.id, clip, ...extras });
       continue;
     }
     const source = timeline.sources.find((s) => s.id === clip.sourceId);
@@ -165,7 +179,7 @@ export function visibleVideoClips(timeline: Timeline, frame: number): VisibleCli
       clip,
       source,
       sourceMicros: sourceMicrosAt(clip, frame, timeline.fps, source.fps),
-      ...(transform ? { transform } : {}),
+      ...extras,
     });
   }
   return out;

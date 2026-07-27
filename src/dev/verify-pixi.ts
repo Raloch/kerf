@@ -1,10 +1,13 @@
 /**
  * PixiJS spike 的主线程驱动——把 Worker 量到的数字变成断言。
  *
- * 这不是第四个"回归自检"，它验的是**换渲染后端之前必须成立的前提**。
- * M2 的滤镜和 shader 转场要 GPU，而合成器同时被预览（主线程）和导出（Worker）
- * 依赖；这些前提里任何一条不成立，M2 的图层模型就得换个设计。所以它跑在
- * 写 M2 功能代码之前，而不是之后。
+ * 这一组最初不是"回归自检"，验的是**换后端之前必须成立的前提**——那些前提
+ * 已经在 2026-07-27 全部成立并完成迁移（D15 / D16），它们现在是回归护栏：
+ * 上下文丢失、上下文预算、跨 task 清空、纹理复用，这几类失效模式只有 WebGL 才有，
+ * 而且都不报错。
+ *
+ * 后加进来的**一级调色**（M2 后半段）也在这里，因为它同样只有跑真 GPU 才验得了：
+ * 矩阵语义有单测，但"shader 有没有按那个矩阵算"单测够不着。
  *
  * 断言逻辑放在主线程而不是 Worker 里，是为了让"我们到底在要求什么"集中可读；
  * Worker 只负责跑和量（见 `verify-pixi.worker.ts` 的文件头）。
@@ -37,6 +40,14 @@ const BACKEND_HUE_TOLERANCE_DEG = 8;
  * 2.5 落在实测最差（1.69×）和数量级倒退（≈10×）之间，两边都留得下余量。
  */
 const SLOWDOWN_LIMIT = 2.5;
+/**
+ * GPU 调色与 CPU 参照实现允许的逐通道差，单位是 8 位色阶。
+ *
+ * 0 是达不到的：shader 在 float 上算、写回 8 位纹理时舍入，而参照实现在 JS 里
+ * 先算再 round，两条路的舍入点不同。2 相当于 0.8%，肉眼看不见；而所有会出问题的
+ * 写法（预乘 alpha、偏移当 0–255、行列转置）差的都是几十上百，不会卡在这个量级。
+ */
+const COLOR_TOLERANCE = 2;
 
 export interface PixiVerifyResult {
   readonly checks: readonly Check[];
@@ -335,6 +346,61 @@ export async function verifyPixiBackend(): Promise<PixiVerifyResult> {
       "≤ 4",
       alphaCase ? String(alphaDelta) : "找不到半透明用例",
       alphaDelta <= 4,
+    ),
+  );
+
+  // ---- 9b. 一级调色（M2 后半段）----
+  // 这是滤镜能力的地基断言：**GPU 出来的像素 == colorMatrixOf() 在 CPU 上算的**。
+  // 矩阵语义有单测，但"shader 有没有按这个矩阵算"单测够不着，而写错了不报错——
+  // 在预乘 alpha 上算、偏移列当成 0–255、行列转置，三种都照样画得出图
+  const gradedCases = report.colors.filter((c) => !c.name.startsWith("恒等"));
+  let worstColor = 0;
+  let worstColorCase = "";
+  for (const c of gradedCases) {
+    if (c.worst > worstColor) {
+      worstColor = c.worst;
+      worstColorCase = `${c.name}：期望 ${c.expected.join(",")}，实际 ${c.actual.join(",")}`;
+    }
+  }
+  checks.push(
+    check(
+      "GPU 调色的结果等于 colorMatrixOf() 的参照实现",
+      `≤ ${COLOR_TOLERANCE} / 255`,
+      worstColor === 0
+        ? `${gradedCases.length} 个用例逐通道完全相同`
+        : `最差 ${worstColor} · ${worstColorCase}`,
+      gradedCases.length > 0 && worstColor <= COLOR_TOLERANCE,
+    ),
+  );
+
+  // 调色真的改变了画面。上一条在"滤镜整个没挂上"时也可能过——那时
+  // actual == base，而参照值恰好接近 base 的用例（比如轻微调整）就看不出来
+  const changed = gradedCases.filter(
+    (c) => Math.max(...c.actual.map((v, i) => Math.abs(v - c.base[i]!))) > COLOR_TOLERANCE,
+  ).length;
+  checks.push(
+    check(
+      "每个调色用例都真的改变了像素（滤镜确实挂上了）",
+      `${gradedCases.length} 个`,
+      `${changed} 个 · 原色 ${gradedCases[0]?.base.join(",") ?? "-"}`,
+      changed === gradedCases.length,
+    ),
+  );
+
+  // 跟在调色之后的恒等帧必须一个字节不差地回到原色。滤镜是跨帧复用的槽位状态，
+  // 忘了清就会把上一帧的调色画到这一帧头上——只在"某帧有调色、下一帧没有"时出现
+  const identityAfter = report.colors.find((c) => c.name.startsWith("恒等"));
+  const residue = identityAfter
+    ? Math.max(...identityAfter.actual.map((v, i) => Math.abs(v - identityAfter.base[i]!)))
+    : Number.POSITIVE_INFINITY;
+  checks.push(
+    check(
+      "调色之后的恒等帧回到原色（跨帧不残留滤镜）",
+      "0",
+      identityAfter
+        ? `差 ${residue}（原色 ${identityAfter.base.join(",")} → ${identityAfter.actual.join(",")}）`
+        : "找不到恒等用例",
+      residue === 0,
     ),
   );
 

@@ -18,8 +18,14 @@
  * **播放头所在那一帧**的关键帧值。于是播放头不在片段内时动画值不能改——
  * 那时"当前帧"没有意义，硬写会打出一个偏移为负的关键帧。
  *
- * 上下限和缺省值一律取自 `TRANSFORM_RANGES`，不在这里另写一份：两处夹紧规则
+ * 上下限和缺省值一律取自 `PROPERTY_RANGES`，不在这里另写一份：两处夹紧规则
  * 一旦不一致，用户看到的是"输入框允许输入、松手却弹回去"。
+ *
+ * ## 变换和调色是同一套界面
+ *
+ * 它们在编辑侧完全同构（静态值 / 关键帧、单位换算、重置），所以共用
+ * `PropertySection` + `PropertyRow`，只在"改哪个 action、读哪个静态字段"上分岔，
+ * 而那两处收在 `GROUPS` 表里。见 PLAN.md 的 D17。
  */
 
 import { useState } from "react";
@@ -28,8 +34,10 @@ import { TEXT_STYLE_DEFAULTS } from "../compose/text-raster";
 import { clipDuration, type Clip, type MediaClip, type TextClip, type Timeline } from "../edl/types";
 import {
   findClip,
+  isColorProperty,
   PROPERTY_LABELS,
-  TRANSFORM_RANGES,
+  PROPERTY_RANGES,
+  type ColorPatch,
   type TransformPatch,
 } from "../state/operations";
 import { useTimeline } from "../state/timeline-store";
@@ -60,13 +68,24 @@ const DEGREES = {
   fromDisplay: (v: number) => (v * Math.PI) / 180,
 };
 
-const PROPERTY_SPECS: readonly PropertySpec[] = [
+const TRANSFORM_SPECS: readonly PropertySpec[] = [
   { property: "x", label: PROPERTY_LABELS.x, suffix: "px", step: 1, digits: 1, ...RAW },
   { property: "y", label: PROPERTY_LABELS.y, suffix: "px", step: 1, digits: 1, ...RAW },
   { property: "scaleX", label: PROPERTY_LABELS.scaleX, suffix: "%", step: 1, digits: 1, ...PERCENT },
   { property: "scaleY", label: PROPERTY_LABELS.scaleY, suffix: "%", step: 1, digits: 1, ...PERCENT },
   { property: "rotation", label: PROPERTY_LABELS.rotation, suffix: "°", step: 1, digits: 1, ...DEGREES },
   { property: "opacity", label: PROPERTY_LABELS.opacity, suffix: "%", step: 1, digits: 0, ...PERCENT },
+];
+
+/**
+ * 调色四项。三个倍数按百分比显示（100% = 不调），色相按度数——
+ * 和变换那一组用的是同一套 `toDisplay` / `fromDisplay`，单位换算不新开第二处。
+ */
+const COLOR_SPECS: readonly PropertySpec[] = [
+  { property: "brightness", label: PROPERTY_LABELS.brightness, suffix: "%", step: 1, digits: 0, ...PERCENT },
+  { property: "contrast", label: PROPERTY_LABELS.contrast, suffix: "%", step: 1, digits: 0, ...PERCENT },
+  { property: "saturation", label: PROPERTY_LABELS.saturation, suffix: "%", step: 1, digits: 0, ...PERCENT },
+  { property: "hue", label: PROPERTY_LABELS.hue, suffix: "°", step: 1, digits: 1, ...DEGREES },
 ];
 
 const EASINGS: readonly { readonly value: Easing; readonly label: string }[] = [
@@ -84,10 +103,12 @@ const EASINGS: readonly { readonly value: Easing; readonly label: string }[] = [
  * 界面显示的必须是这个值，否则打关键帧时会把一个屏幕上根本不存在的值定下来。
  */
 function effectiveValue(clip: Clip, property: AnimatableProperty, offset: number): number {
-  const fallback = TRANSFORM_RANGES[property].fallback;
+  const fallback = PROPERTY_RANGES[property].fallback;
   const series = clip.keyframes?.[property];
   if (series && series.length > 0) return valueAt(series, offset) ?? fallback;
-  return clip.transform?.[property] ?? fallback;
+  // 静态值存在两个字段里，去哪儿取由属性自己决定（判据同 `clearKeyframes` 的烘焙）
+  const statics = isColorProperty(property) ? clip.color : clip.transform;
+  return (statics as Record<string, number | undefined> | undefined)?.[property] ?? fallback;
 }
 
 function round(value: number, digits: number): number {
@@ -164,8 +185,13 @@ export function Inspector() {
         <SourceSection clip={clip} timeline={timeline} />
       )}
 
-      {/* 音频片段没有画面，变换对它没有意义 */}
-      {track.kind === "video" && <TransformSection clip={clip} playhead={playhead} />}
+      {/* 音频片段没有画面，变换和调色对它都没有意义 */}
+      {track.kind === "video" && (
+        <>
+          <PropertySection group="transform" clip={clip} playhead={playhead} />
+          <PropertySection group="color" clip={clip} playhead={playhead} />
+        </>
+      )}
     </>
   );
 }
@@ -195,47 +221,83 @@ function SourceSection({
 }
 
 // ---------------------------------------------------------------------------
-// 变换与关键帧
+// 变换 / 调色与关键帧
 // ---------------------------------------------------------------------------
 
-function TransformSection({
+/**
+ * 两组属性共用同一套界面。
+ *
+ * 摆位和调色在**编辑**这一侧完全同构：同样的"有动画改关键帧、没动画改静态值"、
+ * 同样的关键帧条、同样的重置。各写一套组件就会漂——今天是调色那边少了缓动下拉，
+ * 明天是变换那边的重置按钮判据不一样。它们只在两处分岔（改哪个 store action、
+ * 读哪个静态字段），下面用一张表把这两处收起来。
+ */
+type PropertyGroup = "transform" | "color";
+
+const GROUPS: Record<
+  PropertyGroup,
+  {
+    readonly title: string;
+    readonly specs: readonly PropertySpec[];
+    readonly staticsOf: (clip: Clip) => object | undefined;
+    readonly resetHint: string;
+  }
+> = {
+  transform: {
+    title: "变换",
+    specs: TRANSFORM_SPECS,
+    staticsOf: (clip) => clip.transform,
+    resetHint: "把静态变换恢复成默认（不动关键帧）",
+  },
+  color: {
+    title: "调色",
+    specs: COLOR_SPECS,
+    staticsOf: (clip) => clip.color,
+    resetHint: "把静态调色恢复成默认（不动关键帧）",
+  },
+};
+
+function PropertySection({
+  group,
   clip,
   playhead,
 }: {
+  readonly group: PropertyGroup;
   readonly clip: Clip;
   readonly playhead: number;
 }) {
   const setClipTransform = useTimeline((s) => s.setClipTransform);
+  const setClipColor = useTimeline((s) => s.setClipColor);
   const inside = playhead >= clip.timelineIn && playhead < clip.timelineOut;
+  const { title, specs, staticsOf, resetHint } = GROUPS[group];
 
   const reset = (): void => {
-    const patch: TransformPatch = {};
-    for (const spec of PROPERTY_SPECS) {
-      (patch as Record<string, undefined>)[spec.property] = undefined;
-    }
-    setClipTransform(clip.id, patch);
+    const patch: Record<string, undefined> = {};
+    for (const spec of specs) patch[spec.property] = undefined;
+    if (group === "color") setClipColor(clip.id, patch as ColorPatch);
+    else setClipTransform(clip.id, patch as TransformPatch);
   };
 
   return (
     <>
       <div className="grp-title row">
-        <span>变换</span>
+        <span>{title}</span>
         <button
           type="button"
           className="mini"
-          disabled={clip.transform === undefined}
-          title="把静态变换恢复成默认（不动关键帧）"
+          disabled={staticsOf(clip) === undefined}
+          title={resetHint}
           onClick={reset}
         >
           重置
         </button>
       </div>
-      {!inside && (
+      {!inside && group === "transform" && (
         <p className="hint">播放头不在这个片段上，只能改静态值；打关键帧要先把播放头移进片段。</p>
       )}
       <div className="fields">
-        {PROPERTY_SPECS.map((spec) => (
-          <TransformRow
+        {specs.map((spec) => (
+          <PropertyRow
             key={spec.property}
             clip={clip}
             spec={spec}
@@ -248,7 +310,7 @@ function TransformSection({
   );
 }
 
-function TransformRow({
+function PropertyRow({
   clip,
   spec,
   playhead,
@@ -260,6 +322,7 @@ function TransformRow({
   readonly inside: boolean;
 }) {
   const setClipTransform = useTimeline((s) => s.setClipTransform);
+  const setClipColor = useTimeline((s) => s.setClipColor);
   const setKeyframeAt = useTimeline((s) => s.setKeyframeAt);
   const removeKeyframeAt = useTimeline((s) => s.removeKeyframeAt);
   const clearKeyframes = useTimeline((s) => s.clearKeyframes);
@@ -271,13 +334,15 @@ function TransformRow({
   const animated = series.length > 0;
   const onKeyframe = animated && series.some((k) => k.frame === offset);
   const value = effectiveValue(clip, property, offset);
-  const range = TRANSFORM_RANGES[property];
+  const range = PROPERTY_RANGES[property];
 
   const commit = (display: number): void => {
     const next = spec.fromDisplay(display);
     // 有动画就改这一帧的关键帧，没有就改静态值——见文件头
     if (animated && inside) setKeyframeAt(clip.id, property, playhead, next);
-    else if (!animated) setClipTransform(clip.id, { [property]: next } as TransformPatch);
+    else if (animated) return;
+    else if (isColorProperty(property)) setClipColor(clip.id, { [property]: next } as ColorPatch);
+    else setClipTransform(clip.id, { [property]: next } as TransformPatch);
   };
 
   return (

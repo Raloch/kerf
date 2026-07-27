@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { FPS } from "../time/rational";
+import { clipsUsingColor } from "../edl/types";
 import type { Clip, MediaClip, MediaSource, TextClip, Timeline, Track } from "../edl/types";
 import {
   addTextClip,
@@ -10,6 +11,7 @@ import {
   removeClip,
   removeKeyframe,
   rippleDeleteClip,
+  setClipColor,
   setClipTransform,
   setKeyframe,
   setTextContent,
@@ -542,6 +544,110 @@ describe("静态变换", () => {
   it("锁定轨道上改不动", () => {
     const t = timeline([{ id: "V1", kind: "video", locked: true, clips: [clip("a", 0, 100)] }]);
     expect(setClipTransform(t, "a", { x: 10 }).reason).toContain("锁定");
+  });
+});
+
+describe("静态调色", () => {
+  const one = () => timeline([{ id: "V1", kind: "video", clips: [clip("a", 0, 100)] }]);
+
+  it("设值后写进 color，而不是 transform", () => {
+    // 混进 transform 不会报错——合成器不认识那个字段，表现只是"调了色画面没变"
+    const r = setClipColor(one(), "a", { saturation: 0, hue: 1 });
+    const got = findClip(r.timeline, "a")!.clip;
+    expect(got.color).toEqual({ saturation: 0, hue: 1 });
+    expect("transform" in got).toBe(false);
+  });
+
+  it("超范围的值被夹住", () => {
+    const r = setClipColor(one(), "a", { brightness: 99, contrast: -5 });
+    expect(findClip(r.timeline, "a")!.clip.color).toEqual({ brightness: 4, contrast: 0 });
+  });
+
+  it("拒绝 NaN", () => {
+    const r = setClipColor(one(), "a", { saturation: Number.NaN });
+    expect(r.changed).toBe(false);
+    expect(r.reason).toContain("有限数");
+  });
+
+  it("调回缺省值时把 color 字段整个删掉，不留 { brightness: 1 }", () => {
+    const set = setClipColor(one(), "a", { brightness: 1.5 }).timeline;
+    const back = setClipColor(set, "a", { brightness: 1 }).timeline;
+    expect("color" in findClip(back, "a")!.clip).toBe(false);
+  });
+
+  it("值没变时 changed:false 且不给 reason", () => {
+    const set = setClipColor(one(), "a", { saturation: 0.5 }).timeline;
+    const again = setClipColor(set, "a", { saturation: 0.5 });
+    expect(again.changed).toBe(false);
+    expect(again.reason).toBeUndefined();
+  });
+
+  it("锁定轨道上改不动", () => {
+    const t = timeline([{ id: "V1", kind: "video", locked: true, clips: [clip("a", 0, 100)] }]);
+    expect(setClipColor(t, "a", { hue: 1 }).reason).toContain("锁定");
+  });
+
+  it("变换和调色互不干扰", () => {
+    let t = setClipTransform(one(), "a", { x: 40 }).timeline;
+    t = setClipColor(t, "a", { hue: 2 }).timeline;
+    const got = findClip(t, "a")!.clip;
+    expect(got.transform).toEqual({ x: 40 });
+    expect(got.color).toEqual({ hue: 2 });
+    // 重置一组不该动另一组
+    const reset = setClipColor(t, "a", { hue: undefined }).timeline;
+    expect(findClip(reset, "a")!.clip.transform).toEqual({ x: 40 });
+    expect("color" in findClip(reset, "a")!.clip).toBe(false);
+  });
+
+  it("关掉调色属性的动画时，值烘进 color 而不是 transform", () => {
+    // 写死成 transform 的话会静默把 brightness 塞进 LayerTransform：
+    // 不报错，表现是"关掉动画之后调色整个丢了"
+    const t = setKeyframe(one(), "a", "brightness", 0, 2).timeline;
+    const cleared = clearKeyframes(t, "a", "brightness", 1.8).timeline;
+    const got = findClip(cleared, "a")!.clip;
+    expect(got.color).toEqual({ brightness: 1.8 });
+    expect("transform" in got).toBe(false);
+    expect("keyframes" in got).toBe(false);
+  });
+});
+
+describe("clipsUsingColor", () => {
+  it("静态调色的片段算数", () => {
+    const t = setClipColor(
+      timeline([{ id: "V1", kind: "video", clips: [clip("a", 0, 100)] }]),
+      "a",
+      { saturation: 0 },
+    ).timeline;
+    expect(clipsUsingColor(t).map((c) => c.id)).toEqual(["a"]);
+  });
+
+  it("**只有关键帧、没有静态值**的片段也算数", () => {
+    // 这是这个函数最容易写错的地方：那种片段的 color 字段根本不存在
+    // （全缺省会被归一化删掉），只看 clip.color 会放行，用户拿到没调色的成片
+    const t = setKeyframe(
+      timeline([{ id: "V1", kind: "video", clips: [clip("a", 0, 100)] }]),
+      "a",
+      "hue",
+      0,
+      1,
+    ).timeline;
+    expect("color" in findClip(t, "a")!.clip).toBe(false);
+    expect(clipsUsingColor(t).map((c) => c.id)).toEqual(["a"]);
+  });
+
+  it("只有摆位关键帧的片段不算数", () => {
+    const t = setKeyframe(
+      timeline([{ id: "V1", kind: "video", clips: [clip("a", 0, 100)] }]),
+      "a",
+      "x",
+      0,
+      50,
+    ).timeline;
+    expect(clipsUsingColor(t)).toEqual([]);
+  });
+
+  it("没调过色的项目返回空", () => {
+    expect(clipsUsingColor(timeline([{ id: "V1", kind: "video", clips: [clip("a", 0, 100)] }]))).toEqual([]);
   });
 });
 

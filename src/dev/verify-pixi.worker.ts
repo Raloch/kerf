@@ -37,6 +37,7 @@ import {
   type VideoCodec,
 } from "mediabunny";
 
+import { applyColorMatrix8, colorMatrixOf, type ColorAdjust } from "../compose/color";
 import {
   createCanvas2DCompositor,
   type Compositor,
@@ -165,6 +166,8 @@ export interface PixiProbeReport {
   readonly frameCount: number;
   /** 图层变换在两个后端上的摆位比对（M2 第 2 步加的）。 */
   readonly transforms: readonly TransformComparison[];
+  /** 一级调色：GPU 出来的像素与 CPU 参照实现的比对（M2 后半段加的）。 */
+  readonly colors: readonly ColorComparison[];
   /** 720p 上的吞吐，`pixiNoPreserve` 用来量 preserveDrawingBuffer 的开销。 */
   readonly perf: {
     readonly width: number;
@@ -395,6 +398,91 @@ async function transformPass(sample: VideoSample): Promise<TransformComparison[]
   } finally {
     pixi.dispose();
     canvas2d.dispose();
+  }
+}
+
+/**
+ * 一级调色：**GPU 出来的像素要等于 `colorMatrixOf()` 在 CPU 上算出来的像素**。
+ *
+ * 这条是整个调色能力的地基。矩阵语义有单测，但"shader 有没有按这个矩阵算"
+ * 单测够不着——它只能在真的跑一遍 WebGL 之后比对。写错了不会报错，画面只是
+ * "看着有点怪"：在预乘 alpha 上算、偏移列当成 0–255、行列转置，三种都画得出图。
+ *
+ * 参照值不用写死的常量，而是**当场量一遍不调色时的像素**再喂给参照实现。
+ * 这样 RGB → 纹理这一路上的任何色彩转换都从比对里消掉了，剩下的差异只可能
+ * 来自滤镜本身。
+ */
+const COLOR_CASES: readonly { readonly name: string; readonly color?: ColorAdjust }[] = [
+  { name: "饱和度 0（灰度）", color: { saturation: 0 } },
+  { name: "亮度 0.5", color: { brightness: 0.5 } },
+  { name: "对比度 2", color: { contrast: 2 } },
+  { name: "色相转 90°", color: { hue: Math.PI / 2 } },
+  { name: "四项一起调", color: { brightness: 1.2, contrast: 0.8, saturation: 1.6, hue: 0.5 } },
+  // 压轴的这条最重要：**跟在调色之后的恒等帧**必须一个字节不差地回到原色。
+  // 滤镜是跨帧复用的槽位状态，忘了清就会把上一帧的调色画到这一帧头上，
+  // 而且只在"某帧有调色、下一帧没有"时出现——最难复现的那种
+  { name: "恒等（紧跟在调色之后）" },
+];
+
+export interface ColorComparison {
+  readonly name: string;
+  /** 不调色时量到的像素，也就是喂给参照实现的输入。 */
+  readonly base: readonly [number, number, number];
+  readonly expected: readonly [number, number, number];
+  readonly actual: readonly [number, number, number];
+  /** 三个通道里最差的那个差值。 */
+  readonly worst: number;
+}
+
+async function colorPass(sample: VideoSample): Promise<ColorComparison[]> {
+  const probe = new OffscreenCanvas(OUT, OUT);
+  const probeCtx = probe.getContext("2d", { willReadFrequently: true });
+  if (!probeCtx) throw new Error("调色比对画布没有 2D 上下文");
+
+  /** 取画面正中一小块的平均色。源片是纯色，所以这就是那个颜色本身。 */
+  const centerColor = (compositor: Compositor): [number, number, number] => {
+    probeCtx.clearRect(0, 0, OUT, OUT);
+    probeCtx.drawImage(compositor.canvas, 0, 0);
+    const { data } = probeCtx.getImageData(OUT / 2 - 8, OUT / 2 - 8, 16, 16);
+    let r = 0;
+    let g = 0;
+    let b = 0;
+    const pixels = data.length / 4;
+    for (let i = 0; i < data.length; i += 4) {
+      r += data[i]!;
+      g += data[i + 1]!;
+      b += data[i + 2]!;
+    }
+    return [Math.round(r / pixels), Math.round(g / pixels), Math.round(b / pixels)];
+  };
+
+  const pixi = await createPixiCompositor(OUT, OUT);
+  try {
+    // 基准：不调色时这一层是什么颜色
+    pixi.composeFrame([{ kind: "sample", sample }]);
+    const base = centerColor(pixi);
+
+    return COLOR_CASES.map((testCase) => {
+      pixi.composeFrame([
+        { kind: "sample", sample, ...(testCase.color ? { color: testCase.color } : {}) },
+      ]);
+      const actual = centerColor(pixi);
+      const [er, eg, eb] = applyColorMatrix8(colorMatrixOf(testCase.color), [...base, 255]);
+      const expected: [number, number, number] = [er, eg, eb];
+      return {
+        name: testCase.name,
+        base,
+        expected,
+        actual,
+        worst: Math.max(
+          Math.abs(actual[0] - er),
+          Math.abs(actual[1] - eg),
+          Math.abs(actual[2] - eb),
+        ),
+      };
+    });
+  } finally {
+    pixi.dispose();
   }
 }
 
@@ -757,6 +845,9 @@ async function run(): Promise<PixiProbeReport> {
     // ---- 5. 图层变换：两个后端摆位是否一致、是否落在手算的位置上 ----
     const transforms = await transformPass(probeSample);
 
+    // ---- 5b. 一级调色：GPU 算出来的颜色是不是 colorMatrixOf() 那个矩阵 ----
+    const colors = await colorPass(probeSample);
+
     // ---- 6. 三个失效模式 ----
     // 上下文预算放最后：它会连开十几个上下文，跑完之后 GPU 侧的状态最脏，
     // 别的探针再跟在后面就说不清失败是自己的问题还是被它拖累的
@@ -786,6 +877,7 @@ async function run(): Promise<PixiProbeReport> {
       })),
       frameCount: FRAMES,
       transforms,
+      colors,
       perf,
     };
   } finally {

@@ -3,7 +3,9 @@
  *
  * 纯函数，**不认识渲染、不认识浏览器**——所以它能脱离浏览器单测，而移动/缓动/
  * 边界外取值的条件多到必须靠测试锁死（和 `state/operations.ts` 同一个理由）。
- * 作用目标是 `compose/compositor.ts` 的 `LayerTransform` 那六个量（见 PLAN.md 的 D9）。
+ * 作用目标是**两组**量：`compose/compositor.ts` 的 `LayerTransform`（摆位六项，
+ * 见 PLAN.md 的 D9）和 `compose/color.ts` 的 `ColorAdjust`（调色四项，见 D17）。
+ * 求值机制完全共用，只在"结果交给谁"上分岔——见 `ANIMATABLE_PROPERTIES`。
  *
  * ## 时间全程在帧号空间，不出现秒
  *
@@ -26,6 +28,7 @@
  * 排序是同一类约定，会随状态层一起落地。本模块的 `valueAt` **假定输入已升序**。
  */
 
+import type { ColorAdjust } from "../compose/color";
 import type { LayerTransform } from "../compose/compositor";
 
 /**
@@ -54,8 +57,8 @@ export interface Keyframe {
   readonly easing?: Easing;
 }
 
-/** 可以打关键帧的属性，与 `LayerTransform` 的字段一一对应。 */
-export const ANIMATABLE_PROPERTIES = [
+/** 摆位类属性，与 `LayerTransform` 的字段一一对应。 */
+export const TRANSFORM_PROPERTIES = [
   "x",
   "y",
   "scaleX",
@@ -64,7 +67,29 @@ export const ANIMATABLE_PROPERTIES = [
   "opacity",
 ] as const;
 
-export type AnimatableProperty = (typeof ANIMATABLE_PROPERTIES)[number];
+/** 调色类属性，与 `ColorAdjust` 的字段一一对应。 */
+export const COLOR_PROPERTIES = ["brightness", "contrast", "saturation", "hue"] as const;
+
+export type TransformProperty = (typeof TRANSFORM_PROPERTIES)[number];
+export type ColorProperty = (typeof COLOR_PROPERTIES)[number];
+
+/**
+ * 所有能打关键帧的属性。
+ *
+ * **分成两组、但共用一张通道表**（下面的 `KeyframeChannels`）。两个选择各有理由：
+ *
+ * - **共用一张表**：打/删/平移关键帧、撤销栈合并键、检查器的关键帧条，这些逻辑
+ *   与"这个属性最后作用到摆位还是颜色"完全无关。分成两张表等于把它们全部写两遍，
+ *   而漏改一处的表现是"某类属性的关键帧撤销不了"。
+ * - **分成两组**：求值时必须知道去向——`resolveTransform` 只能吐 `LayerTransform`，
+ *   把 `brightness` 混进去会变成一个合成器不认识、也不报错的字段。
+ */
+export const ANIMATABLE_PROPERTIES = [
+  ...TRANSFORM_PROPERTIES,
+  ...COLOR_PROPERTIES,
+] as const;
+
+export type AnimatableProperty = TransformProperty | ColorProperty;
 
 /** 每个属性一条独立的关键帧序列。没有条目 = 这个属性不动画。 */
 export type KeyframeChannels = {
@@ -134,28 +159,30 @@ export function valueAt(keyframes: readonly Keyframe[], frame: number): number |
 }
 
 /**
- * 把静态变换和关键帧合成这一帧真正要用的变换。
+ * 把静态值和关键帧合成这一帧真正要用的那一组属性。
  *
  * 优先级：**某属性有关键帧就用求值结果，没有就保留静态值**。两者并存是刻意的，
  * 也是所有 NLE 的做法——用户先调出一个满意的值，再决定要不要让它动起来；
  * 强迫"动画属性必须删掉静态值"会让"暂时关掉动画"变成破坏性操作。
  *
- * **没有任何属性被动画时原样返回 `base`（包括返回 `undefined`）。**
- * 这条不是省事：`undefined` 的变换才会走合成器的恒等快路径，而那条路径是
- * "没用变换的项目输出逐像素不变"的保证（见 PLAN.md 的 D9）。这里若顺手返回一个
- * `{}`，所有没打关键帧的图层就会集体掉出快路径，画面可能整体挪半个像素。
+ * **这一组里没有任何属性被动画时原样返回 `base`（包括返回 `undefined`）。**
+ * 这条不是省事：`undefined` 才会让合成器走恒等快路径，而那条路径是"没用这项能力
+ * 的项目输出逐像素不变"的保证（摆位见 PLAN.md 的 D9，调色见 `compose/color.ts`
+ * 的 `isDefaultColor`）。这里若顺手返回一个 `{}`，所有静态图层就会集体掉出快路径。
  *
- * @param frame 片段内的帧偏移
+ * 泛型是为了让两组属性共用这一段——摆位和调色的合并规则一模一样，
+ * 各写一遍迟早会在"什么时候返回 base"上分叉，而分叉的表现是画面整体挪半个像素。
  */
-export function resolveTransform(
-  base: LayerTransform | undefined,
+function resolveGroup<K extends AnimatableProperty, T>(
+  properties: readonly K[],
+  base: T | undefined,
   channels: KeyframeChannels | undefined,
   frame: number,
-): LayerTransform | undefined {
+): T | undefined {
   if (!channels) return base;
 
-  let animated: { -readonly [K in AnimatableProperty]?: number } | null = null;
-  for (const property of ANIMATABLE_PROPERTIES) {
+  let animated: Record<string, number> | null = null;
+  for (const property of properties) {
     const keyframes = channels[property];
     if (!keyframes || keyframes.length === 0) continue;
     const value = valueAt(keyframes, frame);
@@ -164,5 +191,30 @@ export function resolveTransform(
     animated[property] = value;
   }
 
-  return animated ?? base;
+  return (animated as T | null) ?? base;
+}
+
+/**
+ * 这一帧的摆位（静态变换 + 关键帧）。`frame` 是**片段内的帧偏移**。
+ */
+export function resolveTransform(
+  base: LayerTransform | undefined,
+  channels: KeyframeChannels | undefined,
+  frame: number,
+): LayerTransform | undefined {
+  return resolveGroup(TRANSFORM_PROPERTIES, base, channels, frame);
+}
+
+/**
+ * 这一帧的调色（静态调色 + 关键帧）。`frame` 是**片段内的帧偏移**。
+ *
+ * 和 `resolveTransform` 是同一套规则，分成两个函数只因为返回类型不同——
+ * 合成器要能从类型上区分"这是摆位"和"这是颜色"。
+ */
+export function resolveColor(
+  base: ColorAdjust | undefined,
+  channels: KeyframeChannels | undefined,
+  frame: number,
+): ColorAdjust | undefined {
+  return resolveGroup(COLOR_PROPERTIES, base, channels, frame);
 }

@@ -16,8 +16,11 @@
 import { describe, expect, it } from "vitest";
 import {
   ANIMATABLE_PROPERTIES,
+  COLOR_PROPERTIES,
   easeProgress,
+  resolveColor,
   resolveTransform,
+  TRANSFORM_PROPERTIES,
   valueAt,
   type Keyframe,
 } from "./keyframes";
@@ -205,13 +208,56 @@ describe("resolveTransform", () => {
     expect(base).toEqual({ x: 1, y: 2 });
   });
 
-  it("六个可动画属性全都接得住", () => {
+  it("六个摆位属性全都接得住", () => {
     const channels = Object.fromEntries(
       ANIMATABLE_PROPERTIES.map((p) => [p, [kf(0, 0), kf(10, 10)]]),
     );
     const out = resolveTransform(undefined, channels, 5)!;
-    for (const property of ANIMATABLE_PROPERTIES) {
+    for (const property of TRANSFORM_PROPERTIES) {
       expect(out[property]).toBe(5);
     }
+  });
+
+  it("只挑自己那一组：调色的关键帧不会漏进摆位里", () => {
+    // 混进去不会报错——`LayerTransform` 上多一个 `brightness` 字段，合成器不认识、
+    // 也不会抱怨，表现只是"调了色但画面没变"。所以要在这一层钉死
+    const channels = Object.fromEntries(
+      ANIMATABLE_PROPERTIES.map((p) => [p, [kf(0, 0), kf(10, 10)]]),
+    );
+    const out = resolveTransform(undefined, channels, 5)!;
+    expect(Object.keys(out).sort()).toEqual([...TRANSFORM_PROPERTIES].sort());
+  });
+});
+
+describe("resolveColor", () => {
+  it("没有通道时原样返回 base（包括 undefined）", () => {
+    // 和 resolveTransform 同一条要求：返回 `{}` 会让所有没调色的图层挂上
+    // 一个单位阵滤镜，多一次重采样，"没调色的输出逐像素不变"就没了
+    expect(resolveColor(undefined, undefined, 3)).toBeUndefined();
+    const base = { saturation: 0.5 };
+    expect(resolveColor(base, undefined, 3)).toBe(base);
+    expect(resolveColor(base, { x: [kf(0, 0), kf(10, 10)] }, 5)).toBe(base);
+  });
+
+  it("四个调色属性全都接得住，且不带进摆位属性", () => {
+    const channels = Object.fromEntries(
+      ANIMATABLE_PROPERTIES.map((p) => [p, [kf(0, 0), kf(10, 10)]]),
+    );
+    const out = resolveColor(undefined, channels, 5)!;
+    expect(Object.keys(out).sort()).toEqual([...COLOR_PROPERTIES].sort());
+    for (const property of COLOR_PROPERTIES) expect(out[property]).toBe(5);
+  });
+
+  it("有关键帧的属性盖掉静态值，没有的保留", () => {
+    const out = resolveColor(
+      { brightness: 2, saturation: 0.25 },
+      { brightness: [kf(0, 1), kf(10, 3)] },
+      5,
+    );
+    expect(out).toEqual({ brightness: 2, saturation: 0.25 });
+    // 上面这个巧合值（第 5 帧插值恰好是 2）说明不了什么，换一帧才看得出真的在动
+    expect(resolveColor({ brightness: 2 }, { brightness: [kf(0, 1), kf(10, 3)] }, 0)).toEqual({
+      brightness: 1,
+    });
   });
 });
