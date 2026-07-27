@@ -18,17 +18,18 @@
  * 整个区间一次性混完，结果是 `声道数 × 帧数 × 4` 字节的 PCM：
  * 立体声 48kHz 下约 **23MB / 分钟**。
  *
- * 但**峰值远不止这一份**，这是量过之后才看清的：
+ * 但**峰值不止这一份**，这是量过之后才看清的：
  *
  * 1. 所有素材的解码结果要**同时**挂在音频图上等渲染（`node.buffer`），
  *    它们按**源片自己的**采样率和声道数占内存，加起来可能比输出还大；
- * 2. `OfflineAudioContext` 的渲染目标是完整的另一份；
- * 3. 拷出来交给 Worker 时（不能直接 transfer 渲染结果，见下）又是一份。
+ * 2. `OfflineAudioContext` 的渲染目标是完整的另一份。
  *
- * 于是 2、3 在拷贝那一刻**同时活着**，峰值至少是最终 PCM 的两倍再加上 1。
- * 一小时的项目最终 PCM 是 1.4GB，峰值会到三四个 GB——所以炸的位置比
- * "1.4GB"这个数暗示的更早。分段混流 + 边混边喂编码器才是终解，但那需要
- * Worker 反过来向主线程请求下一段，是一套请求／应答协议，留给 M3。
+ * 曾经还有第三份——把渲染结果拷出来再交给 Worker。那一份已经去掉了，
+ * 见下面 `takeChannels`。
+ *
+ * 剩下的 1、2 只能靠**分段混流**（边混边喂编码器）削掉，那需要 Worker 反过来
+ * 向主线程请求下一段，是一套请求／应答协议，留给 M3。在那之前一小时的项目
+ * 峰值仍会到 2.8GB 上下，**炸的位置比"最终 PCM 1.4GB"这个数暗示的更早**。
  *
  * 这几项都接进了常驻量计量（`export/residency.ts` 的 `audioMixBytes`），
  * 所以上面这些不是估的，是能在导出面板上看到的数。
@@ -55,7 +56,14 @@ export const MIX_SAMPLE_RATE = 48_000;
 /** 混流输出声道数。M2 做环绕声之前固定立体声。 */
 export const MIX_CHANNELS = 2;
 
-/** 混好的 PCM。`channels` 里每项是一个声道（f32-planar 的一个平面）。 */
+/**
+ * 混好的 PCM。`channels` 里每项是一个声道（f32-planar 的一个平面）。
+ *
+ * **这是一份"交出去就没了"的数据**：`channels` 通常直接就是渲染结果的后备存储
+ * （见 `takeChannels`），transfer 进 Worker 之后主线程这边会变成零长数组。
+ * 所以拿到它就该立刻 post 走，不要在 post 之后再读——`frameCount` 之类的标量
+ * 都在这个对象上另存了一份，正是为了 post 之后还能报数。
+ */
 export interface MixedAudio {
   readonly sampleRate: number;
   readonly numberOfChannels: number;
@@ -66,6 +74,61 @@ export interface MixedAudio {
 /** 把 MixedAudio 里所有 PCM 的 ArrayBuffer 收集出来，用于 postMessage 的 transfer 列表。 */
 export function mixedAudioTransferables(mixed: MixedAudio): Transferable[] {
   return mixed.channels.map((channel) => channel.buffer as ArrayBuffer);
+}
+
+/**
+ * 这批声道数组能不能**直接把所有权交出去**（transfer），而不必先拷一份。
+ *
+ * 两个前提，缺一不可：
+ *
+ * - **每个数组整块独占一个 ArrayBuffer**。若它是某个大 buffer 上的子视图，
+ *   transfer 会把整块搬走，连带影响别的声道。
+ * - **各声道不共用同一个 ArrayBuffer**。共用的话 transfer 列表里会出现重复项，
+ *   `postMessage` 直接抛 DataCloneError——整次导出失败。
+ *
+ * Chrome 150 和 Safari 26.5 上实测两条都成立（`getChannelData()` 返回的就是
+ * 那一个声道的完整后备存储，重复调用返回同一个 buffer）。但这是**规范灰区**：
+ * Web Audio 只规定了 "acquire the content" 之后 `getChannelData()` 返回零长数组，
+ * 没规定后备存储怎么摆。所以这里不假设，每次都当场验，不满足就退回拷贝。
+ *
+ * 抽成纯函数是为了能单测——真正的 `AudioBuffer` 在 node 里造不出来，而这段
+ * "能不能搬"的判断恰恰是会写错的地方（漏判共用 buffer 就是线上抛异常）。
+ */
+export function channelsAreMovable(views: readonly Float32Array[]): boolean {
+  const buffers = new Set<ArrayBufferLike>();
+  for (const view of views) {
+    if (view.byteOffset !== 0) return false;
+    if (view.buffer.byteLength !== view.length * Float32Array.BYTES_PER_ELEMENT) return false;
+    if (buffers.has(view.buffer)) return false;
+    buffers.add(view.buffer);
+  }
+  return true;
+}
+
+/**
+ * 取出渲染结果的各声道，**能直接交出所有权就直接交**。
+ *
+ * 上一版无条件拷了一份，理由写的是"getChannelData 返回的数组由 AudioBuffer 持有，
+ * 直接 transfer 会把它 detach，rendered 自己就坏了"。前半句对，后半句是**多余的
+ * 顾虑**——`rendered` 在这之后就没人要了，坏掉正好。
+ *
+ * 这一份不是记账上的虚数。Chrome 里量渲染进程 RSS：渲染完 +220MB（10 分钟立体声
+ * 的一份 PCM），显式拷贝之后再 +220MB。也就是说 `getChannelData()` 本身不复制，
+ * 而那句 `new Float32Array(...)` 是实打实的第二份。
+ *
+ * 返回 `copied` 供计量用：退回拷贝时峰值会高一份，那必须在导出面板上看得见，
+ * 否则就成了"某个浏览器上悄悄多占 660MB"。
+ */
+function takeChannels(rendered: AudioBuffer): {
+  readonly channels: Float32Array[];
+  readonly copied: boolean;
+} {
+  const views: Float32Array[] = [];
+  for (let ch = 0; ch < rendered.numberOfChannels; ch++) {
+    views.push(rendered.getChannelData(ch));
+  }
+  if (channelsAreMovable(views)) return { channels: views, copied: false };
+  return { channels: views.map((view) => new Float32Array(view)), copied: true };
 }
 
 /**
@@ -147,27 +210,23 @@ export async function mixdown(
   }
 
   const rendered = await ctx.startRendering();
-  residency.retainMixBytes(bufferBytes(rendered));
-  // 峰值就在下面这段拷贝里（三份同时活着），采一下才看得到
+  const renderedBytes = bufferBytes(rendered);
+  residency.retainMixBytes(renderedBytes);
+  // 峰值就在这一刻（解码结果 + 渲染目标同时活着），采一下才看得到
   onProgress?.(1);
 
-  const channels: Float32Array[] = [];
-  for (let ch = 0; ch < rendered.numberOfChannels; ch++) {
-    // 复制一份：getChannelData 返回的数组由 AudioBuffer 持有，
-    // 直接 transfer 会把它 detach，rendered 自己就坏了
-    channels.push(new Float32Array(rendered.getChannelData(ch)));
-    residency.retainMixBytes(rendered.length * 4);
-  }
+  const { channels, copied } = takeChannels(rendered);
+  // 退回拷贝的浏览器上这里会再顶起一份，必须让它出现在计量里
+  if (copied) residency.retainMixBytes(renderedBytes);
   onProgress?.(1);
 
   // **解码结果要到这里才销账，不是渲染一完成就销。** 它们还挂在
   // `AudioBufferSourceNode.buffer` 上，而那些节点由 `ctx` 引用着，`ctx` 活到函数返回。
   // 第一版在 startRendering() 之后就减掉了，于是峰值少报了整整一份——
   // 记账点必须贴着"最后一个引用消失"的地方写，不是贴着"逻辑上用完了"
-  residency.releaseMixBytes(
-    scheduledBytes + bufferBytes(rendered) + rendered.length * 4 * rendered.numberOfChannels,
-  );
-  residency.setAudioPcmBytes(rendered.length * rendered.numberOfChannels * 4);
+  residency.releaseMixBytes(scheduledBytes + renderedBytes + (copied ? renderedBytes : 0));
+  // 交出去之前这份 PCM 还在主线程手上，换个名目继续记着
+  residency.setAudioPcmBytes(renderedBytes);
 
   return {
     sampleRate: rendered.sampleRate,

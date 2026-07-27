@@ -97,6 +97,12 @@ export function startExport(
       onProgress,
       (w) => {
         worker = w;
+        // 这个回调在 postMessage **之后**才被调，所以 PCM 的所有权已经交给
+        // Worker 了（transfer 之后主线程这边是零长数组）。计量报的是"我们还
+        // 引用着多少"，那就得在这里销账——否则 mixTracker 的末尾采样会一直
+        // 显示几百 MB，看起来像主线程没放手
+        residency.setAudioPcmBytes(0);
+        sampleMix();
         // 混音期间用户就点了取消
         if (canceled) w.postMessage({ type: "cancel" } satisfies WorkerRequest);
       },
