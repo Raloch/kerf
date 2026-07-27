@@ -28,10 +28,11 @@
  * 而那两处收在 `GROUPS` 表里。见 PLAN.md 的 D17。
  */
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { valueAt, type AnimatableProperty, type Easing } from "../anim/keyframes";
+import { parseCubeLut } from "../compose/lut";
 import { TEXT_STYLE_DEFAULTS } from "../compose/text-raster";
-import { clipDuration, type Clip, type MediaClip, type TextClip, type Timeline } from "../edl/types";
+import { clipDuration, findLut, type Clip, type MediaClip, type TextClip, type Timeline } from "../edl/types";
 import {
   findClip,
   isColorProperty,
@@ -87,6 +88,22 @@ const COLOR_SPECS: readonly PropertySpec[] = [
   { property: "saturation", label: PROPERTY_LABELS.saturation, suffix: "%", step: 1, digits: 0, ...PERCENT },
   { property: "hue", label: PROPERTY_LABELS.hue, suffix: "°", step: 1, digits: 1, ...DEGREES },
 ];
+
+/**
+ * LUT 强度单独一条，**只在片段真的挂了 LUT 时才渲染**。
+ *
+ * 它在数据上属于调色那一组（能打关键帧，见 `COLOR_PROPERTIES`），但在界面上
+ * 跟着 LUT 走——没挂 LUT 时它是个改了也没有任何效果的滑块，摆出来只会让人
+ * 以为"调了没反应"。
+ */
+const LUT_INTENSITY_SPEC: PropertySpec = {
+  property: "lutIntensity",
+  label: PROPERTY_LABELS.lutIntensity,
+  suffix: "%",
+  step: 1,
+  digits: 0,
+  ...PERCENT,
+};
 
 const EASINGS: readonly { readonly value: Easing; readonly label: string }[] = [
   { value: "linear", label: "线性" },
@@ -306,6 +323,90 @@ function PropertySection({
           />
         ))}
       </div>
+      {group === "color" && <LutRow clip={clip} playhead={playhead} inside={inside} />}
+    </>
+  );
+}
+
+/**
+ * LUT：载入 / 摘掉 + 强度。
+ *
+ * 解析在这里同步做完再进状态层（`parseCubeLut` 抛错就原地提示），**不把文件
+ * 存进 EDL**——那样预览和导出会各解析一遍，是硬规则 2 的新入口（解析器有分歧
+ * 不报错，只让两边颜色差一点点）。理由见 `edl/types.ts` 的 `LutSource`。
+ */
+function LutRow({
+  clip,
+  playhead,
+  inside,
+}: {
+  readonly clip: Clip;
+  readonly playhead: number;
+  readonly inside: boolean;
+}) {
+  const timeline = useTimeline((s) => s.timeline());
+  const addLut = useTimeline((s) => s.addLut);
+  const setClipLut = useTimeline((s) => s.setClipLut);
+  const [error, setError] = useState<string | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  const current = clip.lutId ? findLut(timeline, clip.lutId) : null;
+
+  const load = async (file: File): Promise<void> => {
+    try {
+      const parsed = parseCubeLut(await file.text());
+      const id = `lut-${file.name}-${parsed.size}-${Date.now()}`;
+      addLut({ id, name: parsed.title || file.name.replace(/\.cube$/i, ""), size: parsed.size, rgb: parsed.rgb });
+      setClipLut(clip.id, id);
+      setError(null);
+    } catch (e) {
+      // 解析失败要就地说清楚，不能静默不套——用户会以为这张 LUT 就是没效果
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  return (
+    <>
+      <div className="fields">
+        <div className="f ctl lut">
+          <label>LUT</label>
+          {current ? (
+            <>
+              <span className="val lut-name" title={`${current.name} · ${current.size}³`}>
+                {current.name} · {current.size}³
+              </span>
+              <button
+                type="button"
+                className="mini"
+                title="摘掉这张 LUT（强度值保留，挂回去还是原来那个）"
+                onClick={() => setClipLut(clip.id)}
+              >
+                移除
+              </button>
+            </>
+          ) : (
+            <button type="button" className="mini" onClick={() => fileRef.current?.click()}>
+              载入 .cube
+            </button>
+          )}
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".cube"
+            hidden
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              // 清掉 value，否则连着选同一个文件不触发 change
+              e.target.value = "";
+              if (file) void load(file);
+            }}
+          />
+        </div>
+        {current && (
+          <PropertyRow clip={clip} spec={LUT_INTENSITY_SPEC} playhead={playhead} inside={inside} />
+        )}
+      </div>
+      {error && <p className="hint err">LUT 读不了：{error}</p>}
     </>
   );
 }

@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { FPS } from "../time/rational";
-import { clipsUsingColor } from "../edl/types";
+import { clipsUsingEffects } from "../edl/types";
+import type { LutSource } from "../edl/types";
 import type { Clip, MediaClip, MediaSource, TextClip, Timeline, Track } from "../edl/types";
 import {
+  addLut,
   addTextClip,
   clearKeyframes,
   computeDuration,
@@ -12,6 +14,7 @@ import {
   removeKeyframe,
   rippleDeleteClip,
   setClipColor,
+  setClipLut,
   setClipTransform,
   setKeyframe,
   setTextContent,
@@ -611,14 +614,85 @@ describe("静态调色", () => {
   });
 });
 
-describe("clipsUsingColor", () => {
+describe("LUT", () => {
+  const lut = (id: string): LutSource => ({ id, name: id, size: 2, rgb: new Float32Array(24) });
+  const one = () => timeline([{ id: "V1", kind: "video", clips: [clip("a", 0, 100)] }]);
+
+  it("导入后进 timeline.luts", () => {
+    const t = addLut(one(), lut("L1")).timeline;
+    expect(t.luts?.map((l) => l.id)).toEqual(["L1"]);
+  });
+
+  it("同 id 重复导入不产生历史条目", () => {
+    const t = addLut(one(), lut("L1")).timeline;
+    expect(addLut(t, lut("L1")).changed).toBe(false);
+  });
+
+  it("挂上之后片段只存 id，不存表", () => {
+    // 表存进片段会让撤销栈里每一步都拷一份几百 KB，而且"这些片段用的是同一张表"
+    // 从数据上就看不出来了
+    let t = addLut(one(), lut("L1")).timeline;
+    t = setClipLut(t, "a", "L1").timeline;
+    expect(findClip(t, "a")!.clip.lutId).toBe("L1");
+    expect(JSON.stringify(findClip(t, "a")!.clip)).not.toContain("rgb");
+  });
+
+  it("挂一张项目里没有的 LUT 会被拒绝", () => {
+    expect(setClipLut(one(), "a", "nope").reason).toContain("没有这张 LUT");
+  });
+
+  it("摘掉时把 lutId 字段整个删掉", () => {
+    let t = addLut(one(), lut("L1")).timeline;
+    t = setClipLut(t, "a", "L1").timeline;
+    t = setClipLut(t, "a").timeline;
+    expect("lutId" in findClip(t, "a")!.clip).toBe(false);
+  });
+
+  it("摘掉时**不动**强度——挂回去要和摘之前一样", () => {
+    let t = addLut(one(), lut("L1")).timeline;
+    t = setClipLut(t, "a", "L1").timeline;
+    t = setClipColor(t, "a", { lutIntensity: 0.4 }).timeline;
+    t = setClipLut(t, "a").timeline;
+    expect(findClip(t, "a")!.clip.color).toEqual({ lutIntensity: 0.4 });
+  });
+
+  it("强度归一化：1 是缺省值，会被整个删掉", () => {
+    const t = setClipColor(one(), "a", { lutIntensity: 1 });
+    expect(t.changed).toBe(false);
+  });
+
+  it("强度夹在 0–1，外插一张查找表没有意义", () => {
+    const t = setClipColor(one(), "a", { lutIntensity: 3 }).timeline;
+    expect(findClip(t, "a")!.clip.color).toBeUndefined();
+    const low = setClipColor(one(), "a", { lutIntensity: -1 }).timeline;
+    expect(findClip(low, "a")!.clip.color).toEqual({ lutIntensity: 0 });
+  });
+
+  it("锁定轨道上挂不上", () => {
+    const locked = timeline([{ id: "V1", kind: "video", locked: true, clips: [clip("a", 0, 100)] }]);
+    const t = addLut(locked, lut("L1")).timeline;
+    expect(setClipLut(t, "a", "L1").reason).toContain("锁定");
+  });
+});
+
+describe("clipsUsingEffects", () => {
+  it("只挂了 LUT、没调过色的片段也算数", () => {
+    let t = addLut(
+      timeline([{ id: "V1", kind: "video", clips: [clip("a", 0, 100)] }]),
+      { id: "L1", name: "L1", size: 2, rgb: new Float32Array(24) },
+    ).timeline;
+    t = setClipLut(t, "a", "L1").timeline;
+    expect("color" in findClip(t, "a")!.clip).toBe(false);
+    expect(clipsUsingEffects(t).map((c) => c.id)).toEqual(["a"]);
+  });
+
   it("静态调色的片段算数", () => {
     const t = setClipColor(
       timeline([{ id: "V1", kind: "video", clips: [clip("a", 0, 100)] }]),
       "a",
       { saturation: 0 },
     ).timeline;
-    expect(clipsUsingColor(t).map((c) => c.id)).toEqual(["a"]);
+    expect(clipsUsingEffects(t).map((c) => c.id)).toEqual(["a"]);
   });
 
   it("**只有关键帧、没有静态值**的片段也算数", () => {
@@ -632,7 +706,7 @@ describe("clipsUsingColor", () => {
       1,
     ).timeline;
     expect("color" in findClip(t, "a")!.clip).toBe(false);
-    expect(clipsUsingColor(t).map((c) => c.id)).toEqual(["a"]);
+    expect(clipsUsingEffects(t).map((c) => c.id)).toEqual(["a"]);
   });
 
   it("只有摆位关键帧的片段不算数", () => {
@@ -643,11 +717,11 @@ describe("clipsUsingColor", () => {
       0,
       50,
     ).timeline;
-    expect(clipsUsingColor(t)).toEqual([]);
+    expect(clipsUsingEffects(t)).toEqual([]);
   });
 
   it("没调过色的项目返回空", () => {
-    expect(clipsUsingColor(timeline([{ id: "V1", kind: "video", clips: [clip("a", 0, 100)] }]))).toEqual([]);
+    expect(clipsUsingEffects(timeline([{ id: "V1", kind: "video", clips: [clip("a", 0, 100)] }]))).toEqual([]);
   });
 });
 

@@ -4,7 +4,7 @@
  * 纯函数，**不认识渲染、不认识浏览器**——所以它能脱离浏览器单测，而移动/缓动/
  * 边界外取值的条件多到必须靠测试锁死（和 `state/operations.ts` 同一个理由）。
  * 作用目标是**两组**量：`compose/compositor.ts` 的 `LayerTransform`（摆位六项，
- * 见 PLAN.md 的 D9）和 `compose/color.ts` 的 `ColorAdjust`（调色四项，见 D17）。
+ * 见 PLAN.md 的 D9）和 `compose/color.ts` 的 `ColorAdjust`（调色五项，见 D17 / D18）。
  * 求值机制完全共用，只在"结果交给谁"上分岔——见 `ANIMATABLE_PROPERTIES`。
  *
  * ## 时间全程在帧号空间，不出现秒
@@ -67,8 +67,20 @@ export const TRANSFORM_PROPERTIES = [
   "opacity",
 ] as const;
 
-/** 调色类属性，与 `ColorAdjust` 的字段一一对应。 */
-export const COLOR_PROPERTIES = ["brightness", "contrast", "saturation", "hue"] as const;
+/**
+ * 调色类属性，与 `ColorAdjust` 的字段一一对应。
+ *
+ * `lutIntensity` 在这一组里是刻意的：它是"LUT 这个看渐渐上来"，用的是和亮度
+ * 完全一样的打点 / 求值 / 撤销机制，另起一组等于把那一套再写一遍。它只是在
+ * 求值之后走另一条渲染路径（查表而不是矩阵），那是合成器的事，不是这里的事。
+ */
+export const COLOR_PROPERTIES = [
+  "brightness",
+  "contrast",
+  "saturation",
+  "hue",
+  "lutIntensity",
+] as const;
 
 export type TransformProperty = (typeof TRANSFORM_PROPERTIES)[number];
 export type ColorProperty = (typeof COLOR_PROPERTIES)[number];
@@ -168,7 +180,7 @@ export function valueAt(keyframes: readonly Keyframe[], frame: number): number |
  * **这一组里没有任何属性被动画时原样返回 `base`（包括返回 `undefined`）。**
  * 这条不是省事：`undefined` 才会让合成器走恒等快路径，而那条路径是"没用这项能力
  * 的项目输出逐像素不变"的保证（摆位见 PLAN.md 的 D9，调色见 `compose/color.ts`
- * 的 `isDefaultColor`）。这里若顺手返回一个 `{}`，所有静态图层就会集体掉出快路径。
+ * 的 `isDefaultColorMatrix`）。这里若顺手返回一个 `{}`，所有静态图层就会集体掉出快路径。
  *
  * 泛型是为了让两组属性共用这一段——摆位和调色的合并规则一模一样，
  * 各写一遍迟早会在"什么时候返回 base"上分叉，而分叉的表现是画面整体挪半个像素。

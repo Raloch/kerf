@@ -18,9 +18,10 @@
  * 而且还要跟手算的位置对得上。另外专门断言"摆位逐帧在变"——变换要是被整条丢掉，
  * 两条路径同样是"一致"的，只比一致性抓不到这种错。
  *
- * 第三段（M2 后半段）验**一级调色**，套路完全一样：一致 + 真的生效 + 落在
- * 参照实现算出来的数上 + 没顺手挪动几何。"调色只在一个后端生效"和"调色被整层
- * 丢掉"是这一块最可能的两种静默失效，前者靠一致性抓、后者靠"画面必须变灰"抓。
+ * 第三段（M2 后半段）验**一级调色**和 **LUT**，套路完全一样：一致 + 真的生效 +
+ * 落在参照实现算出来的数上 + 没顺手挪动几何。"只在一个后端生效"和"被整层丢掉"
+ * 是这一块最可能的两种静默失效，前者靠一致性抓、后者靠"画面必须变灰 / 通道必须
+ * 轮换"抓——后一条尤其重要，LUT 套了没生效时画面看起来完全正常。
  */
 
 import { ALL_FORMATS, BlobSource, Input, VideoSampleSink } from "mediabunny";
@@ -30,7 +31,7 @@ import { runExport } from "../export/pipeline";
 import { readExportFile, removeExportFile } from "../export/write-target";
 import { createPreviewEngine } from "../preview/preview-engine";
 import { applyColorMatrix8, colorMatrixOf } from "../compose/color";
-import { singleClipTimeline, type Timeline } from "../edl/types";
+import { singleClipTimeline, type LutSource, type Timeline } from "../edl/types";
 import { frameDurationMicros, frameToMicros, MICROS_PER_SECOND } from "../time/timebase";
 import { measure, type Bands, type MeasureRegion } from "./measure";
 import type { Check } from "./verify-m0";
@@ -43,6 +44,31 @@ const VERIFY_XFORM_OUT = "kerf-verify-preview-xform.mp4";
 const VERIFY_TEXT_OUT = "kerf-verify-preview-text.mp4";
 /** 调色比对的落盘文件名。 */
 const VERIFY_COLOR_OUT = "kerf-verify-preview-color.mp4";
+/** LUT 比对的落盘文件名。 */
+const VERIFY_LUT_OUT = "kerf-verify-preview-lut.mp4";
+
+/**
+ * 比对用的 LUT：**红绿蓝轮换**（R←B、G←R、B←G）。
+ *
+ * 挑它有两个理由。它是**线性映射**，所以三线性插值处处精确，断言不必留插值容差；
+ * 而且"通道换位"这件事一眼可判——LUT 最要命的失效是"套了但没生效"，
+ * 那时画面看起来完全正常，只有拿原色比对才发现什么都没发生。
+ */
+function swapLut(size: number): { size: number; rgb: Float32Array } {
+  const rgb = new Float32Array(size * size * size * 3);
+  let i = 0;
+  for (let b = 0; b < size; b++) {
+    for (let g = 0; g < size; g++) {
+      for (let r = 0; r < size; r++) {
+        const d = size - 1;
+        rgb[i++] = b / d;
+        rgb[i++] = r / d;
+        rgb[i++] = g / d;
+      }
+    }
+  }
+  return { size, rgb };
+}
 
 /**
  * 比对用的调色：**只把饱和度打到 0**。
@@ -396,6 +422,82 @@ export async function verifyPreviewMatchesExport(): Promise<PreviewVerifyResult>
   );
 
   await removeExportFile(VERIFY_COLOR_OUT);
+
+  // ---- M2 后半段：LUT 在两条路径上是否一致 ----
+  // 套一张"红绿蓝轮换"的表：它是线性映射，三线性插值处处精确，而且**换了通道**
+  // 这件事一眼可判——LUT 最要命的失效是"套了但没生效"，那时画面看起来完全正常
+  const lut: LutSource = { id: "verify-lut", name: "swap", ...swapLut(9) };
+  const luted: Timeline = {
+    ...timeline,
+    luts: [lut],
+    tracks: timeline.tracks.map((track) =>
+      track.kind !== "video"
+        ? track
+        : { ...track, clips: track.clips.map((clip) => ({ ...clip, lutId: lut.id })) },
+    ),
+  };
+
+  const engineL = await createPreviewEngine(document.createElement("div"), OUT_SIZE, OUT_SIZE);
+  let lutPreview: Bands;
+  try {
+    await engineL.renderFrame(luted, PROBE_FRAME);
+    lutPreview = measureCanvas(engineL.canvas as CanvasImageSource, OUT_SIZE);
+  } finally {
+    engineL.dispose();
+  }
+
+  const lutExport = (
+    await exportAndMeasure(
+      { ...luted, durationFrames: PROBE_FRAME + 1 },
+      [PROBE_FRAME],
+      VERIFY_LUT_OUT,
+    )
+  )[0]![0]!;
+
+  // 1. 两条路径的查表结果一致
+  const lutDelta = Math.max(
+    Math.abs(lutPreview.meanR - lutExport.meanR),
+    Math.abs(lutPreview.meanG - lutExport.meanG),
+    Math.abs(lutPreview.meanB - lutExport.meanB),
+  );
+  checks.push(
+    check(
+      "套 LUT 后预览与导出的颜色一致（容差 24，容许 seek 落在相邻帧）",
+      "≤ 24",
+      String(lutDelta),
+      lutDelta <= 24,
+    ),
+  );
+
+  // 2. LUT **真的生效了**。这张表把 R←B、G←R、B←G，所以三个通道应当整体轮换；
+  //    "套了但没生效"时上一条照样通过——两条路径会一致地都不套
+  const swapped =
+    Math.abs(lutExport.meanR - exportedBands.meanB) <= 24 &&
+    Math.abs(lutExport.meanG - exportedBands.meanR) <= 24 &&
+    Math.abs(lutExport.meanB - exportedBands.meanG) <= 24;
+  checks.push(
+    check(
+      "LUT 确实生效（RGB 轮换成 BRG）",
+      `原色 ${exportedBands.meanR},${exportedBands.meanG},${exportedBands.meanB} → 应为 ${exportedBands.meanB},${exportedBands.meanR},${exportedBands.meanG}`,
+      `实际 ${lutExport.meanR},${lutExport.meanG},${lutExport.meanB}`,
+      swapped,
+    ),
+  );
+
+  // 3. 查表不改几何。挂第二个滤镜等于再渲一次临时纹理，摆位算错会整体偏几像素
+  const lutEdgeDelta = worstEdgeDelta(lutExport, exportedBands);
+  checks.push(
+    check(
+      "套 LUT 不改变几何（黑边与不套时完全相同）",
+      "0px",
+      lutEdgeDelta === 0
+        ? `完全相同（${edgesText(lutExport)}）`
+        : `差 ${lutEdgeDelta}px · LUT ${edgesText(lutExport)} / 原始 ${edgesText(exportedBands)}`,
+      lutEdgeDelta === 0,
+    ),
+  );
+
+  await removeExportFile(VERIFY_LUT_OUT);
 
   // ---- M2：图层变换 + 关键帧在两条路径上是否一致 ----
   // 单独造一份带动画的 EDL，不动上面那份：上面几条断言的期望值依赖"没有变换"，

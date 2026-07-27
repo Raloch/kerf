@@ -30,7 +30,7 @@ import { formatBytes } from "../export/residency";
 import { canPickSaveFile, pickWriteTarget } from "../export/write-target";
 import type { ExportCapabilities } from "../media/capability";
 import type { ContainerChoice } from "../media/capability";
-import { clipsUsingColor, type RenderRange, type Timeline } from "../edl/types";
+import { clipsUsingEffects, type RenderRange, type Timeline } from "../edl/types";
 import { observedCapabilities } from "../compose/backend";
 import { formatDuration, frameToSeconds } from "../time/timebase";
 import { formatFps } from "../time/rational";
@@ -69,9 +69,9 @@ export function ExportDialog({ timeline, caps, selectedRange, onClose }: ExportD
   // 这台机器起不来 GPU 合成，而项目里有调色 → **在这里就拦住**。
   // 和缺 AAC 时禁掉 MP4 是同一套做法（D3）：不静默交付一个丢了效果的片子，
   // 但把原因和出路写在旁边。`null` 表示还没造过合成器，那时不拦
-  const colorClips = useMemo(() => clipsUsingColor(timeline), [timeline]);
+  const colorClips = useMemo(() => clipsUsingEffects(timeline), [timeline]);
   const gpuCaps = observedCapabilities();
-  const colorBlocked = colorClips.length > 0 && gpuCaps !== null && !gpuCaps.supportsColor;
+  const colorBlocked = colorClips.length > 0 && gpuCaps !== null && !gpuCaps.supportsEffects;
 
   // MP4 被挡住时自动落到 WebM，但**不是静默降级**：MP4 选项就地写着原因，
   // 用户看到的是"MP4 不可用 + 已经帮你选了 WebM"，而不是点了 MP4 拿到 WebM
@@ -298,16 +298,16 @@ export function ExportDialog({ timeline, caps, selectedRange, onClose }: ExportD
                     {/* GPU 合成排在这里而不是等导出跑完再报：调色 / LUT / 转场
                         全都吊在它上面，用户点导出之前就该知道本机做不做得了 */}
                     <CapRow
-                      ok={gpuCaps?.supportsColor ?? true}
+                      ok={gpuCaps?.supportsEffects ?? true}
                       label="GPU 合成"
                       value={
                         gpuCaps === null
                           ? "未探测"
-                          : gpuCaps.supportsColor
+                          : gpuCaps.supportsEffects
                             ? "可用（调色生效）"
                             : "不可用（调色画不出）"
                       }
-                      warn={gpuCaps !== null && !gpuCaps.supportsColor}
+                      warn={gpuCaps !== null && !gpuCaps.supportsEffects}
                     />
                     <CapRow
                       ok={canPickSaveFile()}

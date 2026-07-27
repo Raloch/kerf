@@ -23,9 +23,9 @@
  * 5. **临时 `VideoFrame` 必须在 `render()` 之后才 close。** 纹理上传发生在
  *    render 期间，提前 close 会上传到一个已关闭的帧。Canvas2D 后端里
  *    `drawImage` 是立即的，所以那边可以画完就关——这条差异换后端时最容易踩。
- * 6. **没调色的图层不能挂滤镜。** 挂上 filter（哪怕是单位阵）Pixi 就会先把
- *    sprite 渲进临时纹理再合成，多一次重采样；而且滤镜也是跨帧复用的槽位状态，
- *    上一帧的调色不清掉会画到这一帧头上。见 `applyColor`。
+ * 6. **没用效果的图层不能挂滤镜。** 挂上 filter（哪怕是单位阵 / 恒等 LUT）Pixi
+ *    就会先把 sprite 渲进临时纹理再合成，多一次重采样；而且滤镜也是跨帧复用的
+ *    槽位状态，上一帧的效果不清掉会画到这一帧头上。见 `applyEffects`。
  *
  * 另外开了 `preserveDrawingBuffer`。WebGL 的 drawing buffer 默认在下一帧被丢弃，
  * 而导出是"合成一帧、立刻把画布交给编码器"——两者在同一个 task 里时本来没问题，
@@ -36,6 +36,7 @@
 import type {
   ColorMatrixFilter,
   Container,
+  Filter,
   ICanvas,
   ImageResource,
   ImageSource,
@@ -44,7 +45,8 @@ import type {
   WebGLRenderer,
 } from "pixi.js";
 
-import { colorMatrixOf, isDefaultColor, type ColorAdjust } from "./color";
+import { colorMatrixOf, isDefaultColorMatrix, lutIntensityOf, type ColorAdjust } from "./color";
+import { buildLutTexture, LUT_FRAGMENT, LUT_VERTEX, type LutTable } from "./lut";
 import { containRect, isDefaultGeometry, placeLayer, type Compositor } from "./compositor";
 
 /** 仅供自检使用的观察窗口。生产代码不要依赖这里的任何东西。 */
@@ -72,6 +74,12 @@ interface LayerSlot {
    * 没调过色的图层永远不会建它（`null`）。
    */
   colorFilter: ColorMatrixFilter | null;
+  /** LUT 滤镜，同上懒建。 */
+  lutFilter: Filter | null;
+  /** `lutFilter` 当前装的是哪张表；换表时才重新上传纹理。 */
+  lutData: LutTable | null;
+  /** LUT 查找纹理。跟着 `lutFilter` 的生命周期走。 */
+  lutTexture: Texture | null;
 }
 
 /** `recover()` 等上下文回来的上限。浏览器主动恢复通常在一两帧内，给足富余。 */
@@ -182,41 +190,124 @@ export async function createPixiCompositor(
     const texture = new pixi.Texture({ source });
     const sprite = new pixi.Sprite(texture);
     stage.addChild(sprite);
-    const slot: LayerSlot = { source, texture, sprite, colorFilter: null };
+    const slot: LayerSlot = {
+      source,
+      texture,
+      sprite,
+      colorFilter: null,
+      lutFilter: null,
+      lutData: null,
+      lutTexture: null,
+    };
     slots[index] = slot;
     return slot;
   };
 
   /**
-   * 按这一层的调色决定挂不挂滤镜。
+   * 确保这个槽位上挂的是这张 LUT。换表时**连滤镜一起重建**。
    *
-   * **恒等调色必须把 `filters` 设回 null**，不能挂一个单位阵滤镜了事：挂了滤镜
-   * Pixi 就会先把 sprite 渲进一张临时纹理再合成，多一次重采样。所以"没调色的
-   * 项目输出逐像素不变"这条保证靠的是这条分支——和 `isDefaultGeometry` 完全同构
-   * （见 D9），也同样**不是性能优化**。
+   * 只换 `filter.resources.uLut` 更省，但那要依赖 Pixi 内部重新绑定资源组的时机；
+   * 而换表是用户点一下才发生的事，重建的代价可以忽略，换来的是"表换了画面一定跟着变"
+   * 这件事不依赖框架实现细节——依赖错了的表现是"选了 LUT 没生效"，静默。
+   */
+  const ensureLut = (slot: LayerSlot, lut: LutTable): void => {
+    if (slot.lutData === lut && slot.lutFilter) return;
+    slot.lutFilter?.destroy();
+    slot.lutTexture?.destroy(true);
+
+    const built = buildLutTexture(lut);
+    const source = new pixi.BufferImageSource({
+      // BufferImageSource 收的是 Uint8Array；Uint8ClampedArray 与它共用同一块 buffer
+      resource: new Uint8Array(built.pixels.buffer),
+      width: built.width,
+      height: built.height,
+      format: "rgba8unorm",
+      // 红绿两维靠采样器的双线性过滤插值——**这一条不能关**，
+      // 关了查表就退化成最近邻，画面出色带，而且不报错
+      scaleMode: "linear",
+      // 半纹素偏移让采样永远落在切片内部，理论上取不到边界外；
+      // clamp 是兜底，wrap 的话浮点误差会让边缘像素取到隔壁切片
+      addressMode: "clamp-to-edge",
+      // 表里的数是颜色本身，不是"颜色乘以透明度"。alpha 恒为 255，
+      // 声明成已预乘就是让上传这一步别去动它
+      alphaMode: "premultiplied-alpha",
+    });
+    const texture = new pixi.Texture({ source });
+
+    slot.lutTexture = texture;
+    slot.lutFilter = new pixi.Filter({
+      glProgram: pixi.GlProgram.from({ vertex: LUT_VERTEX, fragment: LUT_FRAGMENT }),
+      resources: {
+        lutUniforms: {
+          uLutSize: { value: lut.size, type: "f32" },
+          uIntensity: { value: 1, type: "f32" },
+        },
+        uLut: source,
+        uLutSampler: source.style,
+      },
+    });
+    slot.lutData = lut;
+  };
+
+  /**
+   * 按这一层的调色和 LUT 决定挂哪些滤镜。
+   *
+   * **两条恒等分支都必须把 `filters` 设回空**，不能挂一个单位阵滤镜 / 恒等 LUT
+   * 了事：挂了滤镜 Pixi 就会先把 sprite 渲进一张临时纹理再合成，多一次重采样。
+   * 所以"没用效果的项目输出逐像素不变"这条保证靠的是这里——和 `isDefaultGeometry`
+   * 完全同构（见 D9），也同样**不是性能优化**。
    *
    * 而且 slot 是**跨帧复用**的：上一帧留下的滤镜不清掉，这一帧就会带着别人的
-   * 调色画出去——只在"某帧有调色、下一帧没有"时出现，最难复现的那种。
+   * 效果画出去——只在"某帧有效果、下一帧没有"时出现，最难复现的那种。
+   *
+   * **顺序定死：先一级调色，再 LUT**（`filters` 数组的顺序就是应用顺序）。
+   * 这是调色台的常规做法——LUT 是"看"，它应当作用在调整过的画面上；反过来
+   * 会让同一组参数出另一张画面，而那正是硬规则 2 要消灭的东西。
    */
-  const applyColor = (slot: LayerSlot, color: ColorAdjust | undefined): void => {
-    // 空数组而不是 null：Pixi v8 据 `filters.length` 决定挂不挂那一遍 filter pass，
+  const applyEffects = (
+    slot: LayerSlot,
+    color: ColorAdjust | undefined,
+    lut: LutTable | undefined,
+  ): void => {
+    const chain: Filter[] = [];
+
+    if (!isDefaultColorMatrix(color)) {
+      let filter = slot.colorFilter;
+      if (!filter) {
+        filter = new pixi.ColorMatrixFilter();
+        slot.colorFilter = filter;
+      }
+      // 矩阵由 `compose/color.ts` 算，这里只负责搬——两个地方各算一遍就是
+      // "预览和成片颜色不一样"的入口（硬规则 2）
+      // Pixi 的 matrix 类型是个 20 长的元组，我们这边是 readonly number[]；
+      // 布局完全相同（5×4 行主序，偏移在第 5 列），只是类型表达方式不同
+      filter.matrix = colorMatrixOf(color) as unknown as ColorMatrixFilter["matrix"];
+      chain.push(filter);
+    }
+
+    const intensity = lutIntensityOf(color);
+    // 强度 0 等于没套，走恒等快路径而不是挂一个混合系数为 0 的滤镜
+    if (lut && intensity > 0) {
+      ensureLut(slot, lut);
+      const filter = slot.lutFilter!;
+      // 强度是逐帧可变的（它能打关键帧），所以每帧写一次 uniform。
+      // 这是普通的 uniform 组更新，Pixi 每帧会重新上传，不涉及资源重绑
+      const group = filter.resources["lutUniforms"] as { uniforms: { uIntensity: number } };
+      group.uniforms.uIntensity = intensity;
+      chain.push(filter);
+    }
+
+    // 空数组而不是 null：Pixi v8 据 `filters.length` 决定挂不挂 filter pass，
     // 空数组就是"不挂"。判空要带 `?.`——`filters` 在从没设过时是 undefined
-    if (isDefaultColor(color)) {
-      if (slot.sprite.filters?.length) slot.sprite.filters = [];
+    const current = slot.sprite.filters;
+    if (chain.length === 0) {
+      if (current?.length) slot.sprite.filters = [];
       return;
     }
-    let filter = slot.colorFilter;
-    if (!filter) {
-      filter = new pixi.ColorMatrixFilter();
-      slot.colorFilter = filter;
-    }
-    // 矩阵由 `compose/color.ts` 算，这里只负责搬——两个地方各算一遍就是
-    // "预览和成片颜色不一样"的入口（硬规则 2）
-    // Pixi 的 matrix 类型是个 20 长的元组，我们这边是 readonly number[]；
-    // 布局完全相同（5×4 行主序，偏移在第 5 列），只是类型表达方式不同
-    filter.matrix = colorMatrixOf(color) as unknown as ColorMatrixFilter["matrix"];
-    // 只在真的没挂时才赋值：这个 setter 会增删渲染组上的 effect，逐帧重设是白费
-    if (slot.sprite.filters?.[0] !== filter) slot.sprite.filters = [filter];
+    // 只在链真的变了时才赋值：这个 setter 会增删渲染组上的 effect，逐帧重设是白费
+    const same =
+      current?.length === chain.length && chain.every((f, i) => current[i] === f);
+    if (!same) slot.sprite.filters = chain;
   };
 
   return {
@@ -228,7 +319,7 @@ export async function createPixiCompositor(
     },
     canvas,
 
-    supportsColor: true,
+    supportsEffects: true,
 
     /**
      * 就地改尺寸。**必须就地，不能销毁重建**——`renderer.destroy()` 会
@@ -337,7 +428,7 @@ export async function createPixiCompositor(
 
           slot.sprite.visible = true;
           slot.sprite.alpha = layer.transform?.opacity ?? 1;
-          applyColor(slot, layer.color);
+          applyEffects(slot, layer.color, layer.lut);
 
           // anchor 和 rotation 两条分支都要显式写。slot 是**跨帧复用**的，
           // 上一帧留下的 anchor 0.5 会让这一帧的恒等摆位整体偏半个图层——
@@ -382,6 +473,11 @@ export async function createPixiCompositor(
         slot.sprite.filters = [];
         slot.colorFilter?.destroy();
         slot.colorFilter = null;
+        slot.lutFilter?.destroy();
+        slot.lutFilter = null;
+        slot.lutTexture?.destroy(true);
+        slot.lutTexture = null;
+        slot.lutData = null;
         slot.sprite.destroy();
         slot.texture.destroy(true);
       }

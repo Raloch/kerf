@@ -39,6 +39,12 @@ import {
 
 import { applyColorMatrix8, colorMatrixOf, type ColorAdjust } from "../compose/color";
 import {
+  buildLutTexture,
+  identityLut,
+  sampleLutTexture8,
+  type LutData,
+} from "../compose/lut";
+import {
   createCanvas2DCompositor,
   type Compositor,
   type LayerTransform,
@@ -168,6 +174,8 @@ export interface PixiProbeReport {
   readonly transforms: readonly TransformComparison[];
   /** 一级调色：GPU 出来的像素与 CPU 参照实现的比对（M2 后半段加的）。 */
   readonly colors: readonly ColorComparison[];
+  /** 3D LUT：同上，外加"先调色再 LUT"这个顺序的钉子。 */
+  readonly luts: readonly LutComparison[];
   /** 720p 上的吞吐，`pixiNoPreserve` 用来量 preserveDrawingBuffer 的开销。 */
   readonly perf: {
     readonly width: number;
@@ -484,6 +492,151 @@ async function colorPass(sample: VideoSample): Promise<ColorComparison[]> {
   } finally {
     pixi.dispose();
   }
+}
+
+/**
+ * 3D LUT：**GPU 查出来的颜色要等于 `sampleLutTexture()` 在 CPU 上查出来的**。
+ *
+ * 和上面调色那一段是同一个理由，但对 LUT 更要紧：调色错了还能靠"画面偏绿了"
+ * 看出来，LUT 本来就是用来把颜色改成另一样的，查歪了肉眼根本分不出来。
+ * 半纹素偏移、切片拼接、蓝方向的手动 lerp，三处任何一处写错都只会让颜色偏一点。
+ *
+ * 四个用例覆盖四类失效：
+ *
+ * - **恒等 LUT**：查表这条路本身不能改变画面。这条最强——它不需要知道"应该"是
+ *   什么颜色，任何一处偏移写错都会打破它。
+ * - **通道互换**：线性映射，三线性插值处处精确，所以可以按精确值断言。
+ * - **强度 0.5**：混合系数走的是另一条分支。
+ * - **调色 + LUT 同时**：钉住**顺序**（先调色再 LUT）。顺序反了两条单独的断言
+ *   都还是绿的，只有这条会红。
+ */
+const LUT_SIZE = 17;
+/**
+ * 第二张恒等 LUT 刻意用**很小的尺寸**。
+ *
+ * 半纹素偏移写错时，误差大小与格点间距成正比：17³ 上只差 4/255（刚压在容差线上，
+ * 实测过），5³ 上就是 17/255。这条探针不是为了"真实"，是为了**把我们最怕的那类
+ * 错误放大到不可能漏判**——用真实尺寸去测一个亚纹素级的偏移，等于把断言的余量
+ * 交给运气。
+ */
+const SMALL_LUT_SIZE = 5;
+const LUT_CASES = [
+  { name: "恒等 LUT（查表本身不改画面）", kind: "identity" },
+  { name: "恒等 LUT · 5³（放大半纹素偏移）", kind: "small" },
+  { name: "通道互换 RGB → BRG", kind: "swap" },
+  { name: "通道互换 · 强度 50%", kind: "swap", intensity: 0.5 },
+  { name: "先调色再 LUT（顺序）", kind: "swap", color: { saturation: 0, brightness: 1.4 } },
+  { name: "恒等（紧跟在 LUT 之后）", kind: "none" },
+] as const;
+
+export interface LutComparison {
+  readonly name: string;
+  readonly base: readonly [number, number, number];
+  readonly expected: readonly [number, number, number];
+  readonly actual: readonly [number, number, number];
+  readonly worst: number;
+}
+
+async function lutPass(sample: VideoSample): Promise<LutComparison[]> {
+  const probe = new OffscreenCanvas(OUT, OUT);
+  const probeCtx = probe.getContext("2d", { willReadFrequently: true });
+  if (!probeCtx) throw new Error("LUT 比对画布没有 2D 上下文");
+
+  const centerColor = (compositor: Compositor): [number, number, number] => {
+    probeCtx.clearRect(0, 0, OUT, OUT);
+    probeCtx.drawImage(compositor.canvas, 0, 0);
+    const { data } = probeCtx.getImageData(OUT / 2 - 8, OUT / 2 - 8, 16, 16);
+    let r = 0;
+    let g = 0;
+    let b = 0;
+    const pixels = data.length / 4;
+    for (let i = 0; i < data.length; i += 4) {
+      r += data[i]!;
+      g += data[i + 1]!;
+      b += data[i + 2]!;
+    }
+    return [Math.round(r / pixels), Math.round(g / pixels), Math.round(b / pixels)];
+  };
+
+  const identity = identityLut(LUT_SIZE);
+  const small = identityLut(SMALL_LUT_SIZE);
+  // 红→蓝、绿→红、蓝→绿：线性映射，所以三线性插值精确，断言可以写得很紧
+  const swap = swapLut(LUT_SIZE);
+  const identityTex = buildLutTexture(identity);
+  const smallTex = buildLutTexture(small);
+  const swapTex = buildLutTexture(swap);
+
+  const pixi = await createPixiCompositor(OUT, OUT);
+  try {
+    pixi.composeFrame([{ kind: "sample", sample }]);
+    const base = centerColor(pixi);
+
+    return LUT_CASES.map((testCase) => {
+      const lut =
+        testCase.kind === "identity"
+          ? identity
+          : testCase.kind === "small"
+            ? small
+            : testCase.kind === "swap"
+              ? swap
+              : undefined;
+      const tex =
+        testCase.kind === "identity" ? identityTex : testCase.kind === "small" ? smallTex : swapTex;
+      const intensity = "intensity" in testCase ? testCase.intensity : 1;
+      const color = "color" in testCase ? testCase.color : undefined;
+      const adjust =
+        color || intensity !== 1
+          ? { ...(color ?? {}), ...(intensity !== 1 ? { lutIntensity: intensity } : {}) }
+          : undefined;
+
+      pixi.composeFrame([
+        {
+          kind: "sample",
+          sample,
+          ...(adjust ? { color: adjust } : {}),
+          ...(lut ? { lut } : {}),
+        },
+      ]);
+      const actual = centerColor(pixi);
+
+      // CPU 参照：**顺序必须和 applyEffects 一致**——先色彩矩阵，再查表
+      const [mr, mg, mb] = applyColorMatrix8(colorMatrixOf(adjust), [...base, 255]);
+      const expected: [number, number, number] = lut
+        ? sampleLutTexture8(tex, [mr, mg, mb], intensity)
+        : [mr, mg, mb];
+
+      return {
+        name: testCase.name,
+        base,
+        expected,
+        actual,
+        worst: Math.max(
+          Math.abs(actual[0] - expected[0]),
+          Math.abs(actual[1] - expected[1]),
+          Math.abs(actual[2] - expected[2]),
+        ),
+      };
+    });
+  } finally {
+    pixi.dispose();
+  }
+}
+
+/** 红→蓝、绿→红、蓝→绿。线性映射，插值精确，适合当断言的真值。 */
+function swapLut(size: number): LutData {
+  const rgb = new Float32Array(size * size * size * 3);
+  let i = 0;
+  for (let b = 0; b < size; b++) {
+    for (let g = 0; g < size; g++) {
+      for (let r = 0; r < size; r++) {
+        const d = size - 1;
+        rgb[i++] = b / d;
+        rgb[i++] = r / d;
+        rgb[i++] = g / d;
+      }
+    }
+  }
+  return { size, rgb, title: "swap" };
 }
 
 /** 纯合成耗时。只测 CPU 提交，GPU 是否完成不在这里体现——真实耗时看 encodeMs。 */
@@ -848,6 +1001,9 @@ async function run(): Promise<PixiProbeReport> {
     // ---- 5b. 一级调色：GPU 算出来的颜色是不是 colorMatrixOf() 那个矩阵 ----
     const colors = await colorPass(probeSample);
 
+    // ---- 5c. 3D LUT：GPU 查出来的是不是 sampleLutTexture() 查出来的 ----
+    const luts = await lutPass(probeSample);
+
     // ---- 6. 三个失效模式 ----
     // 上下文预算放最后：它会连开十几个上下文，跑完之后 GPU 侧的状态最脏，
     // 别的探针再跟在后面就说不清失败是自己的问题还是被它拖累的
@@ -878,6 +1034,7 @@ async function run(): Promise<PixiProbeReport> {
       frameCount: FRAMES,
       transforms,
       colors,
+      luts,
       perf,
     };
   } finally {

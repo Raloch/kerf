@@ -197,6 +197,7 @@ export async function runExport(
         const looks = {
           ...(visible.transform ? { transform: visible.transform } : {}),
           ...(visible.color ? { color: visible.color } : {}),
+          ...(visible.lut ? { lut: visible.lut } : {}),
         };
         if (visible.kind === "text") {
           // 与预览侧调的是同一个 rasterizeText、同一份缓存，所以字形一致是

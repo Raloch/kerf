@@ -511,12 +511,29 @@
   line-height: 1.45;
   color: var(--tx-faint);
 }
+/* 解析失败这类"你刚做的操作没成功"的提示要比普通说明显眼 */
+.ed .hint.err {
+  color: var(--warn);
+}
+/* LUT 名字可能很长，挤掉「移除」按钮就点不到了 */
+.ed .f.ctl .val.lut-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 /* ---------- 检查器：可编辑控件 ---------- */
 /* 三列：标签 / 输入 / 关键帧钻石。右栏只有 248px，列宽是数出来的，
    加控件前先量一遍，别让输入框被挤成看不清数字的一条。 */
 .ed .f.ctl {
   grid-template-columns: 54px minmax(0, 1fr) 20px;
+}
+/* LUT 那一行第三列放的是「移除 / 载入」按钮，不是 20px 的关键帧钻石——
+   沿用上面的列宽会把按钮压成两行（实测过）。这一行没有关键帧钻石，
+   所以第三列按内容宽度走 */
+.ed .f.ctl.lut {
+  grid-template-columns: 54px minmax(0, 1fr) auto;
 }
 .ed .numw {
   display: flex;

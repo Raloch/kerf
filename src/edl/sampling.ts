@@ -23,9 +23,11 @@
 
 import {
   clipAt,
+  findLut,
   findSource,
   type Clip,
   type MediaClip,
+  type LutSource,
   type MediaSource,
   type TextClip,
   type Timeline,
@@ -99,6 +101,13 @@ export interface VisibleMediaClip {
    * 同样不要补空对象，理由和 `transform` 完全相同（见 D17）。
    */
   readonly color?: ColorAdjust;
+  /**
+   * 这一层要套的 LUT，已经从 `Timeline.luts` 里查好。
+   *
+   * 在这里查而不是让合成器拿着 `lutId` 自己查，理由同 `transform`：预览和导出
+   * 都从这个函数取渲染决策，合成器只认"画什么"，不认 EDL 的索引结构（硬规则 2）。
+   */
+  readonly lut?: LutSource;
 }
 
 /** 某一帧要画的一层文字。没有源片，也就没有取帧位置。 */
@@ -108,6 +117,7 @@ export interface VisibleTextClip {
   readonly clip: TextClip;
   readonly transform?: LayerTransform;
   readonly color?: ColorAdjust;
+  readonly lut?: LutSource;
 }
 
 /**
@@ -166,7 +176,13 @@ export function visibleVideoClips(timeline: Timeline, frame: number): VisibleCli
     // 而下游靠"没有变换 / 没有调色"走恒等快路径
     const transform = transformAt(clip, frame);
     const color = colorAt(clip, frame);
-    const extras = { ...(transform ? { transform } : {}), ...(color ? { color } : {}) };
+    // 引用了已删除的 LUT 时当作没套，而不是整条渲染崩掉——那是编辑器该能扛住的状态
+    const lut = clip.lutId ? findLut(timeline, clip.lutId) : null;
+    const extras = {
+      ...(transform ? { transform } : {}),
+      ...(color ? { color } : {}),
+      ...(lut ? { lut } : {}),
+    };
     if (clip.kind === "text") {
       out.push({ kind: "text", trackId: track.id, clip, ...extras });
       continue;

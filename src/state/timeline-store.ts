@@ -12,7 +12,7 @@
 
 import { create } from "zustand";
 import type { AnimatableProperty, Easing } from "../anim/keyframes";
-import type { Clip, ClipId, MediaSource, Timeline, TrackId } from "../edl/types";
+import type { Clip, ClipId, LutId, LutSource, MediaSource, Timeline, TrackId } from "../edl/types";
 import { singleClipTimeline } from "../edl/types";
 import { FPS } from "../time/rational";
 import {
@@ -34,8 +34,10 @@ import {
   moveClip,
   removeClip,
   removeKeyframe,
+  addLut,
   rippleDeleteClip,
   setClipColor,
+  setClipLut,
   setClipTransform,
   setKeyframe,
   setTextContent,
@@ -107,6 +109,10 @@ export interface TimelineState {
   setClipTransform: (clipId: ClipId, patch: TransformPatch) => void;
   /** 改静态调色。合并策略同上。 */
   setClipColor: (clipId: ClipId, patch: ColorPatch) => void;
+  /** 把一张解析好的 LUT 加进项目库。 */
+  addLut: (lut: LutSource) => void;
+  /** 给片段挂上 / 摘掉 LUT。传 undefined 表示摘掉。 */
+  setClipLut: (clipId: ClipId, lutId?: LutId) => void;
   /** 在**时间轴帧号** `frame` 处打关键帧；内部换算成片段内偏移。 */
   setKeyframeAt: (
     clipId: ClipId,
@@ -305,6 +311,14 @@ export const useTimeline = create<TimelineState>((set, get) => {
     setClipColor(clipId, patch) {
       const keys = Object.keys(patch).sort().join(",");
       apply(setClipColor(get().timeline(), clipId, patch), "调色", `color:${clipId}:${keys}`);
+    },
+
+    addLut(lut) {
+      apply(addLut(get().timeline(), lut), `导入 LUT ${lut.name}`);
+    },
+
+    setClipLut(clipId, lutId) {
+      apply(setClipLut(get().timeline(), clipId, lutId), lutId ? "套用 LUT" : "移除 LUT");
     },
 
     setKeyframeAt(clipId, property, frame, value, easing) {

@@ -48,6 +48,15 @@ const SLOWDOWN_LIMIT = 2.5;
  * 写法（预乘 alpha、偏移当 0–255、行列转置）差的都是几十上百，不会卡在这个量级。
  */
 const COLOR_TOLERANCE = 2;
+/**
+ * LUT 查表的容差，比调色松一点。
+ *
+ * 多出来的误差来自**采样器的双线性过滤**：GPU 的插值权重只有有限位精度
+ * （典型 8 位子纹素），而 CPU 参照用的是双精度浮点。这是硬件行为，不是 bug。
+ * 3 相当于 1.2%；而会出问题的写法（半纹素偏移漏了、切片拼错、蓝方向没 lerp）
+ * 差的都是几十上百，卡不到这个量级。
+ */
+const LUT_TOLERANCE = 3;
 
 export interface PixiVerifyResult {
   readonly checks: readonly Check[];
@@ -401,6 +410,78 @@ export async function verifyPixiBackend(): Promise<PixiVerifyResult> {
         ? `差 ${residue}（原色 ${identityAfter.base.join(",")} → ${identityAfter.actual.join(",")}）`
         : "找不到恒等用例",
       residue === 0,
+    ),
+  );
+
+  // ---- 9c. 3D LUT（M2 后半段）----
+  // 比调色那三条更要紧：调色错了还能靠"画面偏绿了"看出来，LUT 本来就是用来把
+  // 颜色改成另一样的，查歪了肉眼分不出来。半纹素偏移、切片拼接、蓝方向的手动
+  // lerp，三处任何一处写错都只让颜色偏一点点
+  const lutCases = report.luts.filter((c) => !c.name.startsWith("恒等（紧跟"));
+  let worstLut = 0;
+  let worstLutCase = "";
+  for (const c of lutCases) {
+    if (c.worst > worstLut) {
+      worstLut = c.worst;
+      worstLutCase = `${c.name}：期望 ${c.expected.join(",")}，实际 ${c.actual.join(",")}`;
+    }
+  }
+  checks.push(
+    check(
+      "GPU 查表的结果等于 sampleLutTexture() 的参照实现",
+      `≤ ${LUT_TOLERANCE} / 255`,
+      worstLut === 0
+        ? `${lutCases.length} 个用例逐通道完全相同`
+        : `最差 ${worstLut} · ${worstLutCase}`,
+      lutCases.length > 0 && worstLut <= LUT_TOLERANCE,
+    ),
+  );
+
+  // 恒等 LUT 必须不改画面。这条最强——它不需要知道"应该"是什么颜色，
+  // 任何一处半纹素偏移写错都会打破它，而那类错误在真实 LUT 上完全看不出来
+  // 用 5³ 那张：半纹素偏移在小尺寸上会被放大到 17/255，17³ 上只有 4/255
+  const identityCase = report.luts.find((c) => c.name.startsWith("恒等 LUT · 5³"));
+  const identityDrift = identityCase
+    ? Math.max(...identityCase.actual.map((v, i) => Math.abs(v - identityCase.base[i]!)))
+    : Number.POSITIVE_INFINITY;
+  checks.push(
+    check(
+      "恒等 LUT（5³）查完等于原色（查表这条路本身不改画面）",
+      `≤ ${LUT_TOLERANCE}`,
+      identityCase
+        ? `差 ${identityDrift}（原色 ${identityCase.base.join(",")} → ${identityCase.actual.join(",")}）`
+        : "找不到恒等 LUT 用例",
+      identityDrift <= LUT_TOLERANCE,
+    ),
+  );
+
+  // 顺序：**先一级调色，再 LUT**。反过来的话上面两条都还是绿的，只有这条会红——
+  // 参照值是按正序算的，倒过来的结果与它不同（调色不是与查表可交换的操作）
+  const orderCase = report.luts.find((c) => c.name.startsWith("先调色再 LUT"));
+  checks.push(
+    check(
+      "调色与 LUT 的应用顺序是「先调色再查表」",
+      `≤ ${LUT_TOLERANCE}`,
+      orderCase
+        ? `差 ${orderCase.worst}（期望 ${orderCase.expected.join(",")}，实际 ${orderCase.actual.join(",")}）`
+        : "找不到顺序用例",
+      orderCase !== undefined && orderCase.worst <= LUT_TOLERANCE,
+    ),
+  );
+
+  // 跟在 LUT 之后的恒等帧必须回到原色。同调色那条，钉的是跨帧不残留滤镜
+  const afterLut = report.luts.find((c) => c.name.startsWith("恒等（紧跟"));
+  const lutResidue = afterLut
+    ? Math.max(...afterLut.actual.map((v, i) => Math.abs(v - afterLut.base[i]!)))
+    : Number.POSITIVE_INFINITY;
+  checks.push(
+    check(
+      "LUT 之后的恒等帧回到原色（跨帧不残留滤镜）",
+      "0",
+      afterLut
+        ? `差 ${lutResidue}（原色 ${afterLut.base.join(",")} → ${afterLut.actual.join(",")}）`
+        : "找不到用例",
+      lutResidue === 0,
     ),
   );
 

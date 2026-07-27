@@ -196,6 +196,7 @@ export async function createPreviewEngine(
       const looks = {
         ...(visible.transform ? { transform: visible.transform } : {}),
         ...(visible.color ? { color: visible.color } : {}),
+        ...(visible.lut ? { lut: visible.lut } : {}),
       };
       if (visible.kind === "text") {
         const raster = rasterizeText(

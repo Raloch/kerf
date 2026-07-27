@@ -32,6 +32,8 @@ import {
   clipDuration,
   type Clip,
   type ClipId,
+  type LutId,
+  type LutSource,
   type TextClip,
   type Timeline,
   type Track,
@@ -424,6 +426,7 @@ export const PROPERTY_LABELS: Record<AnimatableProperty, string> = {
   contrast: "对比度",
   saturation: "饱和度",
   hue: "色相",
+  lutIntensity: "LUT 强度",
 };
 
 export interface PropertyRange {
@@ -464,6 +467,9 @@ export const PROPERTY_RANGES: Record<AnimatableProperty, PropertyRange> = {
   // 色相是**弧度**（合成层单位，度数换算在 UI 层）。±1 圈就够——色相是循环量，
   // 转 3 圈和转 1 圈画面完全相同，放宽只会让关键帧插值走冤枉路
   hue: { fallback: 0, min: -2 * Math.PI, max: 2 * Math.PI },
+  // LUT 强度：0 = 不套，1 = 完全套用。上限就是 1——外插一张查找表没有意义，
+  // 那不是"更强的看"，只是把颜色推出色域
+  lutIntensity: { fallback: 1, min: 0, max: 1 },
 };
 
 /** 变换补丁：给数值就设，显式给 `undefined` 就**删掉**这个属性（回到缺省）。 */
@@ -587,6 +593,33 @@ export function setClipTransform(
   return ok(
     replaceClip(timeline, found.track.id, setOptional(found.clip, "transform", result.value)),
   );
+}
+
+/**
+ * 把一张解析好的 LUT 加进项目。同名同尺寸也不去重——两张看起来一样的表可能
+ * 内容不同，靠名字去重会让用户"换了一张但没生效"。
+ */
+export function addLut(timeline: Timeline, lut: LutSource): EditResult {
+  if (timeline.luts?.some((l) => l.id === lut.id)) return unchanged(timeline);
+  return ok({ ...timeline, luts: [...(timeline.luts ?? []), lut] });
+}
+
+/**
+ * 给片段挂上（或摘掉）一张 LUT。`lutId` 传 `undefined` 表示摘掉。
+ *
+ * 摘掉时**不动 `color.lutIntensity`**：用户常常是"先摘下来看看原片、再挂回去"，
+ * 顺手把强度重置成 1 会让挂回去时和摘掉之前不一样。强度是没挂 LUT 时的死值，
+ * 留着不会影响画面（`applyEffects` 只在有 LUT 时才看它）。
+ */
+export function setClipLut(timeline: Timeline, clipId: ClipId, lutId?: LutId): EditResult {
+  const found = findClip(timeline, clipId);
+  if (!found) return reject(timeline, `找不到片段 ${clipId}`);
+  if (found.track.locked) return reject(timeline, "轨道已锁定");
+  if (lutId !== undefined && !timeline.luts?.some((l) => l.id === lutId)) {
+    return reject(timeline, `项目里没有这张 LUT：${lutId}`);
+  }
+  if (found.clip.lutId === lutId) return unchanged(timeline);
+  return ok(replaceClip(timeline, found.track.id, setOptional(found.clip, "lutId", lutId)));
 }
 
 /**

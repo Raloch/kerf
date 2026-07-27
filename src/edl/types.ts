@@ -17,6 +17,27 @@ import type { Rational } from "../time/rational";
 export type SourceId = string;
 export type ClipId = string;
 export type TrackId = string;
+export type LutId = string;
+
+/**
+ * 导入的一张 3D LUT。**存的是解析结果，不是文件**。
+ *
+ * 与 `MediaSource` 存 `File` 的选择相反，理由是两者的解析代价完全不同：视频要
+ * 按需解码、且必须流式；LUT 是一次性的几万行文本，解析结果只有几百 KB，而且
+ * 预览和导出**必须拿到逐位相同的表**——存文件就意味着两个上下文各解析一遍，
+ * 那是硬规则 2 的新入口（解析器有分歧不会报错，只会让两边颜色差一点点）。
+ *
+ * `rgb` 是 `Float32Array`，结构化克隆进 Worker 是零拷贝之外的一次内存复制，
+ * 一次导出只发生一次，可以接受。
+ */
+export interface LutSource {
+  readonly id: LutId;
+  /** 显示名，取自文件名或 `.cube` 里的 TITLE。 */
+  readonly name: string;
+  readonly size: number;
+  /** 长度 `size³ × 3`，顺序与 `.cube` 相同（红变化最快）。见 `compose/lut.ts`。 */
+  readonly rgb: Float32Array;
+}
 
 /**
  * 轨道只分两条通道：**画面**和**声音**。
@@ -71,6 +92,16 @@ interface ClipBase {
    * 混成一个的话合成器就得靠字段名去猜这个数该进哪儿。见 PLAN.md 的 D17。
    */
   readonly color?: ColorAdjust;
+  /**
+   * 套用哪一张 LUT。指向 `Timeline.luts` 里的一项，缺省 = 不套。
+   *
+   * **只存引用，表本身放在 `Timeline.luts`**：同一张 LUT 常常要套在几十个片段上，
+   * 每个片段各存一份 431KB（33³）的表既撑爆撤销栈，也让"这些片段用的是同一张表"
+   * 从数据上看不出来。和 `MediaClip.sourceId` 指向 `Timeline.sources` 是同一个模式。
+   *
+   * 强度不在这里，在 `color.lutIntensity`——那样它就能打关键帧（见 D18）。
+   */
+  readonly lutId?: LutId;
   /**
    * 关键帧通道，每个属性一条独立序列。帧偏移**相对片段起点**（D10）——
    * 所以在时间轴上平移片段不需要动它，但**裁入点时要跟着平移**。
@@ -131,6 +162,8 @@ export interface Timeline {
   readonly durationFrames: number;
   readonly tracks: readonly Track[];
   readonly sources: readonly MediaSource[];
+  /** 导入过的 LUT。片段用 `lutId` 引用，缺省为空数组。 */
+  readonly luts?: readonly LutSource[];
 }
 
 /** 导出范围，帧号，左闭右开。 */
@@ -158,16 +191,16 @@ export function clipAt(track: Track, frame: number): Clip | null {
 }
 
 /**
- * 用了一级调色的片段（静态值或关键帧任一算数）。
+ * 用了 GPU 效果的片段——一级调色或 LUT，静态值和关键帧任一算数。
  *
- * 存在的理由是**导出前的能力闸门**：这台机器起不来 WebGL 时调色画不出来，
+ * 存在的理由是**导出前的能力闸门**：这台机器起不来 WebGL 时这些效果画不出来，
  * 界面要在开始导出之前就拦下来并说明（见 `ui/ExportDialog.tsx`）。
  *
- * 判据必须**同时看两处**。只看 `clip.color` 会漏掉"静态值是缺省、全靠关键帧动"
- * 的片段——那种片段的 `color` 字段根本不存在（归一化会把全缺省的整个删掉，
- * 见 `state/operations.ts`），于是闸门放行，用户拿到一个丢了调色的成片。
+ * 判据必须**把关键帧也算进去**。只看 `clip.color` 会漏掉"静态值是缺省、全靠
+ * 关键帧动"的片段——那种片段的 `color` 字段根本不存在（归一化会把全缺省的整个
+ * 删掉，见 `state/operations.ts`），于是闸门放行，用户拿到一个丢了效果的成片。
  */
-export function clipsUsingColor(timeline: Timeline): Clip[] {
+export function clipsUsingEffects(timeline: Timeline): Clip[] {
   const out: Clip[] = [];
   for (const track of timeline.tracks) {
     if (track.kind !== "video") continue;
@@ -175,10 +208,15 @@ export function clipsUsingColor(timeline: Timeline): Clip[] {
       const animated = clip.keyframes
         ? COLOR_PROPERTIES.some((p) => (clip.keyframes?.[p]?.length ?? 0) > 0)
         : false;
-      if (clip.color !== undefined || animated) out.push(clip);
+      if (clip.color !== undefined || clip.lutId !== undefined || animated) out.push(clip);
     }
   }
   return out;
+}
+
+/** 取一张 LUT；找不到返回 null（引用了已删除的 LUT 时不该整条渲染崩掉）。 */
+export function findLut(timeline: Timeline, id: LutId): LutSource | null {
+  return timeline.luts?.find((l) => l.id === id) ?? null;
 }
 
 /** 把时间轴帧号换算成源片帧号。 */

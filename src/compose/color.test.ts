@@ -24,7 +24,7 @@ import {
   contrastMatrix,
   hueMatrix,
   IDENTITY_MATRIX,
-  isDefaultColor,
+  isDefaultColorMatrix,
   saturationMatrix,
   type ColorMatrix,
   type Rgba,
@@ -42,18 +42,18 @@ const closeTo = (m: ColorMatrix, expected: readonly number[]): void => {
   for (let i = 0; i < 20; i++) expect(m[i]!).toBeCloseTo(expected[i]!, 6);
 };
 
-describe("isDefaultColor", () => {
+describe("isDefaultColorMatrix", () => {
   it("没给、空对象、显式写缺省值，都算没调色", () => {
-    expect(isDefaultColor()).toBe(true);
-    expect(isDefaultColor({})).toBe(true);
-    expect(isDefaultColor({ brightness: 1, contrast: 1, saturation: 1, hue: 0 })).toBe(true);
+    expect(isDefaultColorMatrix()).toBe(true);
+    expect(isDefaultColorMatrix({})).toBe(true);
+    expect(isDefaultColorMatrix({ brightness: 1, contrast: 1, saturation: 1, hue: 0 })).toBe(true);
   });
 
   it("任一项动过就不算", () => {
-    expect(isDefaultColor({ brightness: 1.01 })).toBe(false);
-    expect(isDefaultColor({ contrast: 0.99 })).toBe(false);
-    expect(isDefaultColor({ saturation: 0 })).toBe(false);
-    expect(isDefaultColor({ hue: 0.001 })).toBe(false);
+    expect(isDefaultColorMatrix({ brightness: 1.01 })).toBe(false);
+    expect(isDefaultColorMatrix({ contrast: 0.99 })).toBe(false);
+    expect(isDefaultColorMatrix({ saturation: 0 })).toBe(false);
+    expect(isDefaultColorMatrix({ hue: 0.001 })).toBe(false);
   });
 });
 

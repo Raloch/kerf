@@ -78,7 +78,7 @@ export async function createCompositor(
 /** 这个 JS 上下文里最近一次真的造出来的合成器能做什么。 */
 export interface ObservedCapabilities {
   readonly backend: CompositorBackend;
-  readonly supportsColor: boolean;
+  readonly supportsEffects: boolean;
   readonly reason?: string;
 }
 
@@ -87,7 +87,7 @@ let observed: ObservedCapabilities | null = null;
 function record(created: CreatedCompositor): CreatedCompositor {
   observed = {
     backend: created.backend,
-    supportsColor: created.compositor.supportsColor,
+    supportsEffects: created.compositor.supportsEffects,
     ...(created.reason ? { reason: created.reason } : {}),
   };
   return created;

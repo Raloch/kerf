@@ -17,6 +17,7 @@
 import type { VideoSample } from "mediabunny";
 
 import type { ColorAdjust } from "./color";
+import type { LutTable } from "./lut";
 
 /**
  * 图层变换：位置 / 缩放 / 旋转 / 不透明度。**这四个量正是关键帧的作用目标。**
@@ -50,6 +51,8 @@ export type ComposeLayer =
       readonly transform?: LayerTransform;
       /** 一级调色。省略 = 不调，后端据此不挂滤镜（见 `compose/color.ts`）。 */
       readonly color?: ColorAdjust;
+      /** 3D LUT。省略 = 不套。强度在 `color.lutIntensity`（见 `compose/lut.ts`）。 */
+      readonly lut?: LutTable;
     }
   | {
       readonly kind: "image";
@@ -59,6 +62,7 @@ export type ComposeLayer =
       readonly height: number;
       readonly transform?: LayerTransform;
       readonly color?: ColorAdjust;
+      readonly lut?: LutTable;
     };
 
 /** 等比缩放居中（contain）后，图层在输出画布上占据的矩形。 */
@@ -147,17 +151,19 @@ export interface Compositor {
   readonly width: number;
   readonly height: number;
   /**
-   * 这个后端能不能做一级调色（`ComposeLayer.color`）。
+   * 这个后端能不能做只有 GPU 才做得了的效果：一级调色（`ComposeLayer.color`）
+   * 和 LUT（`ComposeLayer.lut`）。**是一个布尔而不是一组能力位**——两者都要
+   * WebGL、都是整个后端级别的有或没有，拆开只会造出一堆恒等的标志。
    *
-   * **为 false 时 `composeFrame` 会照常画，只是把 `color` 忽略掉**——它不抛错，
+   * **为 false 时 `composeFrame` 会照常画，只是把这些字段忽略掉**——它不抛错，
    * 因为一次导出跑到第三千帧才发现画不了是更坏的失败方式。真正的守卫在上层：
-   * 项目里有调色而这个后端做不了时，导出面板会**禁掉导出并说明原因**
+   * 项目里用了效果而这个后端做不了时，导出面板会**禁掉导出并说明原因**
    * （见 `ui/ExportDialog.tsx`，同硬规则 10 的精神——不静默交付一个丢了效果的片子）。
    *
    * 放在接口上而不是让上层去问"后端是不是 pixi"，是为了让能力和后端名解耦：
    * 将来加第三个后端时，判据仍然是"它能不能做"，不是"它叫什么"。
    */
-  readonly supportsColor: boolean;
+  readonly supportsEffects: boolean;
   /**
    * 就地改输出尺寸。
    *
@@ -235,11 +241,11 @@ export function createCanvas2DCompositor(
     },
     canvas,
 
-    // Canvas2D 做不了一级调色。**不用 `ctx.filter` 拼一个近似版**：那会让同一份
-    // EDL 在有 GPU 和没 GPU 的机器上画出两张不同的画面，而"两套光栅化行为"正是
-    // D5 当初否掉 WebGPU 的理由。宁可这台机器上明确不给用，也不给一个看着像、
-    // 但和成片对不上的结果。上层据此禁掉导出并说明原因，见接口注释
-    supportsColor: false,
+    // Canvas2D 做不了一级调色，更做不了 LUT。**不用 `ctx.filter` 拼一个近似版**：
+    // 那会让同一份 EDL 在有 GPU 和没 GPU 的机器上画出两张不同的画面，而
+    // "两套光栅化行为"正是 D5 当初否掉 WebGPU 的理由。宁可这台机器上明确不给用，
+    // 也不给一个看着像、但和成片对不上的结果。上层据此禁掉导出，见接口注释
+    supportsEffects: false,
 
     resize(nextWidth, nextHeight) {
       width = nextWidth;

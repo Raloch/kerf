@@ -53,6 +53,15 @@ export interface ColorAdjust {
   readonly saturation?: number;
   /** 色相旋转，**弧度**，0 = 不变。 */
   readonly hue?: number;
+  /**
+   * LUT 强度，0–1，1 = 完全套用。**片段没挂 LUT 时这个值没有意义。**
+   *
+   * 它住在这里而不是 `Clip.lut` 里，是为了白拿一整套关键帧机制——"看渐渐上来"
+   * 是 LUT 最常见的用法，而这一组的打点 / 求值 / 撤销 / 检查器行全都是现成的。
+   * 代价是 `ColorAdjust` 不再纯粹是"CSS filter 那四个量"，所以下面的
+   * `colorMatrixOf` / `isDefaultColorMatrix` 都显式说明它们**只看前四个**。
+   */
+  readonly lutIntensity?: number;
 }
 
 /**
@@ -86,20 +95,26 @@ export const COLOR_DEFAULTS: Required<ColorAdjust> = {
   contrast: 1,
   saturation: 1,
   hue: 0,
+  lutIntensity: 1,
 };
 
 /**
- * 有没有调过色。
+ * 一级调色那**四个量**动没动过。`lutIntensity` 不算——它走的是另一条渲染路径。
  *
- * 两个后端据此走"不挂滤镜"的原路径——和 `isDefaultGeometry` 是同一件事，
+ * 两个后端据此走"不挂色彩矩阵滤镜"的原路径——和 `isDefaultGeometry` 是同一件事，
  * 也同样**不是性能优化**：Pixi 里给 sprite 挂上 filter 会让它先渲进一张临时
  * 纹理再合成，重采样一次；没调色的图层必须和加调色之前走完全相同的路径，
  * 否则「没用调色的项目输出逐像素不变」这条保证就没了。
  */
-export function isDefaultColor(color?: ColorAdjust): boolean {
+export function isDefaultColorMatrix(color?: ColorAdjust): boolean {
   if (!color) return true;
   const { brightness = 1, contrast = 1, saturation = 1, hue = 0 } = color;
   return brightness === 1 && contrast === 1 && saturation === 1 && hue === 0;
+}
+
+/** LUT 强度，缺省 1（完全套用）。 */
+export function lutIntensityOf(color?: ColorAdjust): number {
+  return color?.lutIntensity ?? 1;
 }
 
 /**
@@ -191,11 +206,12 @@ export function hueMatrix(radians: number): ColorMatrix {
 /**
  * 把四个量编译成一个矩阵。**顺序定死：色相 → 饱和度 → 对比度 → 亮度**（见文件头）。
  *
+ * **只看前四个量**，`lutIntensity` 与矩阵无关（见 `ColorAdjust`）。
  * 恒等时返回 `IDENTITY_MATRIX` 这个**同一个对象**，调用方可以用引用相等做快判；
- * 但不要把它当唯一判据——`isDefaultColor` 才是。
+ * 但不要把它当唯一判据——`isDefaultColorMatrix` 才是。
  */
 export function colorMatrixOf(color?: ColorAdjust): ColorMatrix {
-  if (isDefaultColor(color)) return IDENTITY_MATRIX;
+  if (isDefaultColorMatrix(color)) return IDENTITY_MATRIX;
   const {
     brightness = 1,
     contrast = 1,
