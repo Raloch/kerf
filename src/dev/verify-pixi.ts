@@ -23,8 +23,20 @@ const BAND_TOLERANCE_PX = 1;
 const HUE_TOLERANCE_DEG = 12;
 /** 两个后端之间的色彩差——比上面严，因为输入完全相同，只有光栅化路径不同。 */
 const BACKEND_HUE_TOLERANCE_DEG = 8;
-/** Pixi 比 Canvas2D 慢多少算倒退。首次上 GPU 有固定开销，留 1.5 倍。 */
-const SLOWDOWN_LIMIT = 1.5;
+/**
+ * Pixi 比 Canvas2D 慢多少算**出事了**。
+ *
+ * 原本是 1.5×，含义是"Pixi 是不是个坏主意"——那个提法的前提是**有得选**。
+ * 但 M2 后半段的滤镜 / LUT / shader 转场在 Canvas2D 上根本做不了，所以真正的
+ * 对比不是"慢"对"快"，而是"慢"对"没有这个功能"。慢多少是要记的账，不是卡口。
+ *
+ * 实测（720p 不缩放、合成 + 捕获 + 编码整段）：Chrome 150 **0.93×**、
+ * Safari 26 **1.69×**（干净状态下重测过，不是上下文残留造成的）。
+ * 所以这条线现在只用来抓**结构性**的错：已知的那一类是"每帧 `Texture.from()`
+ * 新建 GPU 纹理"，它会慢一个数量级（见 CLAUDE.md 的合成层约定）。
+ * 2.5 落在实测最差（1.69×）和数量级倒退（≈10×）之间，两边都留得下余量。
+ */
+const SLOWDOWN_LIMIT = 2.5;
 
 export interface PixiVerifyResult {
   readonly checks: readonly Check[];
@@ -138,6 +150,28 @@ export async function verifyPixiBackend(): Promise<PixiVerifyResult> {
         ? report.contextLoss.detail
         : "无法测试：浏览器不提供 WEBGL_lose_context",
       report.contextLoss.extensionAvailable && report.contextLoss.threwAfterLoss,
+    ),
+  );
+
+  // ---- 5b. 上下文预算：反复导出会不会把 WebGL 上下文用光 ----
+  // Canvas2D 没有这个失效模式，是换后端新引入的风险。Safari 在这个 spike 里
+  // 连报 "too many active WebGL contexts, the oldest context will be lost"。
+  // 驱逐顺序是"最老先死"，所以**长命的那个**才是危险的——预览就是全场最老的
+  const budget = report.contextBudget;
+  checks.push(
+    check(
+      `连开 ${budget.cycles} 个合成器再销毁之后，新建的还画得出（WebGL 上下文预算）`,
+      "画得出",
+      `跑满 ${budget.survivedCycles}/${budget.cycles} 轮 · 最大通道 ${budget.freshMaxChannel}`,
+      budget.survivedCycles === budget.cycles && budget.freshMaxChannel > 32,
+    ),
+  );
+  checks.push(
+    check(
+      `期间一直握着的那个合成器没被驱逐（预览在生产里就是它）`,
+      "画得出",
+      `最大通道 ${budget.longLivedMaxChannel}${budget.detail ? ` · ${budget.detail}` : ""}`,
+      budget.longLivedMaxChannel > 32,
     ),
   );
 
@@ -272,7 +306,7 @@ export async function verifyPixiBackend(): Promise<PixiVerifyResult> {
   const perFrameCanvas = perf.canvas2dMs / perf.frames;
   checks.push(
     check(
-      `${perf.width}×${perf.height} 整段（合成 + 捕获 + 编码）耗时相对 Canvas2D 没有倒退`,
+      `${perf.width}×${perf.height} 整段（合成 + 捕获 + 编码）没有数量级的倒退`,
       `≤ ${SLOWDOWN_LIMIT}×`,
       `${ratio.toFixed(2)}× · 每帧 Pixi ${perFramePixi.toFixed(1)}ms / Canvas2D ${perFrameCanvas.toFixed(1)}ms`,
       ratio <= SLOWDOWN_LIMIT,

@@ -64,6 +64,15 @@ const PROBE_FRAMES = [0, 12, 29] as const;
 const PERF_SIZE = { width: 1280, height: 720 } as const;
 const PERF_FRAMES = 40;
 
+/**
+ * 上下文预算测试要连开几个。
+ *
+ * 12 是"一次剪辑里导出十几次"这个量级——比 WebKit 常见的上限低不了多少，
+ * 又不至于让自检跑很久。这里只要求"起完这么多轮之后还能画"，不要求某个具体上限：
+ * 上限是浏览器和显卡的实现细节，会变；"用户连着导出会不会失败"不会变。
+ */
+const CONTEXT_BUDGET_CYCLES = 12;
+
 export interface FrameComparison {
   readonly index: number;
   readonly expectedHue: number;
@@ -97,6 +106,16 @@ export interface PixiProbeReport {
   readonly contextLoss: {
     readonly extensionAvailable: boolean;
     readonly threwAfterLoss: boolean;
+    readonly detail: string;
+  };
+  /** 反复创建 + 销毁合成器之后，老的和新的还画不画得出。见 `probeContextBudget`。 */
+  readonly contextBudget: {
+    readonly cycles: number;
+    readonly survivedCycles: number;
+    /** 全场最老的那个合成器（生产里是预览）跑完这些轮之后的最大通道值。 */
+    readonly longLivedMaxChannel: number;
+    /** 跑完之后新建的那个的最大通道值。 */
+    readonly freshMaxChannel: number;
     readonly detail: string;
   };
   /** 纯合成耗时（CPU 提交，不含 GPU 完成）。 */
@@ -418,11 +437,120 @@ async function probeContextLoss(
   }
 }
 
+/**
+ * WebGL 上下文预算：反复创建 + 销毁合成器之后，**新的**和**老的**还画不画得出。
+ *
+ * 浏览器对同时存活的 WebGL 上下文有预算，超了就把**最老的那个**丢掉。Safari 在这个
+ * spike 里连报 `There are too many active WebGL contexts on this page, the oldest
+ * context will be lost`——说明 `dispose()` 没有立刻把上下文还回去，而是等 GC。
+ * Canvas2D 完全没有这个失效模式，是换后端**新引入**的风险。
+ *
+ * 两个方向都要问，而且**老的那个才是危险的那个**：
+ *
+ * - **新的**（`freshMaxChannel`）：模拟"连着导出十几次，下一次还起不起得来"。
+ *   驱逐顺序是"最老先死"，所以这个方向天然安全，第一版只测了它，等于没测到点子上。
+ * - **老的**（`longLivedMaxChannel`）：模拟**预览**——它在主线程上从打开项目起就
+ *   一直握着一个合成器，是全场最老的那个。用户每导出一次就产生一轮创建/销毁，
+ *   十几次之后被判死的正是预览。表现是预览突然黑掉或抛错，而用户只是"导出了几次"。
+ *
+ * 刻意不去数上下文（没有跨浏览器的 API 可数），只问画得出画不出——那是用户遇到的形态。
+ */
+async function probeContextBudget(
+  sample: VideoSample,
+): Promise<PixiProbeReport["contextBudget"]> {
+  const draw = (compositor: Compositor): number => {
+    compositor.composeFrame([{ kind: "sample", sample }]);
+    const probe = new OffscreenCanvas(OUT, OUT);
+    const ctx = probe.getContext("2d", { willReadFrequently: true });
+    if (!ctx) throw new Error("探测画布没有 2D 上下文");
+    ctx.drawImage(compositor.canvas, 0, 0);
+    return measure(ctx, OUT, OUT).maxChannel;
+  };
+
+  // 全场最老的那一个：预览在生产里就是这个角色
+  const longLived = await createPixiCompositor(OUT, OUT);
+  try {
+    if (draw(longLived) <= 32) {
+      return {
+        cycles: CONTEXT_BUDGET_CYCLES,
+        survivedCycles: 0,
+        longLivedMaxChannel: 0,
+        freshMaxChannel: 0,
+        detail: "长命合成器一开始就画不出东西，后面的结论都不成立",
+      };
+    }
+
+    let survivedCycles = 0;
+    let cycleError = "";
+    for (let i = 0; i < CONTEXT_BUDGET_CYCLES; i++) {
+      const short = await createPixiCompositor(OUT, OUT);
+      try {
+        short.composeFrame([{ kind: "sample", sample }]);
+        survivedCycles = i + 1;
+      } catch (error) {
+        cycleError = `第 ${i + 1} 轮就画不出来了：${describe(error)}`;
+        break;
+      } finally {
+        short.dispose();
+      }
+    }
+
+    const safely = (label: string, run: () => number): { value: number; note: string } => {
+      try {
+        const value = run();
+        return { value, note: value > 32 ? `${label}画得出` : `${label}画出来是黑的` };
+      } catch (error) {
+        return { value: 0, note: `${label}抛错：${describe(error)}` };
+      }
+    };
+
+    const longLivedResult = safely("老的", () => draw(longLived));
+    const fresh = await createPixiCompositor(OUT, OUT);
+    let freshResult: { value: number; note: string };
+    try {
+      freshResult = safely("新的", () => draw(fresh));
+    } finally {
+      try {
+        fresh.dispose();
+      } catch {
+        /* 上下文可能已经没了，destroy 自己会抛 */
+      }
+    }
+
+    return {
+      cycles: CONTEXT_BUDGET_CYCLES,
+      survivedCycles,
+      longLivedMaxChannel: longLivedResult.value,
+      freshMaxChannel: freshResult.value,
+      detail: [cycleError, longLivedResult.note, freshResult.note].filter(Boolean).join("；"),
+    };
+  } finally {
+    try {
+      longLived.dispose();
+    } catch {
+      /* 同上 */
+    }
+  }
+}
+
 async function run(): Promise<PixiProbeReport> {
   const samples = makeSourceSamples(FRAMES, SRC_WIDTH, SRC_HEIGHT);
   const probeSample = samples[0]!;
 
   try {
+    const avc = await getFirstEncodableVideoCodec(["avc"], { width: OUT, height: OUT });
+    const container: "mp4" | "webm" = avc ? "mp4" : "webm";
+    const codec =
+      avc ?? (await getFirstEncodableVideoCodec(["vp9", "vp8"], { width: OUT, height: OUT }));
+    if (!codec) throw new Error("这个浏览器编不了 AVC / VP9 / VP8，spike 没法跑");
+
+    // ---- 0. 吞吐先跑 ----
+    // 必须在**一个 Pixi 上下文都还没建过**的时候量。放在最后跑时，前面几个探针
+    // 已经创建又销毁过 4 个上下文，而 dispose() 未必立刻把它们还回去
+    // （Safari 会报 "too many active WebGL contexts"）——那样量到的是带着
+    // GPU 内存压力的数字，不是导出的常态。这一段自己会各建一个后端再销毁
+    const perf = await throughputPass(container, codec);
+
     // ---- 1. 能不能起来 ----
     let pixi: PixiCompositor;
     try {
@@ -439,12 +567,6 @@ async function run(): Promise<PixiProbeReport> {
     let encodePixiMs: number;
 
     // ---- 2. 编码一遍，顺便数纹理 ----
-    const avc = await getFirstEncodableVideoCodec(["avc"], { width: OUT, height: OUT });
-    const container: "mp4" | "webm" = avc ? "mp4" : "webm";
-    const codec =
-      avc ?? (await getFirstEncodableVideoCodec(["vp9", "vp8"], { width: OUT, height: OUT }));
-    if (!codec) throw new Error("这个浏览器编不了 AVC / VP9 / VP8，spike 没法跑");
-
     try {
       contextVersion = pixi.debug.contextVersion();
       composePixiMs = timeCompose(pixi, samples);
@@ -479,12 +601,12 @@ async function run(): Promise<PixiProbeReport> {
     // ---- 5. 图层变换：两个后端摆位是否一致、是否落在手算的位置上 ----
     const transforms = await transformPass(probeSample);
 
-    // ---- 6. 两个失效模式 ----
+    // ---- 6. 三个失效模式 ----
+    // 上下文预算放最后：它会连开十几个上下文，跑完之后 GPU 侧的状态最脏，
+    // 别的探针再跟在后面就说不清失败是自己的问题还是被它拖累的
     const drawingBuffer = await probeDrawingBuffer(probeSample);
     const contextLoss = await probeContextLoss(probeSample);
-
-    // ---- 7. 吞吐（720p，不缩放）----
-    const perf = await throughputPass(container, codec);
+    const contextBudget = await probeContextBudget(probeSample);
 
     return {
       contextVersion,
@@ -493,6 +615,7 @@ async function run(): Promise<PixiProbeReport> {
       textures: { afterFirstFrame: texturesAfterFirstFrame, afterLastFrame: texturesAfterLastFrame },
       drawingBuffer,
       contextLoss,
+      contextBudget,
       composeMs: { pixi: composePixiMs, canvas2d: composeCanvas2dMs },
       encodeMs: { pixi: encodePixiMs, canvas2d: encodeCanvas2dMs },
       frames: PROBE_FRAMES.map((index, i) => ({
