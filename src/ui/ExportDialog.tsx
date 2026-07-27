@@ -383,6 +383,10 @@ export function ExportDialog({ timeline, caps, selectedRange, onClose }: ExportD
                       : "已写入你选择的文件"}
                     {" · "}
                     {phase.result.mimeType}
+                    {" · "}
+                    {/* 后端要和预览一致（硬规则 2）。今天两个后端画得一样，
+                        接了滤镜之后不一致就是"预览有效果、成片没有" */}
+                    {phase.result.backend === "pixi" ? "GPU 合成" : "CPU 合成（无 GPU 效果）"}
                   </div>
                   <ResidencyLine residency={phase.result.residency} />
                   {phase.result.mixResidency && (

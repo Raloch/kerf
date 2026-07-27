@@ -21,7 +21,8 @@
 
 import type { MediaSource, Timeline } from "../edl/types";
 import { microsToSeconds, sourceCenterMicrosAt, visibleVideoClips } from "../edl/sampling";
-import { createCanvas2DCompositor, type ComposeLayer, type Compositor } from "../compose/compositor";
+import { createCompositor, type CompositorBackend } from "../compose/backend";
+import type { ComposeLayer, Compositor } from "../compose/compositor";
 import { rasterizeText } from "../compose/text-raster";
 import { frameDurationMicros, MICROS_PER_SECOND } from "../time/timebase";
 import type { Rational } from "../time/rational";
@@ -40,6 +41,20 @@ interface SourceHandle {
 export interface PreviewEngine {
   readonly canvas: HTMLCanvasElement;
   /**
+   * 实际用上的渲染后端。
+   *
+   * 报出来是因为**它必须和导出侧一致**（硬规则 2）：一边 Pixi 一边 Canvas2D 时，
+   * 今天只是留边差一个像素，接了滤镜之后就是"预览有效果、成片没有"。
+   */
+  readonly backend: CompositorBackend;
+  /**
+   * 就地改输出分辨率。
+   *
+   * **优先用它而不是"销毁引擎再建一个"**：后者会换掉画布（见工厂注释），
+   * 顺带丢掉视频元素的解码状态，换分辨率时预览会黑一下再重新 seek。
+   */
+  resize(width: number, height: number): void;
+  /**
    * 代理就绪后调用：换用代理文件重建对应的 video。
    *
    * 预览读代理、导出读原片——代理只为 seek 流畅，绝不影响成片画质。
@@ -52,17 +67,38 @@ export interface PreviewEngine {
   /** 进入播放：把相关 video 对齐到该帧并开始走。 */
   startPlayback(timeline: Timeline, frame: number): Promise<void>;
   stopPlayback(): void;
-  /** 输出分辨率变化时重建合成器。 */
-  resize(width: number, height: number): void;
   dispose(): void;
 }
 
-export function createPreviewEngine(
-  canvas: HTMLCanvasElement,
+/**
+ * 造预览引擎。**画布由引擎自己建并挂进 `container`，调用方不要自己传画布。**
+ *
+ * 两个理由，第二个是硬约束：
+ *
+ * 1. 一张画布只能有一种上下文类型，所以没法"先用 Canvas2D 顶着、Pixi 好了再换"
+ *    ——因此这个工厂必须是异步的，调用方必须等。
+ * 2. **Pixi 的 `renderer.destroy()` 会 `loseContext()`，那张画布之后再建渲染器
+ *    会死循环**（实测 Chrome 150，标签页 100% CPU，不报错）。只要画布是外面传进来
+ *    的，"销毁引擎再建一个"就迟早会撞上它——React 严格模式的双调用、改分辨率、
+ *    热更新都会。让引擎自己拥有画布，每次重建都是**新的一张**，这类问题整类消失。
+ *
+ * 尺寸变化优先走 `compositor.resize()`（见 `resize`），只有换引擎才换画布。
+ */
+export async function createPreviewEngine(
+  container: HTMLElement,
   width: number,
   height: number,
-): PreviewEngine {
-  let compositor: Compositor = createCanvas2DCompositor(width, height, canvas);
+): Promise<PreviewEngine> {
+  const canvas = document.createElement("canvas");
+  container.appendChild(canvas);
+  let created;
+  try {
+    created = await createCompositor(width, height, { target: canvas });
+  } catch (error) {
+    canvas.remove();
+    throw error;
+  }
+  const compositor: Compositor = created.compositor;
   const handles = new Map<string, SourceHandle>();
   /** sourceId → 代理 blob URL。有代理就用它，没有才回退原片。 */
   const proxies = new Map<string, string>();
@@ -197,8 +233,30 @@ export function createPreviewEngine(
     return { layers, active };
   }
 
+  /**
+   * 画一帧，丢了上下文就先救再画。
+   *
+   * 预览是**全场最老的那个** WebGL 上下文，切标签页、系统休眠、驱动重置都会
+   * 让它被收走；而 D15 量过：被上下文预算驱逐的那种救不回来。所以这里救得回来
+   * 就接着画，救不回来就**保持上一帧不动**而不是抛到 React 里——用户看到的是
+   * 画面停住，不是整个界面炸掉。真正的治本在导出侧不再抢上下文（D15）。
+   */
+  async function draw(layers: readonly ComposeLayer[]): Promise<void> {
+    try {
+      compositor.composeFrame(layers);
+    } catch (error) {
+      if (!compositor.isContextLost()) throw error;
+      if (await compositor.recover()) compositor.composeFrame(layers);
+    }
+  }
+
   return {
     canvas,
+    backend: created.backend,
+
+    resize(nextWidth, nextHeight) {
+      compositor.resize(nextWidth, nextHeight);
+    },
 
     async renderFrame(timeline, frame) {
       const { layers, active } = layersFor(timeline, frame);
@@ -212,7 +270,7 @@ export function createPreviewEngine(
       );
       // seek 期间 handle.ready 可能才变 true，重新收集一次
       const fresh = layersFor(timeline, frame);
-      compositor.composeFrame(fresh.layers.length > 0 ? fresh.layers : layers);
+      await draw(fresh.layers.length > 0 ? fresh.layers : layers);
     },
 
     renderLive(timeline, frame) {
@@ -230,7 +288,9 @@ export function createPreviewEngine(
           handle.video.currentTime = seekSeconds;
         }
       }
-      compositor.composeFrame(layers);
+      // 播放态不能 await（rAF 回调是同步的），丢了上下文就先画不出来，
+      // 由下一次 renderFrame（暂停/scrub）去救。播放中黑一下远好过卡住整个循环
+      if (!compositor.isContextLost()) compositor.composeFrame(layers);
     },
 
     async startPlayback(timeline, frame) {
@@ -267,11 +327,6 @@ export function createPreviewEngine(
       for (const handle of handles.values()) handle.video.pause();
     },
 
-    resize(nextWidth, nextHeight) {
-      compositor.dispose();
-      compositor = createCanvas2DCompositor(nextWidth, nextHeight, canvas);
-    },
-
     dispose() {
       playing = false;
       for (const handle of handles.values()) {
@@ -282,6 +337,9 @@ export function createPreviewEngine(
       }
       handles.clear();
       compositor.dispose();
+      // 画布是这个引擎建的，销毁时一并摘掉。**不能留着给下一个引擎用**——
+      // Pixi 销毁渲染器时丢掉了它的 GL 上下文，在这张画布上再建会死循环
+      canvas.remove();
     },
   };
 }

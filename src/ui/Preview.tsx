@@ -19,9 +19,13 @@ export function Preview({ disabled = false }: { readonly disabled?: boolean } = 
   const playhead = useTimeline((s) => s.playhead);
   const setPlayhead = useTimeline((s) => s.setPlayhead);
 
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  // 画布由引擎自己建（见 preview-engine 的工厂注释），这里只给它一个容器
+  const screenRef = useRef<HTMLDivElement>(null);
   const engineRef = useRef<PreviewEngine | null>(null);
   const [playing, setPlaying] = useState(false);
+  // 引擎是异步造出来的，就绪时得把"暂停态重画"那条 effect 重新踢一次，
+  // 否则首帧要等到用户下一次动播放头才出现
+  const [engineReady, setEngineReady] = useState(0);
 
   // 播放头的小数部分：不进 store，但必须保留，否则每帧取整会让播放偏慢
   const fractional = useRef(0);
@@ -30,17 +34,39 @@ export function Preview({ disabled = false }: { readonly disabled?: boolean } = 
 
   const hasContent = timeline.durationFrames > 0;
 
-  // 引擎跟随输出分辨率重建
+  // 引擎**只建一次**，分辨率变化走下面的 resize。
+  //
+  // 异步：Pixi 后端要动态 import + 初始化渲染器。依赖列表刻意为空——把
+  // width/height 放进来就会变成"改分辨率 = 销毁重建"，而重建要换画布、
+  // 顺带丢掉视频元素的解码状态（见 preview-engine 的工厂注释）
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    engineRef.current?.dispose();
-    engineRef.current = createPreviewEngine(canvas, timeline.width, timeline.height);
+    const container = screenRef.current;
+    if (!container) return;
+    let disposed = false;
+    const { width, height } = useTimeline.getState().timeline();
+
+    void createPreviewEngine(container, width, height).then((engine) => {
+      // 这一轮已经被清理掉了（严格模式的双调用、或组件卸载）：造出来的引擎
+      // 立刻还回去，否则它会攥着一个 WebGL 上下文不放，而上下文有预算（D15）
+      if (disposed) {
+        engine.dispose();
+        return;
+      }
+      engineRef.current = engine;
+      setEngineReady((n) => n + 1);
+    });
+
     return () => {
+      disposed = true;
       engineRef.current?.dispose();
       engineRef.current = null;
     };
-  }, [timeline.width, timeline.height]);
+  }, []);
+
+  // 分辨率变化：就地 resize，不重建引擎
+  useEffect(() => {
+    engineRef.current?.resize(timeline.width, timeline.height);
+  }, [engineReady, timeline.width, timeline.height]);
 
   // 暂停态：播放头或 EDL 变化就重画（scrub、逐帧、撤销、拖拽落下都会走到这里）
   useEffect(() => {
@@ -54,7 +80,7 @@ export function Preview({ disabled = false }: { readonly disabled?: boolean } = 
     return () => {
       cancelled = true;
     };
-  }, [hasContent, playhead, playing, timeline]);
+  }, [engineReady, hasContent, playhead, playing, timeline]);
 
   // 代理就绪 → 预览换用代理（seek 快一个量级），并立刻重画当前帧
   useEffect(
@@ -151,8 +177,7 @@ export function Preview({ disabled = false }: { readonly disabled?: boolean } = 
   return (
     <div className="stage">
       <div className="stage-wrap">
-        <div className="screen">
-          <canvas ref={canvasRef} />
+        <div className="screen" ref={screenRef}>
           {!hasContent && <div className="placeholder">导入素材后在此预览</div>}
         </div>
       </div>

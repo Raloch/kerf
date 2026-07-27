@@ -80,10 +80,12 @@ export interface PixiCompositorOptions {
 }
 
 export async function createPixiCompositor(
-  width: number,
-  height: number,
+  initialWidth: number,
+  initialHeight: number,
   options: PixiCompositorOptions = {},
 ): Promise<PixiCompositor> {
+  let width = initialWidth;
+  let height = initialHeight;
   const { target, preserveDrawingBuffer = true } = options;
   const pixi = await import("pixi.js");
 
@@ -94,10 +96,8 @@ export async function createPixiCompositor(
   }
 
   const canvas: OffscreenCanvas | HTMLCanvasElement = target ?? new OffscreenCanvas(width, height);
-  if (target) {
-    target.width = width;
-    target.height = height;
-  }
+  canvas.width = width;
+  canvas.height = height;
 
   const renderer: WebGLRenderer<ICanvas> = new pixi.WebGLRenderer<ICanvas>();
   await renderer.init({
@@ -177,9 +177,27 @@ export async function createPixiCompositor(
   };
 
   return {
-    width,
-    height,
+    get width() {
+      return width;
+    },
+    get height() {
+      return height;
+    },
     canvas,
+
+    /**
+     * 就地改尺寸。**必须就地，不能销毁重建**——`renderer.destroy()` 会
+     * `loseContext()`，同一张画布之后再 `init()` 会**死循环**（实测 Chrome 150，
+     * 标签页 100% CPU）。这是从 Canvas2D 迁过来时最容易踩的一条：那边
+     * "dispose 再 new 一个"完全没问题。
+     */
+    resize(nextWidth, nextHeight) {
+      if (nextWidth === width && nextHeight === height) return;
+      width = nextWidth;
+      height = nextHeight;
+      renderer.resize(nextWidth, nextHeight);
+    },
+
     debug: {
       managedTextureCount: () => renderer.texture.managedTextures.length,
       contextVersion: () => String(renderer.gl.getParameter(renderer.gl.VERSION)),

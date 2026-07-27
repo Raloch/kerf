@@ -40,11 +40,8 @@ import {
 } from "mediabunny";
 
 import { measureEncoderDelay, type EncoderDelay } from "../audio/encoder-delay";
-import {
-  createCanvas2DCompositor,
-  type ComposeLayer,
-  type Compositor,
-} from "../compose/compositor";
+import { createCompositor, type CompositorBackend } from "../compose/backend";
+import type { ComposeLayer, Compositor } from "../compose/compositor";
 import { residency, ResidencyTracker } from "./residency";
 import { rasterizeText, textRasterCacheBytes } from "../compose/text-raster";
 import { videoTracksInDrawOrder, visibleVideoClips } from "../edl/sampling";
@@ -283,6 +280,7 @@ export async function runExport(
       encodedFrames,
       elapsedMs: performance.now() - startedAt,
       audioIncluded: willWriteAudio,
+      backend: residentBackend,
       audioEncoderDelay: encoderDelay,
       bytesWritten: written.size,
       residency: {
@@ -336,21 +334,28 @@ let residentCompositor: Compositor | null = null;
 
 async function acquireCompositor(width: number, height: number): Promise<Compositor> {
   const existing = residentCompositor;
-  if (existing && existing.width === width && existing.height === height) {
+  if (existing) {
     // 上一次导出之后上下文可能已经没了（切标签页、休眠、驱动重置）。
-    // 救得回来就接着用，救不回来就当它不存在，下面重建
-    if (!existing.isContextLost() || (await existing.recover())) return existing;
-    existing.dispose();
-    residentCompositor = null;
-  } else if (existing) {
+    // 救得回来就接着用，救不回来才丢掉重建
+    if (!existing.isContextLost() || (await existing.recover())) {
+      // **尺寸变了就地 resize，不销毁重建**：Pixi 销毁渲染器会 loseContext()，
+      // 那张画布之后再建会死循环（见 compositor.ts 的 `resize`）。
+      // 导出侧每次新建 OffscreenCanvas 本来不会撞上，但没有理由留这个雷
+      existing.resize(width, height);
+      return existing;
+    }
     existing.dispose();
     residentCompositor = null;
   }
 
-  const created = createCanvas2DCompositor(width, height);
-  residentCompositor = created;
-  return created;
+  const created = await createCompositor(width, height);
+  residentCompositor = created.compositor;
+  residentBackend = created.backend;
+  return created.compositor;
 }
+
+/** 上一次造合成器用上的后端，报进导出结果供界面显示。 */
+let residentBackend: CompositorBackend = "canvas2d";
 
 /**
  * 放掉常驻合成器。

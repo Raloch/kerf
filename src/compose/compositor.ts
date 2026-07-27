@@ -142,6 +142,15 @@ export interface Compositor {
   readonly width: number;
   readonly height: number;
   /**
+   * 就地改输出尺寸。
+   *
+   * **不能用"销毁再建一个"代替**：Pixi 的 `renderer.destroy()` 会调
+   * `WEBGL_lose_context.loseContext()`，那张画布之后再也拿不到可用的 WebGL
+   * 上下文——而且第二次 `init()` 不报错，是**死循环**（实测 Chrome 150，
+   * 整个标签页 100% CPU 卡死）。所以尺寸变化必须走这条路。
+   */
+  resize(width: number, height: number): void;
+  /**
    * 供编码器捕获（导出）或直接显示（预览）的画布。
    *
    * **恢复上下文时这个引用不会变**——导出侧的 `CanvasSource` 在开始时就抓住了它，
@@ -184,16 +193,16 @@ export interface Compositor {
  * @param target 传入时直接画到这个可见画布（预览）；不传则新建 OffscreenCanvas（导出）。
  */
 export function createCanvas2DCompositor(
-  width: number,
-  height: number,
+  initialWidth: number,
+  initialHeight: number,
   target?: HTMLCanvasElement,
 ): Compositor {
+  let width = initialWidth;
+  let height = initialHeight;
   const canvas: OffscreenCanvas | HTMLCanvasElement = target ?? new OffscreenCanvas(width, height);
-  if (target) {
-    // 可见画布要按输出分辨率设置位图尺寸，CSS 再缩放显示，否则预览是模糊的
-    target.width = width;
-    target.height = height;
-  }
+  // 可见画布要按输出分辨率设置位图尺寸，CSS 再缩放显示，否则预览是模糊的
+  canvas.width = width;
+  canvas.height = height;
 
   const ctx = (canvas as HTMLCanvasElement).getContext("2d", {
     alpha: false,
@@ -201,9 +210,20 @@ export function createCanvas2DCompositor(
   if (!ctx) throw new Error("拿不到画布的 2D 上下文");
 
   return {
-    width,
-    height,
+    get width() {
+      return width;
+    },
+    get height() {
+      return height;
+    },
     canvas,
+
+    resize(nextWidth, nextHeight) {
+      width = nextWidth;
+      height = nextHeight;
+      canvas.width = nextWidth;
+      canvas.height = nextHeight;
+    },
 
     composeFrame(layers) {
       // 底色：源片比例与输出比例不一致时会露出来（letterbox）

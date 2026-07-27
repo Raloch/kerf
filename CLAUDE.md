@@ -7,7 +7,7 @@
 
 当前阶段：**M2 前半段已完成**——判别联合（**D8**）→ 图层变换（**D9**）→ 关键帧求值（**D10**）→ 接进两条路径 → 文字渲染（**D11**）→ 编辑界面（**D12**，同时还掉了 D10 那笔"裁入点要平移关键帧"的债）。之前：M1.5 导出闭环、M1.6 PixiJS 后端 spike（见 PLAN.md §7 M1.6 与 §6 的 D5）。
 
-下一步是 **M2 后半段**（滤镜 / LUT / shader 转场）。换 Pixi 后端的**两个前置已经做完**（2026-07-27）：合成器支持上下文丢失后恢复（`recover()`）、导出侧复用常驻合成器（Worker 也跟着常驻）。Safari 上 spike **18 项全绿**，原先那条阻塞项（上下文预算把预览判死）已解除。界面上还欠的三件小事（自定义字体、时间轴上的关键帧轨、文字阴影颜色）列在 PLAN.md §7 的 M2 小节。
+**Pixi 后端已经接进预览和导出**（2026-07-27，见 PLAN.md 的 **D16**）。之前的两个前置（`recover()`、导出复用常驻合成器）见 **D15**，Safari 上 spike 18 项全绿。真实拓扑（预览在主线程 + 导出在 Worker，各握一个 WebGL 上下文）连做 12 次导出在 Chrome 与 Safari 上都实测过，预览不掉。下一步是 **M2 后半段**的功能本身：滤镜 / LUT / shader 转场。界面上还欠的三件小事（自定义字体、时间轴上的关键帧轨、文字阴影颜色）列在 PLAN.md §7 的 M2 小节。
 
 ```bash
 pnpm dev          # 起开发服务器
@@ -73,6 +73,9 @@ pnpm build        # 构建
 - **栅格缓存按字节限流，不按条数**（`compose/raster-cache.ts`）。踩过：按 32 条卡，而每张栅格是**输出尺寸**的画布，1080p 下单张 7.9MB，32 条就是 253MB；条数上限对分辨率一无所知，而会爆的是字节。现在是 32MB 预算 + LRU + 保底 2 张。淘汰用 LRU 而不是"满了整体清空"，也不用"调用方每帧报可见列表"——后者是个忘了调也不报错的接口。理由见 **D13**。
 - **改断行要跑 `text-raster.test.ts` 的 23 项**。踩过的两个坑：逐字符判断"能不能断"在拉丁词中间超宽时退不回上一个空格，整个词会溢出；避尾只做"不在这里断"会让开括号卡在行中间而行照样超宽，必须**把断点前移**。切分用 `Intl.Segmenter` 按字素簇，不是码点——码点保得住代理对但保不住 ZWJ 合成的 emoji。
 - **关键帧求值在 `src/anim/keyframes.ts`，全程只用帧号，秒进不来**（所以它连帧率都不需要）。帧偏移**相对片段起点**，不是绝对时间轴帧号——因此裁入点时要平移关键帧。`resolveTransform` 在没有属性被动画时**必须原样返回 `base`（包括 `undefined`）**：返回 `{}` 会让所有静态图层集体掉出上面那条恒等快路径。理由和放弃过的方案见 PLAN.md 的 **D10**。
+- **选后端只有 `compose/backend.ts` 一处**（`createCompositor`）。预览和导出必须画得一样（硬规则 2），两边各写一遍 `try pixi catch canvas2d` 迟早会分叉，而分叉不报错——今天只是留边差 1px，接了滤镜就是"预览有效果、成片没有"。退回 Canvas2D 时 `backend` 会一路报到导出面板上。
+- **一张画布只能有一种上下文类型，而且 Pixi 销毁过渲染器的画布不能再用。** `renderer.destroy()` 会 `loseContext()`，之后在同一张画布上再 `init()` 会**死循环**（实测 Chrome 150，标签页 100% CPU，不抛错、不报警）。两条推论：**改分辨率要走 `compositor.resize()` 就地改，不能销毁重建**；**预览引擎自己建画布**（`createPreviewEngine(container, …)`），不接受外面传进来的——只要画布是外面的，React 严格模式的双调用、改分辨率、热更新迟早会撞上这个死循环。从 Canvas2D 迁过来最容易踩这条：那边"dispose 再 new 一个"完全没问题。
+- **自检里量预览画布要先 `drawImage` 到一张干净的 2D 画布上再量**，不能对引擎画布直接 `getContext("2d")`——接了 Pixi 之后那是 WebGL 画布，那句返回 null。
 - **`pixi-compositor.ts` 对 pixi.js 只有 `import type`**，实例走函数里的动态 `import()`。所以谁静态 import 它都不会把 Pixi 拖进自己的 chunk——这和 mediabunny 的"文件边界"模式不同，靠的是**异步工厂 + 同步 `composeFrame`**。
 - **Pixi 后端里临时 `VideoFrame` 必须在 `render()` 之后才 `close()`**。纹理上传发生在 render 期间；Canvas2D 的 `drawImage` 是立即的，所以那边"画完就关"是对的。从 Canvas2D 迁过来最容易踩这条，且不报错。
 - **每个图层一个常驻 `ImageSource`，逐帧只换 `resource` 再 `update()`**。每帧 `Texture.from(frame)` 会逐帧新建 GPU 纹理，导出慢一个量级。自检里"GPU 纹理数不随帧数增长"就是锁这条。
@@ -81,7 +84,7 @@ pnpm build        # 构建
 - **测吞吐要在一个 WebGL 上下文都没建过的时候测。** 带着残留上下文量到的是 GPU 内存压力，不是导出的常态。spike 里吞吐是**第 0 步**，别把它挪到后面去。
 - **Pixi 相对 Canvas2D 的耗时比值是"记账"，不是卡口。** 滤镜 / LUT / shader 转场在 Canvas2D 上根本做不了，所以"慢"的对立面不是"快"而是"没有这个功能"。那条断言（`SLOWDOWN_LIMIT = 2.5`）只抓数量级的结构性错误，已知的那一类是每帧 `Texture.from()` 新建纹理。实测 Chrome 0.93× / Safari 1.69×。
 - **锁 WebGL，不要 WebGPU**，也不要关 `preserveDrawingBuffer`（实测开销为零，见 PLAN.md §7 M1.6）。
-- **Pixi 后端目前不接在预览和导出上**，只被 spike 自检使用。要接进去先读 PLAN.md 的 D5。
+- **Pixi 后端已经接在预览和导出上了**（2026-07-27，D16）。`compose/pixi-compositor.ts` 仍然只被 `backend.ts` 引用，换/加后端从那一处改。
 
 ## 四个自检，改到相关地方就得跑
 

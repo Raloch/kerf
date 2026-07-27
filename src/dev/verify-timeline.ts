@@ -137,14 +137,19 @@ export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult>
   };
 
   // ---- 2. 预览路径：逐个取样帧渲染并测量 ----
-  const previewCanvas = document.createElement("canvas");
-  const engine = createPreviewEngine(previewCanvas, OUT_SIZE, OUT_SIZE);
+  const engine = await createPreviewEngine(document.createElement("div"), OUT_SIZE, OUT_SIZE);
   const previewBands = new Map<number, Bands>();
   try {
-    const pctx = previewCanvas.getContext("2d");
-    if (!pctx) throw new Error("预览画布没有 2D 上下文");
+    // 引擎画布接了 Pixi 之后是 WebGL 画布，不能直接 getContext("2d")——
+    // 一张画布只能有一种上下文类型。先 drawImage 到干净的 2D 画布上再量
+    const probe = document.createElement("canvas");
+    probe.width = OUT_SIZE;
+    probe.height = OUT_SIZE;
+    const pctx = probe.getContext("2d", { willReadFrequently: true });
+    if (!pctx) throw new Error("探测画布没有 2D 上下文");
     for (const p of PROBES) {
       await engine.renderFrame(timeline, p.frame);
+      pctx.drawImage(engine.canvas as CanvasImageSource, 0, 0);
       previewBands.set(p.frame, measure(pctx, OUT_SIZE, OUT_SIZE));
     }
   } finally {

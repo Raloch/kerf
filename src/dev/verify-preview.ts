@@ -193,16 +193,13 @@ export async function verifyPreviewMatchesExport(): Promise<PreviewVerifyResult>
   };
 
   // ---- 预览路径 ----
-  const previewCanvas = document.createElement("canvas");
-  const engine = createPreviewEngine(previewCanvas, OUT_SIZE, OUT_SIZE);
+  const engine = await createPreviewEngine(document.createElement("div"), OUT_SIZE, OUT_SIZE);
   let previewBands: Bands;
   try {
     // 不需要手动等待：renderFrame 内部会等素材就绪（ensureLoaded）。
     // 早先版本在这里 sleep 是无效的——video 元素是 renderFrame 时才按需创建的。
     await engine.renderFrame(timeline, PROBE_FRAME);
-    const pctx = previewCanvas.getContext("2d");
-    if (!pctx) throw new Error("预览画布没有 2D 上下文");
-    previewBands = measure(pctx, OUT_SIZE, OUT_SIZE);
+    previewBands = measureCanvas(engine.canvas as CanvasImageSource, OUT_SIZE);
   } finally {
     engine.dispose();
   }
@@ -314,13 +311,11 @@ export async function verifyPreviewMatchesExport(): Promise<PreviewVerifyResult>
   };
 
   const animatedPreview: Bands[] = [];
-  const engine2 = createPreviewEngine(document.createElement("canvas"), OUT_SIZE, OUT_SIZE);
+  const engine2 = await createPreviewEngine(document.createElement("div"), OUT_SIZE, OUT_SIZE);
   try {
-    const ctx = engine2.canvas.getContext("2d", { willReadFrequently: true });
-    if (!ctx) throw new Error("预览画布没有 2D 上下文");
     for (const frame of XFORM_PROBES) {
       await engine2.renderFrame(animated, frame);
-      animatedPreview.push(measure(ctx, OUT_SIZE, OUT_SIZE));
+      animatedPreview.push(measureCanvas(engine2.canvas as CanvasImageSource, OUT_SIZE));
     }
   } finally {
     engine2.dispose();
@@ -421,14 +416,13 @@ export async function verifyPreviewMatchesExport(): Promise<PreviewVerifyResult>
     ],
   };
 
-  const engine3 = createPreviewEngine(document.createElement("canvas"), OUT_SIZE, OUT_SIZE);
+  const engine3 = await createPreviewEngine(document.createElement("div"), OUT_SIZE, OUT_SIZE);
   let previewBg: Bands;
   let previewText: Bands;
   let previewFull: Bands;
   try {
-    const ctx = engine3.canvas.getContext("2d", { willReadFrequently: true });
-    if (!ctx) throw new Error("预览画布没有 2D 上下文");
     await engine3.renderFrame(titled, 0);
+    const ctx = probeContextOf(engine3.canvas as CanvasImageSource, OUT_SIZE);
     previewBg = measure(ctx, OUT_SIZE, OUT_SIZE, BG_REGION);
     previewText = measure(ctx, OUT_SIZE, OUT_SIZE, TEXT_REGION);
     previewFull = measure(ctx, OUT_SIZE, OUT_SIZE);
@@ -509,4 +503,26 @@ export async function verifyPreviewMatchesExport(): Promise<PreviewVerifyResult>
     preview: previewBands,
     exported: exportedBands,
   };
+}
+
+/**
+ * 把引擎画布上的内容读进一张 2D 探测画布再量。
+ *
+ * **不能直接对引擎画布 `getContext("2d")`**：接了 Pixi 后端之后那是一张 WebGL
+ * 画布，一张画布只能有一种上下文类型，那句会返回 null（或在别的浏览器上抛错）。
+ * 先 `drawImage` 到一张干净的 2D 画布上，量的还是同一批像素。
+ */
+function probeContextOf(source: CanvasImageSource, size: number): CanvasRenderingContext2D {
+  const probe = document.createElement("canvas");
+  probe.width = size;
+  probe.height = size;
+  const ctx = probe.getContext("2d", { willReadFrequently: true });
+  if (!ctx) throw new Error("探测画布没有 2D 上下文");
+  ctx.drawImage(source, 0, 0);
+  return ctx;
+}
+
+/** 分区测量要在同一份快照上量多次，所以拆成上面那个取上下文 + 这个便捷版。 */
+function measureCanvas(source: CanvasImageSource, size: number): Bands {
+  return measure(probeContextOf(source, size), size, size);
 }
