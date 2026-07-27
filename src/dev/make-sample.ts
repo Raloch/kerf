@@ -25,6 +25,15 @@ export interface SampleOptions {
   readonly fps?: Rational;
   readonly durationFrames?: number;
   readonly withAudio?: boolean;
+  /**
+   * 音频长什么样。
+   *
+   * - `beeps`（缺省）：每秒一声 1kHz 短提示音，其余静音。**M0 自检第 17 项**
+   *   （成片与素材的第一声位置差）靠的就是这个稀疏的起始沿，不要动它。
+   * - `tone`：全程等幅 1kHz 连续音。量**增益包络**只能用它——稀疏提示音在
+   *   半秒的淡化窗口里可能一声都没有，那时 RMS 全是 0，断言测的是运气。
+   */
+  readonly audioShape?: "beeps" | "tone";
 }
 
 export interface GeneratedSample {
@@ -88,7 +97,7 @@ export async function makeSampleVideo(options: SampleOptions = {}): Promise<Gene
   }
 
   if (audioSource) {
-    // 每秒一声 1kHz 短提示音，导出后可听出音画是否对齐
+    const shape = options.audioShape ?? "beeps";
     const sampleRate = 48_000;
     const totalSeconds = frameToSeconds(frames, fps);
     const length = Math.ceil(totalSeconds * sampleRate);
@@ -97,8 +106,9 @@ export async function makeSampleVideo(options: SampleOptions = {}): Promise<Gene
     const data = buffer.getChannelData(0);
     for (let n = 0; n < length; n++) {
       const t = n / sampleRate;
-      const inBeep = t % 1 < 0.08;
-      data[n] = inBeep ? Math.sin(2 * Math.PI * 1000 * t) * 0.25 : 0;
+      // beeps：每秒一声 1kHz 短提示音，导出后可听出音画是否对齐
+      const on = shape === "tone" || t % 1 < 0.08;
+      data[n] = on ? Math.sin(2 * Math.PI * 1000 * t) * 0.25 : 0;
     }
     await audioSource.add(buffer);
   }

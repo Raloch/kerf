@@ -11,6 +11,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { clipDuration, type Clip, type Timeline as Tl, type Track, type TrackId } from "../edl/types";
 import { trackTransitionWindows } from "../edl/transition";
+import { TRANSITION_LABELS } from "../state/operations";
 import { framesToTimecode, secondsToFrameCount } from "../time/timebase";
 import { toNumber } from "../time/rational";
 import { useTimeline } from "../state/timeline-store";
@@ -322,18 +323,20 @@ function TrackRow({
             proxyUrl={clip.kind === "media" ? proxyUrls[clip.sourceId] : undefined}
           />
         ))}
-        {track.kind === "video" &&
-          trackTransitionWindows(track.clips).map((w) => (
-            <div
-              key={`tr-${w.to.id}`}
-              className="tr-mark"
-              title={`${w.frames} 帧交叉溶解`}
-              style={{
-                left: `${w.startFrame * pxPerFrame}px`,
-                width: `${w.frames * pxPerFrame}px`,
-              }}
-            />
-          ))}
+        {/* 声音转场同样要标出来：窗口跨过剪切点，用户得能看见它占了哪一段。
+            名字从 TRANSITION_LABELS 取，不写死——写死过一次「交叉溶解」，
+            结果擦除和推移的提示也都说自己是溶解 */}
+        {trackTransitionWindows(track.clips).map((w) => (
+          <div
+            key={`tr-${w.to.id}`}
+            className="tr-mark"
+            title={`${w.frames} 帧${TRANSITION_LABELS[w.kind]}`}
+            style={{
+              left: `${w.startFrame * pxPerFrame}px`,
+              width: `${w.frames * pxPerFrame}px`,
+            }}
+          />
+        ))}
         {ghost && <GhostView ghost={ghost} pxPerFrame={pxPerFrame} />}
       </div>
     </div>

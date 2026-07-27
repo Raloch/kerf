@@ -39,12 +39,14 @@ import {
   type MediaClip,
   type TextClip,
   type Timeline,
+  type Track,
   type TransitionKind,
 } from "../edl/types";
 import {
   findClip,
   isColorProperty,
   junctionInfo,
+  DEFAULT_TRANSITION_KIND,
   PROPERTY_LABELS,
   PROPERTY_RANGES,
   TRANSITION_LABELS,
@@ -216,10 +218,10 @@ export function Inspector() {
         <SourceSection clip={clip} timeline={timeline} />
       )}
 
-      {/* 音频片段没有画面，转场、变换和调色对它都没有意义 */}
+      {/* 转场两种轨道都有（画面混像素、声音混增益）；变换和调色只有画面才有意义 */}
+      <TransitionSection clip={clip} track={track} timeline={timeline} />
       {track.kind === "video" && (
         <>
-          <TransitionSection clip={clip} timeline={timeline} />
           <PropertySection group="transform" clip={clip} playhead={playhead} />
           <PropertySection group="color" clip={clip} playhead={playhead} />
         </>
@@ -264,22 +266,30 @@ const DEFAULT_TRANSITION_FRAMES = 16;
  *
  * 三件事只在这里说，因为它们只有解算之后才知道，而用户输入的时长推不出来：
  * 前面有没有紧邻片段（没有就整节禁用）、**实际**窗口多长（会被两侧片段各自的
- * 一半夹住）、以及素材余量不够时两侧各定格几帧。最后一条是刻意要显眼的——
- * 定格是画面上看得见的降级，看得见的降级要标注（见 `edl/transition.ts` 文件头）。
+ * 一半夹住）、以及素材余量不够时两侧各短缺几帧。最后一条是刻意要显眼的——
+ * 它是看得见（听得见）的降级，那种降级要标注（见 `edl/transition.ts` 文件头）。
+ *
+ * 可选的种类**按轨道分组**（`TRANSITION_ORDER[track.kind]`），不在这里另列名单：
+ * 漏一种的表现是"新加的曲线选不到"，而那不报错。余量不足的后果两种轨道不同
+ * （定格 vs 静音），所以只有措辞在这里分岔，数字仍由 `junctionInfo` 给。
  */
 function TransitionSection({
   clip,
+  track,
   timeline,
 }: {
   readonly clip: Clip;
+  readonly track: Track;
   readonly timeline: Timeline;
 }) {
   const setTransition = useTimeline((s) => s.setTransition);
   const info = junctionInfo(timeline, clip.id);
   if (!info) return null;
 
-  const { previous, transition, effectiveFrames, frozen } = info;
-  const frozenTotal = frozen.from + frozen.to;
+  const { previous, transition, effectiveFrames, shortfall } = info;
+  const shortfallTotal = shortfall.from + shortfall.to;
+  const kinds = TRANSITION_ORDER[track.kind];
+  const audio = track.kind === "audio";
 
   return (
     <>
@@ -299,7 +309,7 @@ function TransitionSection({
                   })
                 }
               >
-                {TRANSITION_ORDER.map((kind) => (
+                {kinds.map((kind) => (
                   <option key={kind} value={kind}>
                     {TRANSITION_LABELS[kind]}
                   </option>
@@ -317,12 +327,12 @@ function TransitionSection({
               title={previous ? "" : "前面没有紧邻的片段"}
               onClick={() =>
                 setTransition(clip.id, {
-                  kind: "dissolve",
+                  kind: DEFAULT_TRANSITION_KIND[track.kind],
                   frames: DEFAULT_TRANSITION_FRAMES,
                 })
               }
             >
-              添加交叉溶解
+              {audio ? "添加交叉淡化" : "添加交叉溶解"}
             </button>
           )}
         </div>
@@ -362,16 +372,22 @@ function TransitionSection({
           自己长度的一半。
         </p>
       )}
-      {frozenTotal > 0 && (
+      {shortfallTotal > 0 && (
         <p className="hint err">
           {"素材余量不足，转场里"}
           {[
-            frozen.from > 0 ? `前一段末尾定格 ${frozen.from} 帧` : null,
-            frozen.to > 0 ? `这一段开头定格 ${frozen.to} 帧` : null,
+            shortfall.from > 0
+              ? `前一段末尾${audio ? "静音" : "定格"} ${shortfall.from} 帧`
+              : null,
+            shortfall.to > 0
+              ? `这一段开头${audio ? "静音" : "定格"} ${shortfall.to} 帧`
+              : null,
           ]
             .filter(Boolean)
             .join("、")}
-          {"。把两侧的入/出点各往里裁一些就能拿回真实画面。"}
+          {audio
+            ? "，交叉淡化会退化成单侧淡入/淡出。把两侧的入/出点各往里裁一些就能拿回真实声音。"
+            : "。把两侧的入/出点各往里裁一些就能拿回真实画面。"}
         </p>
       )}
     </>

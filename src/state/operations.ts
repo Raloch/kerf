@@ -30,6 +30,7 @@ import type { LayerTransform } from "../compose/compositor";
 import type { TextStyle } from "../compose/text-raster";
 import {
   clipDuration,
+  transitionFitsTrack,
   type Clip,
   type ClipId,
   type LutId,
@@ -129,13 +130,20 @@ export function computeDuration(tracks: readonly Track[]): number {
  *
  * 只在**相邻关系断掉**时清，不因为"片段太短、窗口解不出来"而清——后者是可恢复的
  * （把片段拉长转场就回来了），和关键帧被平移到片段外仍然保留是同一个道理。
+ *
+ * 顺带兜住"种类和轨道对不上"：画面转场描述像素怎么混，音频轨上没有像素
+ * （见 `edl/types.ts` 的 `transitionFitsTrack`）。片段不能跨轨道种类拖，
+ * 所以这一条实际拦不到东西——它防的是将来某个新编辑操作忘了校验。
  */
 function dropOrphanTransitions(sorted: readonly Clip[], kind: TrackKind): Clip[] {
   return sorted.map((clip, i) => {
-    if (!clip.transitionIn) return clip;
+    const transition = clip.transitionIn;
+    if (!transition) return clip;
     const prev = i > 0 ? sorted[i - 1] : undefined;
-    // 音频轨上的转场没有意义（混音走的是另一条路径），一并清掉
-    const live = kind === "video" && prev !== undefined && prev.timelineOut === clip.timelineIn;
+    const live =
+      prev !== undefined &&
+      prev.timelineOut === clip.timelineIn &&
+      transitionFitsTrack(transition.kind, kind);
     return live ? clip : setOptional(clip, "transitionIn", undefined);
   });
 }
@@ -666,18 +674,23 @@ export interface JunctionInfo {
   readonly transition: Transition | null;
   /** 按当前时长解算出的实际窗口长度（帧）；解不出来是 0。 */
   readonly effectiveFrames: number;
-  /** 出场侧、入场侧各有多少帧只能定格（素材余量不足）。 */
-  readonly frozen: { readonly from: number; readonly to: number };
+  /**
+   * 出场侧、入场侧各有多少帧读不到真实素材。
+   *
+   * 后果按轨道分岔：画面轨上定格边缘帧，音频轨上静音。见 `junctionInfo`。
+   */
+  readonly shortfall: { readonly from: number; readonly to: number };
 }
 
 /**
  * 给片段的入点加上（或改掉、或摘掉）转场。`transition` 传 `undefined` 表示摘掉。
  *
  * 拒绝的两种情况都是**结构性**的、改时长也救不回来：没有紧邻前驱（时间轴开头，
- * 或前面是空档），以及片段在音频轨上（混音是另一条路径，画面转场对它没有意义）。
+ * 或前面是空档），以及种类和轨道对不上（画面转场混像素，音频轨上没有像素——
+ * 静默按交叉淡化渲染是硬规则 10 那种"选了 A 拿到 B"，见 `audio/crossfade.ts`）。
  *
  * **不因为"素材余量不足"而拒绝**：最常见的用法恰恰是两段满长素材相邻，那时
- * 两侧一帧余量都没有。那种情况按定格处理并把帧数报到界面上，理由见
+ * 两侧一帧余量都没有。那种情况画面定格、声音静音，并把帧数报到界面上，理由见
  * `edl/transition.ts` 的文件头。
  */
 export function setTransition(
@@ -690,7 +703,14 @@ export function setTransition(
   if (found.track.locked) return reject(timeline, "轨道已锁定");
 
   if (transition !== undefined) {
-    if (found.track.kind !== "video") return reject(timeline, "音频轨上没有画面转场");
+    if (!transitionFitsTrack(transition.kind, found.track.kind)) {
+      return reject(
+        timeline,
+        found.track.kind === "audio"
+          ? "音频轨上只能加声音转场（交叉淡化）"
+          : "画面轨上只能加画面转场",
+      );
+    }
     if (!previousClip(found.track, found.clip)) {
       return reject(timeline, "这个片段前面没有紧邻的片段，无法添加转场");
     }
@@ -725,18 +745,25 @@ export function previousClip(track: Track, clip: Clip): Clip | null {
 }
 
 /**
- * 交界的完整状态。界面拿它决定"能不能加""实际多长""要不要提示定格"。
+ * 交界的完整状态。界面拿它决定"能不能加""实际多长""要不要提示余量不足"。
  *
- * 定格帧数在这里算而不是在界面上算：它要用 `transitionWindow` 解出来的**实际**
+ * 短缺帧数在这里算而不是在界面上算：它要用 `transitionWindow` 解出来的**实际**
  * 窗口，而实际窗口会被两侧片段各自的一半夹住——界面按用户输入的时长去推，
  * 提示的数字就会和画面对不上，那比不提示更坏。
+ *
+ * `shortfall` 的**后果按轨道种类分岔**：画面轨上是定格边缘帧，音频轨上是静音
+ * （按住最后一个采样点会得到直流台阶，松开是"啪"的一声，比静音坏得多，见
+ * `audio/mix-plan.ts`）。数字是同一个，措辞由界面按 `track.kind` 决定——
+ * 在这里就分成两个字段的话，两条分支里总有一条永远是 0，读的人要先想清楚
+ * 自己在看哪一条。音频轨上这个数是**近似**：它按视频轨时长算（硬规则 8），
+ * 而音轨长度可能差几帧。作为"要不要往里裁一点"的提示足够了。
  */
 export function junctionInfo(timeline: Timeline, clipId: ClipId): JunctionInfo | null {
   const found = findClip(timeline, clipId);
   if (!found) return null;
   const previous = previousClip(found.track, found.clip);
   const transition = found.clip.transitionIn ?? null;
-  const empty = { previous, transition, effectiveFrames: 0, frozen: { from: 0, to: 0 } };
+  const empty = { previous, transition, effectiveFrames: 0, shortfall: { from: 0, to: 0 } };
   if (!previous || !transition) return empty;
 
   const window = transitionWindow(previous, found.clip, transition);
@@ -745,7 +772,7 @@ export function junctionInfo(timeline: Timeline, clipId: ClipId): JunctionInfo |
     previous,
     transition,
     effectiveFrames: window.frames,
-    frozen: {
+    shortfall: {
       from: frozenFrames(window, "from", sourceFramesOf(timeline, previous)),
       to: frozenFrames(window, "to", sourceFramesOf(timeline, found.clip)),
     },
@@ -764,10 +791,28 @@ export const TRANSITION_LABELS: Record<TransitionKind, string> = {
   wipe: "线性擦除",
   iris: "圆形张开",
   slide: "推移",
+  // 「交叉淡化」这四个字由分组标题和添加按钮给足了上下文，下拉里只留区分点——
+  // 写全名是 9 个字，实测把 112px 的下拉撑到 124px 并截断（画面那组都是 4 个字）
+  "xfade-power": "等功率淡化",
+  "xfade-linear": "等增益淡化",
 };
 
-/** 界面上按这个顺序排。溶解在最前——它是唯一不需要 GPU 的那个。 */
-export const TRANSITION_ORDER: readonly TransitionKind[] = ["dissolve", "wipe", "iris", "slide"];
+/**
+ * 界面上按轨道种类给不同的一组，顺序即列表顺序。
+ *
+ * 画面组里溶解在最前——它是唯一不需要 GPU 的。声音组里等功率在最前，它对
+ * "两段不同的声音"是对的，而那是绝大多数剪辑点（见 `audio/crossfade.ts`）。
+ */
+export const TRANSITION_ORDER: Record<TrackKind, readonly TransitionKind[]> = {
+  video: ["dissolve", "wipe", "iris", "slide"],
+  audio: ["xfade-power", "xfade-linear"],
+};
+
+/** 新建转场时给哪一种。和 `TRANSITION_ORDER` 的第一项一致。 */
+export const DEFAULT_TRANSITION_KIND: Record<TrackKind, TransitionKind> = {
+  video: "dissolve",
+  audio: "xfade-power",
+};
 
 /**
  * 改片段的**静态**调色。与 `setClipTransform` 完全同构，见其注释。

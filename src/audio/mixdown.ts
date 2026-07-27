@@ -37,9 +37,11 @@
 
 import { ALL_FORMATS, AudioSampleSink, BlobSource, Input } from "mediabunny";
 import type { RenderRange, Timeline } from "../edl/types";
-import { microsToSeconds, sourceMicrosAt } from "../edl/sampling";
+import { microsToSeconds } from "../edl/sampling";
 import { residency } from "../export/residency";
 import { frameToMicros } from "../time/timebase";
+import { crossfadeCurve } from "./crossfade";
+import { planAudioJobs, type AudioJob } from "./mix-plan";
 
 /** AudioBuffer 的字节数：f32，每声道每帧 4 字节。 */
 function bufferBytes(buffer: AudioBuffer): number {
@@ -144,39 +146,10 @@ export async function mixdown(
   const totalFrames = range.outFrame - range.inFrame;
   if (totalFrames <= 0) return null;
 
-  // 收集所有与导出区间相交的音频片段
-  const jobs: {
-    readonly whenSeconds: number;
-    readonly file: File;
-    readonly srcStartSeconds: number;
-    readonly srcEndSeconds: number;
-  }[] = [];
-
-  for (const track of timeline.tracks) {
-    if (track.kind !== "audio" || track.muted) continue;
-    for (const clip of track.clips) {
-      // 文字片段没有声音——落到音频轨上是类型允许但 UI 造不出来的组合
-      if (clip.kind !== "media") continue;
-      const visibleIn = Math.max(clip.timelineIn, range.inFrame);
-      const visibleOut = Math.min(clip.timelineOut, range.outFrame);
-      if (visibleOut <= visibleIn) continue;
-      const source = timeline.sources.find((s) => s.id === clip.sourceId);
-      if (!source || !source.hasAudio) continue;
-
-      jobs.push({
-        whenSeconds: microsToSeconds(frameToMicros(visibleIn - range.inFrame, timeline.fps)),
-        file: source.file,
-        srcStartSeconds: microsToSeconds(
-          sourceMicrosAt(clip, visibleIn, timeline.fps, source.fps),
-        ),
-        srcEndSeconds: microsToSeconds(
-          sourceMicrosAt(clip, visibleOut, timeline.fps, source.fps),
-        ),
-      });
-    }
-  }
-
+  // 解码区间、起播时刻、增益包络全部由纯函数排好，这里只负责接线（见 mix-plan.ts）
+  const jobs = planAudioJobs(timeline, range);
   if (jobs.length === 0) return null;
+  const fileOf = new Map(timeline.sources.map((s) => [s.id, s.file] as const));
 
   const totalSeconds = microsToSeconds(frameToMicros(totalFrames, timeline.fps));
   const frameCount = Math.max(1, Math.round(totalSeconds * MIX_SAMPLE_RATE));
@@ -187,14 +160,17 @@ export async function mixdown(
   // 挂上音频图的解码结果在渲染完成前都不能释放，这里记着好在渲染后一次性还掉
   let scheduledBytes = 0;
   for (const job of jobs) {
-    const pcm = await decodeRange(job.file, job.srcStartSeconds, job.srcEndSeconds);
+    const file = fileOf.get(job.sourceId);
+    const pcm = file
+      ? await decodeRange(file, job.srcStartSeconds, job.srcEndSeconds)
+      : null;
     decoded++;
     onProgress?.(decoded / jobs.length);
     if (!pcm) continue;
 
     const node = ctx.createBufferSource();
     node.buffer = pcm;
-    node.connect(ctx.destination);
+    node.connect(envelopeInput(ctx, job));
     // 采样率不同由音频图重采样，单声道由音频图上混到立体声——都不用我们插手
     node.start(job.whenSeconds);
     scheduled++;
@@ -237,11 +213,47 @@ export async function mixdown(
 }
 
 /**
+ * 这个片段该接到哪儿：没有淡化就直接接总线，有淡化就穿一个排好程的 `GainNode`。
+ *
+ * **恒等增益走原路径**，和合成层 `isDefaultGeometry` / `isDefaultColor` 完全同构
+ * （CLAUDE.md 合成层约定）。这里也不是性能优化：多一级节点意味着多一次浮点乘法，
+ * 而没有转场的项目应该和加这个功能之前**逐样本一模一样**——否则 M0 自检里那条
+ * "成片与素材的第一声位置差"就会开始漂，而漂的原因和转场毫无关系。
+ *
+ * 两段包络可以直接顺序喂给同一个 `AudioParam`：D19 保证一个片段两侧的转场窗口
+ * **永不重叠**（每个片段最多借出自己长度的一半），所以 `setValueCurveAtTime`
+ * 不会撞上"曲线区间重叠"那个抛错。这条结构性保证在这里第二次收到回报。
+ */
+function envelopeInput(ctx: OfflineAudioContext, job: AudioJob): AudioNode {
+  if (job.ramps.length === 0 && job.baseGain === 1) return ctx.destination;
+
+  const gain = ctx.createGain();
+  gain.gain.setValueAtTime(job.baseGain, 0);
+  for (const ramp of job.ramps) {
+    const curve = crossfadeCurve(
+      ramp.kind,
+      ramp.role,
+      ramp.fromProgress,
+      ramp.toProgress,
+      ramp.points,
+    );
+    gain.gain.setValueCurveAtTime(curve, ramp.startSeconds, ramp.durationSeconds);
+  }
+  gain.connect(ctx.destination);
+  return gain;
+}
+
+/**
  * 解出某文件 [start, end) 区间的音频，按源片自身的采样率和声道数返回。
  *
  * 按 `sample.timestamp` 把每个解码块写到正确的偏移上，而不是顺序追加：
  * 音频包边界几乎不会正好落在区间端点上，顺序追加会让整段音频整体前移几毫秒，
  * 多个片段各偏一点，最终表现为音画不同步。
+ *
+ * **区间允许伸出源片两端**（转场借余量时必然如此，见 `mix-plan.ts` 文件头）。
+ * 缓冲区按请求的完整长度开，解不到的那部分留成零 = 静音。所以这里向解码器要的
+ * 是夹紧过的区间，而写回的偏移仍按**未夹紧**的起点算——两者用同一个 `startSeconds`
+ * 会让前半段静音被吃掉，表现是入场那一侧的淡入整体提前，听起来像转场没对齐。
  */
 async function decodeRange(
   file: File,
@@ -263,7 +275,7 @@ async function decodeRange(
     });
 
     const sink = new AudioSampleSink(track);
-    for await (const sample of sink.samples(startSeconds, endSeconds)) {
+    for await (const sample of sink.samples(Math.max(0, startSeconds), endSeconds)) {
       try {
         const buffer = sample.toAudioBuffer();
         let dstOffset = Math.round((sample.timestamp - startSeconds) * rate);

@@ -9,6 +9,7 @@
  */
 
 import { COLOR_PROPERTIES, type KeyframeChannels } from "../anim/keyframes";
+import { isAudioTransitionKind, type AudioTransitionKind } from "../audio/crossfade";
 import type { ColorAdjust } from "../compose/color";
 import type { LayerTransform } from "../compose/compositor";
 import type { TextStyle } from "../compose/text-raster";
@@ -51,7 +52,7 @@ export interface LutSource {
 export type TrackKind = "video" | "audio";
 
 /**
- * 转场的种类。
+ * 画面转场的种类。描述的是**像素**怎么混。
  *
  * `dissolve` 走既有的图层不透明度通道（入场层画在出场层之上、alpha = 进度），
  * 因此**两个后端都画得出来、不需要任何新的合成能力**。
@@ -61,7 +62,43 @@ export type TrackKind = "video" | "audio";
  * 另写一份"哪些算 shader 转场"的名单——漏一种的表现是导出闸门放行，用户拿到
  * 一个转场变成硬切的成片）。
  */
-export type TransitionKind = "dissolve" | "wipe" | "iris" | "slide";
+export type VideoTransitionKind = "dissolve" | "wipe" | "iris" | "slide";
+
+/** 声音转场的种类，定义在 `audio/crossfade.ts`（曲线和它的语义在一起）。 */
+export type { AudioTransitionKind };
+
+/**
+ * 转场的种类。**分画面组和声音组，由轨道种类决定哪一组合法。**
+ *
+ * 时间模型（窗口在哪、多长、余量够不够）两组完全共用，见 `edl/transition.ts`；
+ * 分岔只发生在"这一刻拿这个进度干什么"——画面是混像素，声音是乘增益。
+ *
+ * 不合成一组用"音频轨上就按交叉淡化渲染"糊过去：那样用户能在音频轨上选中
+ * 「圆形张开」，然后拿到一段听起来完全正常、但和他选的东西毫无关系的声音。
+ * 同硬规则 10。校验有两道——`setTransition` 挡住编辑入口，`dropOrphanTransitions`
+ * 在每次改动后兜底（片段不能跨轨道种类拖，所以第二道纯粹是不信任第一道）。
+ */
+export type TransitionKind = VideoTransitionKind | AudioTransitionKind;
+
+/**
+ * 这个种类只能挂在音频轨上。
+ *
+ * 从 `audio/crossfade.ts` 再导出而不是在这里另列一份名单：加一种淡化曲线时
+ * 漏改这里的表现是"能选、但被归一化当成画面转场清掉"，而清掉是静默的。
+ */
+export function isAudioTransition(kind: TransitionKind): kind is AudioTransitionKind {
+  return isAudioTransitionKind(kind);
+}
+
+/** 这个种类只能挂在画面轨上。 */
+export function isVideoTransition(kind: TransitionKind): kind is VideoTransitionKind {
+  return !isAudioTransitionKind(kind);
+}
+
+/** 这个种类挂在这种轨道上合法吗。**归一化和编辑入口都问这一个函数。** */
+export function transitionFitsTrack(kind: TransitionKind, track: TrackKind): boolean {
+  return isAudioTransitionKind(kind) === (track === "audio");
+}
 
 /**
  * 挂在两个**紧邻**片段交界上的转场。

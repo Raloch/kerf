@@ -916,11 +916,34 @@ describe("setTransition", () => {
     expect(r.changed).toBe(false);
   });
 
-  it("音频轨上拒绝", () => {
-    const tl = timeline([
-      { id: "A1", kind: "audio", clips: [clip("a", 0, 100), clip("b", 100, 200)] },
+  const audioAdjacent = () =>
+    timeline([
+      { id: "A1", kind: "audio", clips: [clip("a", 0, 100), clip("b", 100, 200, 100)] },
     ]);
-    expect(setTransition(tl, "b", dissolve(20)).changed).toBe(false);
+  const xfade = (frames: number): Transition => ({ kind: "xfade-power", frames });
+
+  it("画面转场落在音频轨上拒绝——那上面没有像素可混", () => {
+    const r = setTransition(audioAdjacent(), "b", dissolve(20));
+    expect(r.changed).toBe(false);
+    expect(r.reason).toContain("声音转场");
+  });
+
+  it("声音转场落在画面轨上也拒绝——两个方向都要挡", () => {
+    const r = setTransition(adjacent(), "b", xfade(20));
+    expect(r.changed).toBe(false);
+    expect(r.reason).toContain("画面转场");
+  });
+
+  it("音频轨上加交叉淡化", () => {
+    const r = setTransition(audioAdjacent(), "b", xfade(20));
+    expect(r.changed).toBe(true);
+    expect(findClip(r.timeline, "b")?.clip.transitionIn).toEqual(xfade(20));
+  });
+
+  it("两种淡化曲线可以互换，不会被当成「值没变」", () => {
+    const power = setTransition(audioAdjacent(), "b", xfade(20)).timeline;
+    const linear = setTransition(power, "b", { kind: "xfade-linear", frames: 20 });
+    expect(linear.changed).toBe(true);
   });
 
   it("时长越界拒绝并给出范围", () => {
@@ -995,6 +1018,39 @@ describe("转场的孤儿清理", () => {
     expect(findClip(r.timeline, "b")?.clip.transitionIn).toEqual(dissolve(20));
   });
 
+  it("种类和轨道对不上时清掉——画面转场混的是像素，音频轨上没有", () => {
+    // 只有绕过 setTransition 直接造 EDL 才到得了这个状态（片段不能跨轨道种类拖），
+    // 所以这条兜的是"将来某个新编辑操作忘了校验"
+    const tl = timeline([
+      {
+        id: "A1",
+        kind: "audio",
+        clips: [clip("a", 0, 100), { ...clip("b", 100, 200, 100), transitionIn: dissolve(20) }],
+      },
+    ]);
+    // withClips 在任意一次编辑后归一化，这里借移动触发
+    const r = moveClip(tl, "a", 0, { toTrack: "A1" });
+    expect(findClip(r.timeline, "b")?.clip.transitionIn).toBeUndefined();
+  });
+
+  it("声音转场在音频轨上不会被清掉", () => {
+    const tl = timeline([
+      {
+        id: "A1",
+        kind: "audio",
+        clips: [
+          clip("a", 0, 100),
+          { ...clip("b", 100, 200, 100), transitionIn: { kind: "xfade-power", frames: 20 } },
+        ],
+      },
+    ]);
+    const r = trimClip(tl, "a", "in", 10);
+    expect(findClip(r.timeline, "b")?.clip.transitionIn).toEqual({
+      kind: "xfade-power",
+      frames: 20,
+    });
+  });
+
   it("相邻关系还在时不清——只是片段太短解不出窗口也保留", () => {
     // B 只有 2 帧，20 帧的转场解出来只剩 2 帧，但字段要留着
     const tl = timeline([
@@ -1028,7 +1084,7 @@ describe("junctionInfo", () => {
     ]);
     expect(junctionInfo(tl, "b")).toMatchObject({
       effectiveFrames: 20,
-      frozen: { from: 0, to: 0 },
+      shortfall: { from: 0, to: 0 },
     });
   });
 
@@ -1045,7 +1101,7 @@ describe("junctionInfo", () => {
     );
     expect(junctionInfo(tl, "b")).toMatchObject({
       effectiveFrames: 20,
-      frozen: { from: 10, to: 10 },
+      shortfall: { from: 10, to: 10 },
     });
   });
 
