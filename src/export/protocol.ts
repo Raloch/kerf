@@ -17,6 +17,7 @@
 import type { Rational } from "../time/rational";
 import type { ContainerChoice } from "../media/capability";
 import type { RenderRange, Timeline } from "../edl/types";
+import type { EncoderDelay } from "../audio/encoder-delay";
 import type { MixedAudio } from "../audio/mixdown";
 import type { ResidencyReport, ResidencySnapshot } from "./residency";
 import type { WriteTargetSpec } from "./write-target";
@@ -77,6 +78,12 @@ export interface ExportDone {
   readonly encodedFrames: number;
   readonly elapsedMs: number;
   readonly audioIncluded: boolean;
+  /**
+   * 这次导出补偿掉的编码器 priming（样本数）。**不是可选的诊断信息**：它意味着
+   * 音轨头部有这么长一段被丢弃了（AAC 约 44ms），也意味着没补成时成片会整体
+   * 晚这么多。`reason` 非空就是没测出来、退回了未补偿的行为。见 `audio/encoder-delay.ts`。
+   */
+  readonly audioEncoderDelay: EncoderDelay;
   readonly bytesWritten: number;
   readonly residency: ExportResidency;
   /**

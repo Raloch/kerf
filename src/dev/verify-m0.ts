@@ -8,7 +8,14 @@
  * 音轨丢失这些问题都不会让导出报错，只会静默产出错误的片子。
  */
 
-import { ALL_FORMATS, BlobSource, Input, VideoSampleSink } from "mediabunny";
+import {
+  ALL_FORMATS,
+  AudioSampleSink,
+  BlobSource,
+  Input,
+  VideoSampleSink,
+  type InputAudioTrack,
+} from "mediabunny";
 import { makeSampleVideo } from "./make-sample";
 import { probeFile } from "../media/probe";
 import { startExport } from "../export/client";
@@ -185,6 +192,39 @@ export async function verifyM0(options: VerifyOptions = {}): Promise<VerifyResul
       last.close();
     }
     checks.push(check("能取到末帧", true, last !== null));
+
+    // ---- 音画同步：导出这一步不许把音频挪位置 ----
+    //
+    // 抓的是 AAC 编码延迟没被补偿那一类错误（实测 2112 样本 = 44ms，而且每导出
+    // 一次叠加一次）。做法是**同一个判据量两遍**：素材里第一声在哪、成片里第一声
+    // 在哪，两者的差应当正好等于 trim 的入点。量素材而不是拿理论值比，是因为素材
+    // 本身也是 AAC 编的、自己就带着一份 priming 偏移——只有两边同口径才问得出
+    // "导出**改变**了多少"这个真问题。
+    //
+    // 从入点后 0.5 秒起找，避开成片开头那 44ms priming 区（那一段无论如何都不是
+    // 有效音频，在里面找会量到编码器的爬升而不是提示音）。
+    if (audioTrack) {
+      const inSeconds = frameToSeconds(inFrame, FPS.ndf2997);
+      const sourceInput = new Input({ formats: ALL_FORMATS, source: new BlobSource(sample.file) });
+      try {
+        const sourceAudio = await sourceInput.getPrimaryAudioTrack();
+        const srcOnset = sourceAudio ? await firstOnsetAfter(sourceAudio, inSeconds + 0.5) : null;
+        const outOnset = await firstOnsetAfter(audioTrack, 0.5);
+        const expectedOnset = srcOnset === null ? null : srcOnset - inSeconds;
+        const drift =
+          outOnset === null || expectedOnset === null ? null : outOnset - expectedOnset;
+        checks.push(
+          check(
+            "导出没有移动音频（AAC 编码延迟已补偿）",
+            "|Δ| < 5ms",
+            drift === null ? "量不到提示音" : `${(drift * 1000).toFixed(1)}ms`,
+            drift !== null && Math.abs(drift) < 0.005,
+          ),
+        );
+      } finally {
+        sourceInput.dispose();
+      }
+    }
   } finally {
     input.dispose();
   }
@@ -196,6 +236,37 @@ export async function verifyM0(options: VerifyOptions = {}): Promise<VerifyResul
     exportedBytes: exported.bytesWritten,
     realtimeFactor,
   };
+}
+
+/** 高于这个绝对值就算"响了"。测试素材的提示音幅度 0.25，静音段是精确的 0。 */
+const ONSET_THRESHOLD = 0.05;
+
+/**
+ * 找 `from` 之后第一个"响起来"的时刻（秒），找不到返回 null。
+ *
+ * **与 `make-sample.ts` 的配音耦合**：它每秒前 80ms 打一声 1kHz、其余为静音，
+ * 所以"第一个超过阈值的样本"就是那一声的起点。改配音的占空比或幅度要回来看这里，
+ * 和 `sampleHueAt` 依赖背景色相是同一类耦合。
+ */
+async function firstOnsetAfter(
+  track: InputAudioTrack,
+  from: number,
+): Promise<number | null> {
+  const sink = new AudioSampleSink(track);
+  for await (const audioSample of sink.samples(from, from + 2)) {
+    try {
+      const buffer = audioSample.toAudioBuffer();
+      const data = buffer.getChannelData(0);
+      for (let i = 0; i < data.length; i++) {
+        if (Math.abs(data[i]!) > ONSET_THRESHOLD) {
+          return audioSample.timestamp + i / buffer.sampleRate;
+        }
+      }
+    } finally {
+      audioSample.close();
+    }
+  }
+  return null;
 }
 
 function drawTo(canvas: HTMLCanvasElement | undefined, sample: { toVideoFrame(): VideoFrame }): void {

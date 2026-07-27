@@ -35,9 +35,11 @@ import {
   Output,
   StreamTarget,
   WebMOutputFormat,
+  type AudioCodec,
   type VideoSample,
 } from "mediabunny";
 
+import { measureEncoderDelay, type EncoderDelay } from "../audio/encoder-delay";
 import { createCanvas2DCompositor, type ComposeLayer } from "../compose/compositor";
 import { residency, ResidencyTracker } from "./residency";
 import { rasterizeText, textRasterCacheBytes } from "../compose/text-raster";
@@ -149,6 +151,20 @@ export async function runExport(
     : null;
   if (audioSource) output.addAudioTrack(audioSource);
 
+  // 编码器的 priming 会把整条音轨往后推（AAC 实测 2112 样本 = 44ms），而容器这一层
+  // 补偿不了——见 audio/encoder-delay.ts 的文件头。这里测出来，喂 PCM 时从头部丢掉
+  // 同样多，让成片里的音频落回正确的绝对位置
+  const probeCodec = decision.audioCodec ? audioCodecString(decision.audioCodec) : null;
+  const encoderDelay: EncoderDelay =
+    audio && audioSource && probeCodec
+      ? await measureEncoderDelay({
+          codec: probeCodec,
+          sampleRate: audio.sampleRate,
+          numberOfChannels: audio.numberOfChannels,
+          bitrate: request.audioBitrate,
+        })
+      : { samples: 0, sampleRate: audio?.sampleRate ?? 0, correlation: 0 };
+
   let encodedFrames = 0;
 
   try {
@@ -156,7 +172,7 @@ export async function runExport(
     checkCancel();
 
     const frameDurationSeconds = frameDurationMicros(timeline.fps) / MICROS_PER_SECOND;
-    const pumpAudio = makeAudioPump(audio, audioSource, request.audioBitrate);
+    const pumpAudio = makeAudioPump(audio, audioSource, encoderDelay.samples);
 
     let lastReportedAt = 0;
     for (let i = 0; i < totalFrames; i++) {
@@ -250,6 +266,7 @@ export async function runExport(
       encodedFrames,
       elapsedMs: performance.now() - startedAt,
       audioIncluded: willWriteAudio,
+      audioEncoderDelay: encoderDelay,
       bytesWritten: written.size,
       residency: {
         ...tracker.report(),
@@ -282,34 +299,60 @@ export async function runExport(
 }
 
 /**
+ * mediabunny 的编解码器名换成 WebCodecs 的编解码器串。
+ *
+ * 只为了给延迟探针配一个**和 mediabunny 内部一模一样**的编码器——两边配置不同的话，
+ * 测出来的延迟就不是实际用的那个。mediabunny 没有把这个映射导出来，而我们只会选到
+ * 这两个（见 `capability.ts` 的 `decideFormat`），所以这里照抄
+ * （`aac` → AAC-LC，见 mediabunny `codec.js`）。
+ *
+ * 认不出来的编解码器返回 null，让调用方**跳过补偿**而不是猜一个串去测：
+ * 拿错配置测出来的延迟比不补偿更糟，那会按一个错的量去移。
+ */
+function audioCodecString(codec: AudioCodec): string | null {
+  if (codec === "aac") return "mp4a.40.2";
+  if (codec === "opus") return "opus";
+  return null;
+}
+
+/**
  * 造一个"把音频喂到指定时刻"的函数。
  *
  * 主线程混好的 PCM 是 f32-planar 的一组声道数组，切块时要把各声道的这一段
  * **按平面顺序拼进一个连续数组**（ch0 全部帧，然后 ch1 全部帧），
  * 这是 `f32-planar` 的内存布局；写成交错格式会得到左右声道互相穿插的噪音。
+ *
+ * `delayFrames` 是编码器的 priming 长度，要从 PCM **头部**丢掉这么多帧。
+ * 为什么必须这么做、以及为什么容器这一层补偿不了，见 `audio/encoder-delay.ts`。
  */
 function makeAudioPump(
   audio: ExportRequest["audio"],
   audioSource: AudioSampleSource | null,
-  _bitrate: number,
+  delayFrames: number,
 ): (untilSeconds: number) => Promise<void> {
   if (!audio || !audioSource) return async () => undefined;
 
   const { sampleRate, numberOfChannels, frameCount, channels } = audio;
   const chunkFrames = Math.max(1, Math.round(sampleRate * AUDIO_CHUNK_SECONDS));
+  // 编码延迟补偿：源里的第 delayFrames 个样本要成为喂进去的第 0 个，
+  // 解码器把它吐回到绝对位置 delayFrames 上，正好对上（见 encoder-delay.ts）。
+  // 丢掉的那一小段（AAC 是 44ms）只能落在 priming 区，没有别的地方可去
+  const skip = Math.max(0, Math.min(delayFrames, frameCount));
+  const feedFrames = frameCount - skip;
   let written = 0;
 
   return async (untilSeconds: number) => {
-    while (written < frameCount) {
+    while (written < feedFrames) {
       // 已经喂到比视频还超前一整块了就先停，等视频追上来
       if (written / sampleRate > untilSeconds + AUDIO_CHUNK_SECONDS) return;
 
-      const length = Math.min(chunkFrames, frameCount - written);
+      const length = Math.min(chunkFrames, feedFrames - written);
+      const from = written + skip;
       const data = new Float32Array(length * numberOfChannels);
       for (let ch = 0; ch < numberOfChannels; ch++) {
         const plane = channels[ch];
         if (!plane) continue;
-        data.set(plane.subarray(written, written + length), ch * length);
+        data.set(plane.subarray(from, from + length), ch * length);
       }
 
       const sample = new AudioSample({

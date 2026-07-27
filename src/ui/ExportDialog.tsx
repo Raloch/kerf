@@ -24,6 +24,7 @@ import {
   PRESETS,
   resolvePreset,
 } from "../export/presets";
+import type { EncoderDelay } from "../audio/encoder-delay";
 import type { ExportDone, ExportProgress, ExportResidency } from "../export/protocol";
 import { formatBytes } from "../export/residency";
 import { canPickSaveFile, pickWriteTarget } from "../export/write-target";
@@ -387,6 +388,9 @@ export function ExportDialog({ timeline, caps, selectedRange, onClose }: ExportD
                       {formatBytes(phase.result.mixResidency.peak.audioMixBytes)}
                     </div>
                   )}
+                  {phase.result.audioIncluded && (
+                    <EncoderDelayLine delay={phase.result.audioEncoderDelay} />
+                  )}
                 </div>
               </div>
             </div>
@@ -565,6 +569,32 @@ function RunningView({
  * - **有没有泄漏**——跑完还没还回去的解码帧/解码器。非 0 在几百帧的片子上
  *   完全看不出来，到 30 分钟才会变成标签页崩掉。
  */
+/**
+ * 编码延迟补偿这一行。
+ *
+ * 为什么要显示而不是默默做掉：这个补偿**丢掉了音轨开头的一小段**（AAC 约 44ms），
+ * 而"没测出来"意味着成片整体晚 44ms。两种情况都是用户该知道的事实，藏起来就成了
+ * 又一个"不报错、只是片子不对"。测成了写一行灰字，没测成标红并说明原因。
+ */
+function EncoderDelayLine({ delay }: { readonly delay: EncoderDelay }) {
+  if (delay.reason) {
+    return (
+      <div className="done-meta m">
+        <span className="reject">音画同步未补偿：{delay.reason}</span>
+      </div>
+    );
+  }
+  if (delay.samples === 0) {
+    return <div className="done-meta m dim">编码器无延迟，音画位置未改动</div>;
+  }
+  const ms = (delay.samples / delay.sampleRate) * 1000;
+  return (
+    <div className="done-meta m dim">
+      已补偿编码延迟 {ms.toFixed(0)}ms（{delay.samples} 样本）· 音轨开头这一段被丢弃
+    </div>
+  );
+}
+
 function ResidencyLine({ residency }: { readonly residency: ExportResidency }) {
   const leaked =
     residency.leakedSamples + residency.leakedCursors + residency.leakedInputs;
