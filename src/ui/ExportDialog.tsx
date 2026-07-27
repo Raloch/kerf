@@ -24,7 +24,8 @@ import {
   PRESETS,
   resolvePreset,
 } from "../export/presets";
-import type { ExportDone, ExportProgress } from "../export/protocol";
+import type { ExportDone, ExportProgress, ExportResidency } from "../export/protocol";
+import { formatBytes } from "../export/residency";
 import { canPickSaveFile, pickWriteTarget } from "../export/write-target";
 import type { ExportCapabilities } from "../media/capability";
 import type { ContainerChoice } from "../media/capability";
@@ -377,6 +378,7 @@ export function ExportDialog({ timeline, caps, selectedRange, onClose }: ExportD
                     {" · "}
                     {phase.result.mimeType}
                   </div>
+                  <ResidencyLine residency={phase.result.residency} />
                 </div>
               </div>
             </div>
@@ -521,6 +523,17 @@ function RunningView({
               <small> 秒</small>
             </div>
           </div>
+          {/* 常驻量：长片导出真正要盯的那个数。它**不该随进度增长**——
+              涨了就是有东西没还回去，而那在短片上看不出来（见 residency.ts） */}
+          <div className="rn">
+            <div className="k">常驻</div>
+            <div className="v" title="解码帧 + 文字栅格缓存 + 音频 PCM 的估算值。不含编码器内部缓冲">
+              {progress.residency ? formatBytes(progress.residency.estimatedBytes) : "—"}
+              {progress.residency && (
+                <small> · {progress.residency.decodedSamples} 帧驻留</small>
+              )}
+            </div>
+          </div>
         </div>
       </div>
       <div className="dlg-foot">
@@ -530,6 +543,45 @@ function RunningView({
         </button>
       </div>
     </>
+  );
+}
+
+/**
+ * 常驻量小结：峰值、峰值出现在第几帧、以及"跑完归零了没有"。
+ *
+ * 三个数各回答一个问题，缺一个都判不了长片能不能导：
+ *
+ * - **峰值多少**——够不够塞进浏览器给标签页的额度。
+ * - **峰值在第几帧**——出现在开头几帧说明是固定开销，出现在末尾说明在爬。
+ *   只报峰值不报位置，"800MB 且早就稳住"和"800MB 且还在涨"会长得一模一样。
+ * - **有没有泄漏**——跑完还没还回去的解码帧/解码器。非 0 在几百帧的片子上
+ *   完全看不出来，到 30 分钟才会变成标签页崩掉。
+ */
+function ResidencyLine({ residency }: { readonly residency: ExportResidency }) {
+  const leaked =
+    residency.leakedSamples + residency.leakedCursors + residency.leakedInputs;
+  const grew =
+    residency.first && residency.last
+      ? residency.last.estimatedBytes - residency.first.estimatedBytes
+      : 0;
+
+  return (
+    <div className="done-meta m dim">
+      峰值常驻 {formatBytes(residency.peak.estimatedBytes)}（第 {residency.peakAtFrame} 帧）
+      {" · "}
+      首尾差 {grew >= 0 ? "+" : ""}
+      {formatBytes(Math.abs(grew))}
+      {" · "}
+      {leaked === 0 ? (
+        "跑完已归零"
+      ) : (
+        <span className="reject">
+          泄漏 {residency.leakedSamples} 帧 / {residency.leakedCursors} 解码器 /{" "}
+          {residency.leakedInputs} demuxer
+        </span>
+      )}
+      {residency.leakedFromPrevious > 0 && ` · 上次导出残留 ${residency.leakedFromPrevious}`}
+    </div>
   );
 }
 

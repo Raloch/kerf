@@ -39,7 +39,8 @@ import {
 } from "mediabunny";
 
 import { createCanvas2DCompositor, type ComposeLayer } from "../compose/compositor";
-import { rasterizeText } from "../compose/text-raster";
+import { residency, ResidencyTracker } from "./residency";
+import { rasterizeText, textRasterCacheBytes } from "../compose/text-raster";
 import { videoTracksInDrawOrder, visibleVideoClips } from "../edl/sampling";
 import { decideFormat } from "../media/capability";
 import { probeCapabilities } from "../media/capability-probe";
@@ -82,12 +83,23 @@ export async function runExport(
     if (hooks.isCanceled()) throw new ExportCanceled();
   };
 
+  // 常驻量计量。挂在已有的进度节流上，不另起定时器——见 residency.ts 的文件头，
+  // 以及 PLAN.md §4 那条"把测量塞进已经会跑的路径，才不会随时间烂掉"
+  const tracker = new ResidencyTracker();
+  const leftover = residency.reset();
+  // text-raster 的缓存字节由它自己算，这里注入取值函数，避免 residency 反向依赖 compose
+  residency.bindTextRasterBytes(textRasterCacheBytes);
+  residency.setAudioPcmBytes(
+    audio ? audio.channels.reduce((sum, plane) => sum + plane.byteLength, 0) : 0,
+  );
+
   const report = (stage: ExportProgress["stage"], encodedFrames: number) => {
     hooks.onProgress({
       stage,
       encodedFrames,
       totalFrames,
       elapsedMs: performance.now() - startedAt,
+      residency: tracker.sample(encodedFrames),
     });
   };
 
@@ -228,12 +240,26 @@ export async function runExport(
 
     const written = await handle.getFile();
 
+    // 收尾前先把 reader 关掉，这样下面的"归零了没有"问的是**这一次导出**有没有
+    // 泄漏，而不是"finally 还没跑"。finally 里再关一次是幂等的
+    await Promise.all(readers.map(({ reader }) => reader.dispose()));
+    const after = residency.snapshot();
+
     return {
       mimeType,
       encodedFrames,
       elapsedMs: performance.now() - startedAt,
       audioIncluded: willWriteAudio,
       bytesWritten: written.size,
+      residency: {
+        ...tracker.report(),
+        // 跑完还没归零就是真泄漏：解码帧和解码器都该在 dispose 里还回去了。
+        // 上一次导出的残留单独报，否则会算到这一次头上
+        leakedSamples: after.decodedSamples,
+        leakedCursors: after.openCursors,
+        leakedInputs: after.openInputs,
+        leakedFromPrevious: leftover.samples + leftover.cursors + leftover.inputs,
+      },
       ...(request.target.kind === "opfs" ? { opfsName: request.target.name } : {}),
     };
   } catch (error) {

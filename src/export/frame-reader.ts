@@ -25,6 +25,25 @@ import { ALL_FORMATS, BlobSource, Input, VideoSampleSink, type VideoSample } fro
 import type { MediaClip, RenderRange, Timeline, Track } from "../edl/types";
 import { microsToSeconds, sourceMicrosAt } from "../edl/sampling";
 import { FRAME_ALIGN_EPSILON_SECONDS, frameDurationMicros } from "../time/timebase";
+import { residency } from "./residency";
+
+/**
+ * 解码帧的借出 / 归还都要记一笔。
+ *
+ * 记账点必须**贴着 close 写**，不能在外层"大概算一下每条轨两个"——那样算出来的
+ * 是设计意图，不是实际持有量，而这个计量存在的意义恰恰是验证意图有没有被违反
+ * （见 `residency.ts` 的文件头）。
+ */
+function retain(sample: VideoSample): VideoSample {
+  residency.retainSample(sample.codedWidth, sample.codedHeight);
+  return sample;
+}
+
+function release(sample: VideoSample | null): void {
+  if (!sample) return;
+  residency.releaseSample(sample.codedWidth, sample.codedHeight);
+  sample.close();
+}
 
 interface ClipCursor {
   readonly clipId: string;
@@ -85,7 +104,7 @@ export class VideoTrackReader {
       if (first.done) {
         cursor.exhausted = true;
       } else {
-        cursor.current = first.value;
+        cursor.current = retain(first.value);
       }
     }
     if (!cursor.current) return null;
@@ -99,12 +118,12 @@ export class VideoTrackReader {
         if (step.done) {
           cursor.exhausted = true;
         } else {
-          cursor.next = step.value;
+          cursor.next = retain(step.value);
         }
       }
       const next = cursor.next;
       if (next && next.timestamp <= targetSeconds + FRAME_ALIGN_EPSILON_SECONDS) {
-        cursor.current?.close();
+        release(cursor.current);
         cursor.current = next;
         cursor.next = null;
         continue;
@@ -117,7 +136,10 @@ export class VideoTrackReader {
 
   async dispose(): Promise<void> {
     await this.closeCursor();
-    for (const input of this.inputs.values()) input.dispose();
+    for (const input of this.inputs.values()) {
+      input.dispose();
+      residency.closeInput();
+    }
     this.inputs.clear();
   }
 
@@ -129,6 +151,7 @@ export class VideoTrackReader {
     if (!input) {
       input = new Input({ formats: ALL_FORMATS, source: new BlobSource(source.file) });
       this.inputs.set(source.id, input);
+      residency.openInput();
     }
     const videoTrack = await input.getPrimaryVideoTrack();
     if (!videoTrack) return null;
@@ -144,6 +167,7 @@ export class VideoTrackReader {
       frameDurationMicros(source.fps);
 
     const sink = new VideoSampleSink(videoTrack);
+    residency.openCursor();
     return {
       clipId: clip.id,
       samples: sink.samples(microsToSeconds(startMicros), microsToSeconds(endMicros)),
@@ -157,10 +181,11 @@ export class VideoTrackReader {
     const cursor = this.cursor;
     if (!cursor) return;
     this.cursor = null;
-    cursor.current?.close();
-    cursor.next?.close();
+    release(cursor.current);
+    release(cursor.next);
     // 让生成器走完 finally，释放它内部的 VideoDecoder
     await cursor.samples.return?.(undefined);
+    residency.closeCursor();
   }
 }
 

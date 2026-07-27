@@ -36,6 +36,8 @@
  * 必须先把字体文件同时喂给两边，再来放开这里。
  */
 
+import { RasterCache } from "./raster-cache";
+
 /** 文字样式。所有尺寸都是**占输出高度的比例**，理由见文件头。 */
 export interface TextStyle {
   /** 字号 ÷ 输出高度。0.08 在 1080p 上约等于 86px。 */
@@ -239,10 +241,17 @@ export interface TextRaster {
  * 会让导出慢一个量级（和"逐帧新建 GPU 纹理"是同一类错误）。
  *
  * 键里必须带输出尺寸：换分辨率后所有比例换算出的像素值都变了。
+ *
+ * 预算按**字节**而不是条数卡——这是修过的一个 bug：条数上限对分辨率一无所知，
+ * 而每张栅格是输出尺寸的画布，同样 32 条在 720p 是 113MB、1080p 是 253MB。
+ * 32MB 在 1080p 上约等于 4 张，4K 上不足 1 张（由下限兜底）。
+ * 完整理由和淘汰策略见 `raster-cache.ts` 的文件头。
  */
-const cache = new Map<string, TextRaster>();
-/** 上限很小：同时出现在画面上的文字层就那么几个，超了直接整体清空最省心。 */
-const CACHE_LIMIT = 32;
+const CACHE_BUDGET_BYTES = 32 * 1024 * 1024;
+/** 预算再紧也保底留 2 张：同一帧上可能同时有字幕和标题，留不住就等于逐帧重排。 */
+const CACHE_MIN_ENTRIES = 2;
+
+const cache = new RasterCache<TextRaster>(CACHE_BUDGET_BYTES, CACHE_MIN_ENTRIES);
 
 function cacheKey(text: string, style: TextStyle | undefined, width: number, height: number): string {
   return `${width}x${height} ${text} ${JSON.stringify(style ?? {})}`;
@@ -314,7 +323,6 @@ export function rasterizeText(
   });
 
   const raster: TextRaster = { canvas, width: outWidth, height: outHeight };
-  if (cache.size >= CACHE_LIMIT) cache.clear();
   cache.set(key, raster);
   return raster;
 }
@@ -322,4 +330,21 @@ export function rasterizeText(
 /** 输出分辨率变了、或者测试之间要隔离时清缓存。 */
 export function clearTextRasterCache(): void {
   cache.clear();
+}
+
+/**
+ * 缓存当前占多少字节（RGBA 后备存储估算）。
+ *
+ * 这个数比直觉大得多：每张栅格都是**输出尺寸**的画布（D11 的选择，为了让
+ * `containRect` 退化成 1:1），1080p 下单张就是 1920×1080×4 ≈ **7.9MB**。
+ * 导出的常驻量计量读的就是它，见 `export/residency.ts`——按条数限流那一版
+ * 正是被那个计量抓出来的。
+ */
+export function textRasterCacheBytes(): number {
+  return cache.byteSize;
+}
+
+/** 缓存里现在有几张。与字节数一起报，才分得清"张数多"和"每张大"。 */
+export function textRasterCacheCount(): number {
+  return cache.size;
 }

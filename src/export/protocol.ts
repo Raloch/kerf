@@ -18,6 +18,7 @@ import type { Rational } from "../time/rational";
 import type { ContainerChoice } from "../media/capability";
 import type { RenderRange, Timeline } from "../edl/types";
 import type { MixedAudio } from "../audio/mixdown";
+import type { ResidencyReport, ResidencySnapshot } from "./residency";
 import type { WriteTargetSpec } from "./write-target";
 
 export interface ExportRequest {
@@ -46,6 +47,29 @@ export interface ExportProgress {
   readonly totalFrames: number;
   /** 已耗时（毫秒），用于算实时倍数。 */
   readonly elapsedMs: number;
+  /**
+   * 这一刻我们攥着多少资源。见 `residency.ts`——它数的是自己持有量，不是问浏览器。
+   *
+   * `mix` 阶段没有：混音跑在**主线程**、进 Worker 之前，而计量器是每个 JS 上下文
+   * 一份，主线程那份没人喂。混出来的 PCM 有多大会在 Worker 侧作为
+   * `audioPcmBytes` 报出来，所以这里缺的只是"混的过程中"那一段。
+   */
+  readonly residency?: ResidencySnapshot;
+}
+
+/**
+ * 导出结束时的常驻量小结。
+ *
+ * `leaked*` 是**跑完之后还没归还的数量**，正常必须全是 0：解码帧和解码器都在
+ * reader 的 dispose 里还回去。非 0 就是泄漏，而泄漏在短片上看不出来，
+ * 到 30 分钟的片子上才会变成标签页崩掉——所以这个数要跟着每次导出报出来。
+ */
+export interface ExportResidency extends ResidencyReport {
+  readonly leakedSamples: number;
+  readonly leakedCursors: number;
+  readonly leakedInputs: number;
+  /** 上一次导出留下的残留（本次开始前清掉的量）。非 0 说明上一次泄漏了。 */
+  readonly leakedFromPrevious: number;
 }
 
 export interface ExportDone {
@@ -54,6 +78,7 @@ export interface ExportDone {
   readonly elapsedMs: number;
   readonly audioIncluded: boolean;
   readonly bytesWritten: number;
+  readonly residency: ExportResidency;
   /** 走 OPFS 回退时的文件名；主线程据此读回触发下载。picker 路径为 undefined。 */
   readonly opfsName?: string | undefined;
 }
