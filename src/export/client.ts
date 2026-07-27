@@ -128,20 +128,56 @@ export function startExport(
   };
 }
 
+/**
+ * 常驻导出 Worker。**跨导出复用，不再一次一个。**
+ *
+ * 换 Pixi 之后合成器是个 WebGL 上下文，而浏览器对同时存活的上下文有预算、
+ * 超了驱逐**最老的那个**——最老的正是预览。每导出一次就建一个新上下文，
+ * Safari 上十几轮就把预览判死，而且**救不回来**（spike 量过：被预算驱逐的
+ * 上下文 `recover()` 会超时）。所以合成器必须常驻，而合成器住在 Worker 里，
+ * Worker 就得跟着常驻。
+ *
+ * 出错的那个不留：Worker 抛到顶层之后内部状态不可知，terminate 掉换新的。
+ * 正常结束和取消都保留。
+ */
+let sharedWorker: Worker | null = null;
+
+function getWorker(): Worker {
+  if (sharedWorker) return sharedWorker;
+  sharedWorker = new Worker(new URL("./export.worker.ts", import.meta.url), {
+    type: "module",
+    name: "kerf-export",
+  });
+  return sharedWorker;
+}
+
+function discardWorker(worker: Worker): void {
+  if (sharedWorker === worker) sharedWorker = null;
+  worker.terminate();
+}
+
+/**
+ * 让常驻 Worker 放掉合成器画布，但**保留 Worker 本身**。
+ *
+ * 关掉导出面板时调。销毁 Worker 会连渲染上下文一起销毁，下次导出又要新建一个——
+ * 正是上面要避免的事。
+ */
+export function releaseExportResources(): void {
+  sharedWorker?.postMessage({ type: "release" } satisfies WorkerRequest);
+}
+
 function runInWorker(
   request: ExportRequest,
   audioTransfer: Transferable[],
   onProgress: (progress: ExportProgress) => void,
   onReady: (worker: Worker) => void,
 ): Promise<ExportDone | null> {
-  const worker = new Worker(new URL("./export.worker.ts", import.meta.url), {
-    type: "module",
-    name: "kerf-export",
-  });
-
+  const worker = getWorker();
   let settled = false;
 
   const promise = new Promise<ExportDone | null>((resolve, reject) => {
+    // 每次导出重挂 handler：Worker 是复用的，上一次的闭包还挂着就会
+    // 把这一次的进度报给上一次的调用方
     worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
       const message = event.data;
       switch (message.type) {
@@ -151,17 +187,16 @@ function runInWorker(
         case "done":
           settled = true;
           resolve(message.result);
-          worker.terminate();
           break;
         case "canceled":
           settled = true;
           resolve(null);
-          worker.terminate();
           break;
         case "error":
           settled = true;
+          // 业务错误（编码器不可用、写盘失败等）由管道自己收拾干净，
+          // Worker 仍然可用，留着它——常驻的意义就在这里
           reject(new Error(message.message));
-          worker.terminate();
           break;
       }
     };
@@ -169,8 +204,9 @@ function runInWorker(
     worker.onerror = (event) => {
       if (settled) return;
       settled = true;
+      // 这条是**没被捕获**的顶层错误，Worker 内部状态不可知，不能再用
+      discardWorker(worker);
       reject(new Error(event.message || "导出 Worker 异常退出"));
-      worker.terminate();
     };
   });
 

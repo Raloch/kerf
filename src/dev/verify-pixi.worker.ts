@@ -73,6 +73,15 @@ const PERF_FRAMES = 40;
  */
 const CONTEXT_BUDGET_CYCLES = 12;
 
+/**
+ * 上下文恢复之后要画的那一帧，**刻意不是丢失前那一帧**。
+ *
+ * 开着 `preserveDrawingBuffer`，画布会保留丢失前的内容。如果恢复后 `render()`
+ * 其实是空操作，重画同一帧仍会量到正确的色相——那条断言就是空的，什么都挡不住。
+ * 换一帧之后，"量到的色相 = 新帧的色相"才能证明**这一次渲染真的发生了**。
+ */
+const RECOVER_SAMPLE_INDEX = 20;
+
 export interface FrameComparison {
   readonly index: number;
   readonly expectedHue: number;
@@ -107,15 +116,45 @@ export interface PixiProbeReport {
     readonly extensionAvailable: boolean;
     readonly threwAfterLoss: boolean;
     readonly detail: string;
+    /** `recover()` 有没有把上下文要回来。 */
+    readonly recovered: boolean;
+    /**
+     * 丢失前画一帧、恢复后画**另一帧**，两次量到的色相与最大通道。
+     *
+     * 只断言"恢复后不黑"是不够的：GPU 资源在丢失时全部作废，如果 Pixi 没能
+     * 重新上传纹理，画出来会是别的东西（纯色、上一帧、乱码）而不是黑屏。
+     * 而且开着 `preserveDrawingBuffer`，重画**同一帧**的话画布上的旧内容会让
+     * 断言即使在"渲染其实没发生"时也通过——所以恢复后换一帧，
+     * 断言 `afterHue` 命中新帧的期望色相，见 `RECOVER_SAMPLE_INDEX`。
+     */
+    readonly beforeMaxChannel: number;
+    readonly afterMaxChannel: number;
+    readonly beforeHue: number;
+    readonly afterHue: number;
+    /** 恢复后应当画出的那一帧的色相。 */
+    readonly afterExpectedHue: number;
+    readonly recoverDetail: string;
   };
-  /** 反复创建 + 销毁合成器之后，老的和新的还画不画得出。见 `probeContextBudget`。 */
+  /** WebGL 上下文预算：复用 vs 每轮新建的对照。见 `probeContextBudget`。 */
   readonly contextBudget: {
     readonly cycles: number;
     readonly survivedCycles: number;
-    /** 全场最老的那个合成器（生产里是预览）跑完这些轮之后的最大通道值。 */
-    readonly longLivedMaxChannel: number;
+    /**
+     * **复用**常驻合成器跑完这些轮之后，长命的那个（预览）还画不画得出。
+     * 这是导出侧复用的验收——生产架构就是这一条。
+     */
+    readonly reuseLongLivedMaxChannel: number;
+    /** 对照组：**每轮新建 + 销毁**时，长命的那个还画不画得出。 */
+    readonly churnLongLivedMaxChannel: number;
     /** 跑完之后新建的那个的最大通道值。 */
     readonly freshMaxChannel: number;
+    /**
+     * 对照组里老的被驱逐之后，`recover()` 救不救得回来。
+     *
+     * 这决定了复用是"锦上添花"还是"唯一解"：救得回来的话预算耗尽只是闪一下黑，
+     * 救不回来就是预览真的死了。实测 Safari **救不回来**。
+     */
+    readonly churnLongLivedRecovered: boolean;
     readonly detail: string;
   };
   /** 纯合成耗时（CPU 提交，不含 GPU 完成）。 */
@@ -395,40 +434,108 @@ async function probeDrawingBuffer(
 }
 
 /**
- * GL 上下文丢失之后合成器是不是会报错。
+ * GL 上下文丢失之后：**先要报错，再要能救回来。**
  *
  * Canvas2D 没有这个失效模式，WebGL 有：导出跑几分钟，期间切标签页、系统休眠、
- * 驱动重置都可能触发。默认行为是渲染变成 no-op——也就是静默写出几百帧黑画面。
+ * 驱动重置都可能触发；上下文超预算被驱逐是第四种（见 `probeContextBudget`）。
+ * 默认行为是渲染变成 no-op——也就是静默写出几百帧黑画面。
+ *
+ * 两问缺一不可：
+ *
+ * - **报不报错**：不报错就是静默产出黑片，比崩掉还糟。
+ * - **救不救得回来**：这是换后端的前置条件之一。丢失在生产里不是异常而是常态
+ *   （用户切个标签页就可能触发），每次都要求"重开项目"是不可接受的。
+ *
+ * 恢复之后**比对画面内容**而不只是"不黑"：GPU 资源在丢失时全部作废，Pixi 若没能
+ * 重新上传纹理，画出来会是别的东西——纯色、上一帧、乱码——那些都不是黑的。
  */
 async function probeContextLoss(
   sample: VideoSample,
+  afterSample: VideoSample,
+  afterExpectedHue: number,
 ): Promise<PixiProbeReport["contextLoss"]> {
+  const blank = {
+    recovered: false,
+    beforeMaxChannel: 0,
+    afterMaxChannel: 0,
+    beforeHue: 0,
+    afterHue: 0,
+    afterExpectedHue,
+    recoverDetail: "",
+  };
+
   const compositor = await createPixiCompositor(OUT, OUT);
+  const draw = (which: VideoSample): { maxChannel: number; hue: number } => {
+    compositor.composeFrame([{ kind: "sample", sample: which }]);
+    const probe = new OffscreenCanvas(OUT, OUT);
+    const ctx = probe.getContext("2d", { willReadFrequently: true });
+    if (!ctx) throw new Error("探测画布没有 2D 上下文");
+    ctx.drawImage(compositor.canvas, 0, 0);
+    const measured = measure(ctx, OUT, OUT);
+    return { maxChannel: measured.maxChannel, hue: measured.hue };
+  };
+
   try {
     // 丢之前先确认它是能画的，否则下面的"抛错"可能是别的原因
-    compositor.composeFrame([{ kind: "sample", sample }]);
+    const before = draw(sample);
 
     if (!compositor.debug.loseContext()) {
       return {
+        ...blank,
         extensionAvailable: false,
         threwAfterLoss: false,
         detail: "浏览器不提供 WEBGL_lose_context，这条只能手动验证",
+        beforeMaxChannel: before.maxChannel,
+        beforeHue: before.hue,
       };
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
 
+    let threwAfterLoss: boolean;
+    let detail: string;
     try {
       compositor.composeFrame([{ kind: "sample", sample }]);
-      return {
-        extensionAvailable: true,
-        threwAfterLoss: false,
-        detail: "composeFrame 没有抛错——上下文丢失会静默产出黑帧",
-      };
+      threwAfterLoss = false;
+      detail = "composeFrame 没有抛错——上下文丢失会静默产出黑帧";
     } catch (error) {
-      return { extensionAvailable: true, threwAfterLoss: true, detail: describe(error) };
+      threwAfterLoss = true;
+      detail = describe(error);
     }
+
+    // ---- 再问第二件事：救得回来吗 ----
+    let recovered = false;
+    let after = { maxChannel: 0, hue: 0 };
+    let recoverDetail: string;
+    try {
+      recovered = await compositor.recover();
+      if (!recovered) {
+        recoverDetail = "recover() 超时，上下文没回来";
+      } else if (compositor.isContextLost()) {
+        recoverDetail = "recover() 说成功了但 isContextLost() 仍为真——两处判据不一致";
+        recovered = false;
+      } else {
+        after = draw(afterSample);
+        recoverDetail =
+          `恢复后画的是**另一帧**，色相 ${after.hue}°（期望 ${afterExpectedHue}°，丢失前那帧是 ${before.hue}°）`;
+      }
+    } catch (error) {
+      recoverDetail = `恢复过程抛错：${describe(error)}`;
+    }
+
+    return {
+      extensionAvailable: true,
+      threwAfterLoss,
+      detail,
+      recovered,
+      beforeMaxChannel: before.maxChannel,
+      afterMaxChannel: after.maxChannel,
+      beforeHue: before.hue,
+      afterHue: after.hue,
+      afterExpectedHue,
+      recoverDetail,
+    };
   } finally {
-    // 上下文已经没了，destroy 自己可能抛，不影响上面的结论
+    // 上下文可能已经没了，destroy 自己可能抛，不影响上面的结论
     try {
       compositor.dispose();
     } catch {
@@ -438,20 +545,27 @@ async function probeContextLoss(
 }
 
 /**
- * WebGL 上下文预算：反复创建 + 销毁合成器之后，**新的**和**老的**还画不画得出。
+ * WebGL 上下文预算：**复用**一个常驻合成器 vs **每轮新建**，长命的那个（预览）活不活。
  *
  * 浏览器对同时存活的 WebGL 上下文有预算，超了就把**最老的那个**丢掉。Safari 在这个
  * spike 里连报 `There are too many active WebGL contexts on this page, the oldest
  * context will be lost`——说明 `dispose()` 没有立刻把上下文还回去，而是等 GC。
  * Canvas2D 完全没有这个失效模式，是换后端**新引入**的风险。
  *
- * 两个方向都要问，而且**老的那个才是危险的那个**：
+ * 危险的是**老的那个**，不是新的：驱逐顺序是"最老先死"，而生产里最老的正是预览——
+ * 它从打开项目起就一直握着一个合成器。用户每导出一次就产生一轮创建/销毁，
+ * 十几次之后被判死的是预览，表现为"我只是导出了几次，预览黑了"。
  *
- * - **新的**（`freshMaxChannel`）：模拟"连着导出十几次，下一次还起不起得来"。
- *   驱逐顺序是"最老先死"，所以这个方向天然安全，第一版只测了它，等于没测到点子上。
- * - **老的**（`longLivedMaxChannel`）：模拟**预览**——它在主线程上从打开项目起就
- *   一直握着一个合成器，是全场最老的那个。用户每导出一次就产生一轮创建/销毁，
- *   十几次之后被判死的正是预览。表现是预览突然黑掉或抛错，而用户只是"导出了几次"。
+ * 所以这里跑**两组对照**：
+ *
+ * - **复用组**：一个常驻合成器被用 12 轮（生产架构，见 `pipeline.ts` 的
+ *   `acquireCompositor`）。这一组是验收——它必须活。
+ * - **对照组**：每轮新建 + 销毁（旧架构）。它在 Safari 上会把预览判死，
+ *   而且**救不回来**（`recover()` 超时：浏览器要等预算腾出来才还）。
+ *   这一组只记录，不断言——它测的是我们已经废弃的做法，永远红没有意义，
+ *   但那个数字正是"为什么必须复用"的证据，所以留着。
+ *
+ * 顺序不能反：对照组会污染上下文预算，先跑它的话复用组量到的就不是干净状态。
  *
  * 刻意不去数上下文（没有跨浏览器的 API 可数），只问画得出画不出——那是用户遇到的形态。
  */
@@ -467,19 +581,54 @@ async function probeContextBudget(
     return measure(ctx, OUT, OUT).maxChannel;
   };
 
-  // 全场最老的那一个：预览在生产里就是这个角色
+  const safely = (label: string, run: () => number): { value: number; note: string } => {
+    try {
+      const value = run();
+      return { value, note: value > 32 ? `${label}画得出` : `${label}画出来是黑的` };
+    } catch (error) {
+      return { value: 0, note: `${label}抛错：${describe(error)}` };
+    }
+  };
+
+  const notes: string[] = [];
+
+  // ---- 复用组（生产架构）：一个常驻合成器用 12 轮，长命的那个必须活下来 ----
+  let reuseLongLived = 0;
+  {
+    const preview = await createPixiCompositor(OUT, OUT);
+    const resident = await createPixiCompositor(OUT, OUT);
+    try {
+      if (draw(preview) <= 32) {
+        return {
+          cycles: CONTEXT_BUDGET_CYCLES,
+          survivedCycles: 0,
+          reuseLongLivedMaxChannel: 0,
+          churnLongLivedMaxChannel: 0,
+          freshMaxChannel: 0,
+          churnLongLivedRecovered: false,
+          detail: "长命合成器一开始就画不出东西，后面的结论都不成立",
+        };
+      }
+      for (let i = 0; i < CONTEXT_BUDGET_CYCLES; i++) {
+        resident.composeFrame([{ kind: "sample", sample }]);
+      }
+      const result = safely("复用组里的预览", () => draw(preview));
+      reuseLongLived = result.value;
+      notes.push(result.note);
+    } finally {
+      for (const c of [resident, preview]) {
+        try {
+          c.dispose();
+        } catch {
+          /* 上下文可能已经没了 */
+        }
+      }
+    }
+  }
+
+  // ---- 对照组（旧架构）：每轮新建 + 销毁 ----
   const longLived = await createPixiCompositor(OUT, OUT);
   try {
-    if (draw(longLived) <= 32) {
-      return {
-        cycles: CONTEXT_BUDGET_CYCLES,
-        survivedCycles: 0,
-        longLivedMaxChannel: 0,
-        freshMaxChannel: 0,
-        detail: "长命合成器一开始就画不出东西，后面的结论都不成立",
-      };
-    }
-
     let survivedCycles = 0;
     let cycleError = "";
     for (let i = 0; i < CONTEXT_BUDGET_CYCLES; i++) {
@@ -488,27 +637,18 @@ async function probeContextBudget(
         short.composeFrame([{ kind: "sample", sample }]);
         survivedCycles = i + 1;
       } catch (error) {
-        cycleError = `第 ${i + 1} 轮就画不出来了：${describe(error)}`;
+        cycleError = `对照组第 ${i + 1} 轮就画不出来了：${describe(error)}`;
         break;
       } finally {
         short.dispose();
       }
     }
 
-    const safely = (label: string, run: () => number): { value: number; note: string } => {
-      try {
-        const value = run();
-        return { value, note: value > 32 ? `${label}画得出` : `${label}画出来是黑的` };
-      } catch (error) {
-        return { value: 0, note: `${label}抛错：${describe(error)}` };
-      }
-    };
-
-    const longLivedResult = safely("老的", () => draw(longLived));
+    const longLivedResult = safely("对照组里的预览", () => draw(longLived));
     const fresh = await createPixiCompositor(OUT, OUT);
     let freshResult: { value: number; note: string };
     try {
-      freshResult = safely("新的", () => draw(fresh));
+      freshResult = safely("对照组之后新建的", () => draw(fresh));
     } finally {
       try {
         fresh.dispose();
@@ -517,12 +657,27 @@ async function probeContextBudget(
       }
     }
 
+    // 被驱逐了的话问一句：还救得回来吗？救不回来才说明"复用"是唯一解
+    let churnRecovered = false;
+    if (longLivedResult.value <= 32) {
+      try {
+        churnRecovered = (await longLived.recover()) && safely("恢复后", () => draw(longLived)).value > 32;
+        notes.push(churnRecovered ? "对照组被驱逐后能救回来" : "对照组被驱逐后**救不回来**");
+      } catch (error) {
+        notes.push(`对照组恢复时抛错：${describe(error)}`);
+      }
+    }
+
     return {
       cycles: CONTEXT_BUDGET_CYCLES,
       survivedCycles,
-      longLivedMaxChannel: longLivedResult.value,
+      reuseLongLivedMaxChannel: reuseLongLived,
+      churnLongLivedMaxChannel: longLivedResult.value,
       freshMaxChannel: freshResult.value,
-      detail: [cycleError, longLivedResult.note, freshResult.note].filter(Boolean).join("；"),
+      churnLongLivedRecovered: churnRecovered,
+      detail: [cycleError, ...notes, longLivedResult.note, freshResult.note]
+        .filter(Boolean)
+        .join("；"),
     };
   } finally {
     try {
@@ -536,6 +691,7 @@ async function probeContextBudget(
 async function run(): Promise<PixiProbeReport> {
   const samples = makeSourceSamples(FRAMES, SRC_WIDTH, SRC_HEIGHT);
   const probeSample = samples[0]!;
+  const recoverSample = samples[RECOVER_SAMPLE_INDEX]!;
 
   try {
     const avc = await getFirstEncodableVideoCodec(["avc"], { width: OUT, height: OUT });
@@ -605,7 +761,11 @@ async function run(): Promise<PixiProbeReport> {
     // 上下文预算放最后：它会连开十几个上下文，跑完之后 GPU 侧的状态最脏，
     // 别的探针再跟在后面就说不清失败是自己的问题还是被它拖累的
     const drawingBuffer = await probeDrawingBuffer(probeSample);
-    const contextLoss = await probeContextLoss(probeSample);
+    const contextLoss = await probeContextLoss(
+      probeSample,
+      recoverSample,
+      sampleHueAt(RECOVER_SAMPLE_INDEX, FRAMES),
+    );
     const contextBudget = await probeContextBudget(probeSample);
 
     return {

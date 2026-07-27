@@ -16,7 +16,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { startExport, type ExportHandle } from "../export/client";
+import { releaseExportResources, startExport, type ExportHandle } from "../export/client";
 import {
   DEFAULT_PRESET_ID,
   describePreset,
@@ -70,6 +70,11 @@ export function ExportDialog({ timeline, caps, selectedRange, onClose }: ExportD
   useEffect(() => {
     if (mp4Blocked && container === "mp4" && !webmBlocked) setContainer("webm");
   }, [container, mp4Blocked, webmBlocked]);
+
+  // 面板关掉时把常驻合成器的画布还回去，但**保留导出 Worker**——
+  // 销毁 Worker 会连渲染上下文一起销毁，下次导出又要新建一个，
+  // 而"每导出一次建一个 WebGL 上下文"正是要避免的事（见 export/client.ts）
+  useEffect(() => releaseExportResources, []);
 
   const range: RenderRange = useMemo(
     () =>

@@ -63,6 +63,11 @@ interface LayerSlot {
   readonly sprite: Sprite;
 }
 
+/** `recover()` 等上下文回来的上限。浏览器主动恢复通常在一两帧内，给足富余。 */
+const RECOVER_TIMEOUT_MS = 3_000;
+/** 轮询间隔。事件在 OffscreenCanvas 上不保证派发，所以只能问 GL。 */
+const RECOVER_POLL_MS = 16;
+
 export interface PixiCompositorOptions {
   /** 渲染到这个可见画布（预览）；不传则新建 OffscreenCanvas（导出）。 */
   readonly target?: HTMLCanvasElement;
@@ -118,17 +123,44 @@ export async function createPixiCompositor(
 
   const stage: Container = new pixi.Container();
   const slots: LayerSlot[] = [];
-  let contextLost = false;
   let disposed = false;
 
-  // GL 上下文丢失不会抛错，渲染只是变成 no-op——导出跑几分钟，中途切标签页或
-  // 系统休眠都可能触发，静默产出几百帧黑画面是这个项目最不能接受的失败方式。
-  // 事件在 OffscreenCanvas 上不一定派发，所以 composeFrame 里还会再查一次
-  // gl.isContextLost()，这里的监听只是为了尽早置位
-  const onContextLost = () => {
-    contextLost = true;
+  /**
+   * 上下文当前丢没丢。
+   *
+   * **以 `gl.isContextLost()` 为准，不自己锁一个布尔量。** 第一版用一个只置位、
+   * 永不复位的标志，于是即使 Pixi 底下已经把上下文恢复了，合成器仍然一直抛错——
+   * "救得回来但我们不让它活"。事件监听只用来尽早察觉（`webglcontextlost` 在
+   * OffscreenCanvas 上不一定派发），真正的判据始终是问 GL 本身。
+   */
+  /**
+   * **创建时**就把 `WEBGL_lose_context` 抓在手里。
+   *
+   * 丢失之后 `gl.getExtension()` 返回 **null**（实测 Chrome 150），所以"等要用了
+   * 再取"永远取不到——第一版就是这么写的，表现为 `recover()` 什么也没做就超时。
+   * 扩展对象本身在上下文丢失后仍然可用，`restoreContext()` 正是要在那时调。
+   */
+  const loseContextExt = renderer.gl.getExtension("WEBGL_lose_context");
+
+  let sawLossEvent = false;
+  const lost = (): boolean => sawLossEvent || renderer.gl.isContextLost();
+
+  const onContextLost = (event: Event) => {
+    sawLossEvent = true;
+    // **不 preventDefault 就永远恢复不了**：规范要求丢失事件被取消，上下文才有
+    // 资格恢复；否则 `restoreContext()` 是空操作，`webglcontextrestored` 也不会派发
+    // （三种组合都实测过）。Pixi 自己也调，这里再调一次是为了让恢复能力不依赖
+    // 于它的实现细节——这条链上少一环就整条失效，而失效方式是"画面再也回不来"
+    event.preventDefault();
   };
+  const onContextRestored = () => {
+    sawLossEvent = false;
+  };
+  // Pixi 在同一张画布上也挂了这两个事件：restored 时它重新取扩展并向所有子系统
+  // 广播 contextChange 重建 GPU 状态。**真正的重建是 Pixi 做的**，
+  // `recover()` 只负责把上下文要回来
   canvas.addEventListener("webglcontextlost", onContextLost);
+  canvas.addEventListener("webglcontextrestored", onContextRestored);
 
   const ensureSlot = (index: number): LayerSlot => {
     const existing = slots[index];
@@ -157,13 +189,54 @@ export async function createPixiCompositor(
         ext.loseContext();
         return true;
       },
-      contextLost: () => contextLost || renderer.gl.isContextLost(),
+      contextLost: () => lost(),
+    },
+
+    isContextLost: () => !disposed && lost(),
+
+    /**
+     * 把上下文要回来。**重建 GPU 状态的是 Pixi，不是这里**（见上面事件监听处）。
+     *
+     * 两种丢失来源要分开看：
+     *
+     * - **浏览器主动收走**（驱动重置、休眠、上下文超预算被驱逐）：Pixi 已经
+     *   `preventDefault()` 过，浏览器会在能给的时候派发 `webglcontextrestored`。
+     *   我们要做的只是**等**。
+     * - **`WEBGL_lose_context` 模拟的丢失**（自检用）：没人会自动还回来，
+     *   必须显式 `restoreContext()`。规范说它只在配对的 `loseContext()` 之后有效，
+     *   所以对第一种情况调它是无害的，包在 try 里以防某些实现抛错。
+     *
+     * 等不回来就返回 false——那意味着这个合成器已经救不回来了，调用方该整个重建。
+     * 不在这里自己 `new WebGLRenderer` 重来一遍：`getContext()` 对同一张画布返回的
+     * 是同一个（仍然丢失的）上下文对象，重建拿不到新的；而换一张画布会让导出侧
+     * 已经抓住 `canvas` 的 `CanvasSource` 指向一个没人画的地方。
+     */
+    async recover(timeoutMs = RECOVER_TIMEOUT_MS) {
+      if (disposed) throw new Error("合成器已释放");
+      if (!lost()) return true;
+
+      try {
+        loseContextExt?.restoreContext();
+      } catch {
+        /* 不是我们弄丢的那种情况，交给浏览器 */
+      }
+
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        // 轮询而不是只等事件：Chrome 上 `webglcontextrestored` 在 OffscreenCanvas
+        // 上确实会派发（实测），但 Safari 未验，而 gl.isContextLost() 在哪都能问
+        if (!renderer.gl.isContextLost()) {
+          sawLossEvent = false;
+          return true;
+        }
+        await new Promise((resolve) => setTimeout(resolve, RECOVER_POLL_MS));
+      }
+      return false;
     },
 
     composeFrame(layers) {
       if (disposed) throw new Error("合成器已释放");
-      if (contextLost || renderer.gl.isContextLost()) {
-        contextLost = true;
+      if (lost()) {
         throw new Error("WebGL 上下文已丢失，无法继续合成——这一帧及之后都会是黑的");
       }
 
@@ -238,6 +311,7 @@ export async function createPixiCompositor(
       if (disposed) return;
       disposed = true;
       canvas.removeEventListener("webglcontextlost", onContextLost);
+      canvas.removeEventListener("webglcontextrestored", onContextRestored);
       for (const slot of slots) {
         // 先断开 resource，避免纹理销毁时还攥着某个 VideoFrame
         slot.source.resource = null as unknown as ImageResource;

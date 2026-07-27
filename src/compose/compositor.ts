@@ -141,7 +141,12 @@ export function isDefaultGeometry(transform?: LayerTransform): boolean {
 export interface Compositor {
   readonly width: number;
   readonly height: number;
-  /** 供编码器捕获（导出）或直接显示（预览）的画布。 */
+  /**
+   * 供编码器捕获（导出）或直接显示（预览）的画布。
+   *
+   * **恢复上下文时这个引用不会变**——导出侧的 `CanvasSource` 在开始时就抓住了它，
+   * 换一张画布等于把编码器接到一个没人画的地方。
+   */
   readonly canvas: OffscreenCanvas | HTMLCanvasElement;
   /**
    * 合成一帧。
@@ -149,8 +154,29 @@ export interface Compositor {
    * 传入的 `VideoSample` 由调用方负责 `close()`——合成器不接管生命周期，
    * 避免"谁该 close"的责任分散（硬规则 4）。合成器内部临时创建的
    * `VideoFrame` 由它自己关闭。
+   *
+   * 渲染上下文丢失时**抛错**，不静默出黑帧——见 `isContextLost`。
    */
   composeFrame(layers: readonly ComposeLayer[]): void;
+  /**
+   * 现在能不能画。
+   *
+   * GPU 后端的上下文会被浏览器收走（显卡驱动重置、系统休眠、切标签页，以及
+   * **同时存活的 WebGL 上下文超预算时驱逐最老的那个**）。丢了之后渲染不报错，
+   * 只是变成 no-op——导出跑几分钟静默产出几百帧黑画面是这个项目最不能接受的
+   * 失败方式，所以要有一个能主动问的判据。
+   */
+  isContextLost(): boolean;
+  /**
+   * 尝试把丢掉的上下文恢复回来。没丢时是个便宜的空操作。
+   *
+   * 返回 `false` 表示**救不回来**，调用方应当整个重建合成器（预览重新初始化、
+   * 导出中止并告知用户），而不是继续画——继续画就是黑帧。
+   *
+   * 放进这个接口而不是只放在 Pixi 后端上，是为了让预览和导出**不必判断自己
+   * 用的是哪个后端**。Canvas2D 那份是常量实现（见其注释）。
+   */
+  recover(): Promise<boolean>;
   dispose(): void;
 }
 
@@ -199,6 +225,13 @@ export function createCanvas2DCompositor(
         }
       }
     },
+
+    // Canvas2D 上下文在现代浏览器里也能丢（内存压力下 Chrome 会派发 `contextlost`），
+    // 但**我们没有观测到过**，而且它没有 WebGL 那个"同时存活数量有预算"的失效模式——
+    // 后者才是换 Pixi 后端新引入的风险。这里给常量实现只是为了让上层不必判断后端；
+    // 真遇到 2D 上下文丢失，表现会是画面不更新而不是抛错，届时再按同一套接口补。
+    isContextLost: () => false,
+    recover: async () => true,
 
     dispose() {
       ctx.clearRect(0, 0, width, height);

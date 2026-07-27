@@ -153,6 +153,34 @@ export async function verifyPixiBackend(): Promise<PixiVerifyResult> {
     ),
   );
 
+  // ---- 5a. 丢了之后要救得回来 ----
+  // 报错只解决了"不静默产出黑片"。生产里上下文丢失不是异常而是常态——用户切个
+  // 标签页、系统睡一觉、驱动重置一次都会触发——每次都要求重开项目是不可接受的。
+  // 断言比对**画面内容**而不只是"不黑"：GPU 资源在丢失时全部作废，Pixi 若没能
+  // 重新上传纹理，画出来会是纯色或上一帧，那些同样不黑
+  //
+  // 恢复后画的是**另一帧**（不是丢失前那帧）：开着 preserveDrawingBuffer，画布会
+  // 保留旧内容，重画同一帧的话即使"渲染其实没发生"也能量到正确色相——那条断言
+  // 就是空的。命中新帧的色相才证明这一次渲染真的发生了
+  const loss = report.contextLoss;
+  const hueDrift = hueDistance(loss.afterHue, loss.afterExpectedHue);
+  const staleBuffer = hueDistance(loss.afterHue, loss.beforeHue) <= 1;
+  checks.push(
+    check(
+      "上下文丢失后 recover() 能救回来，且之后画的是新的一帧（不是残留的旧画面）",
+      `恢复且色相命中新帧 ±${BACKEND_HUE_TOLERANCE_DEG}°`,
+      loss.extensionAvailable
+        ? `${loss.recoverDetail || "没跑到恢复这一步"} · 最大通道 ${loss.beforeMaxChannel} → ${loss.afterMaxChannel}`
+        : "无法测试：浏览器不提供 WEBGL_lose_context",
+      loss.extensionAvailable &&
+        loss.recovered &&
+        loss.afterMaxChannel > 32 &&
+        hueDrift <= BACKEND_HUE_TOLERANCE_DEG &&
+        // 两帧色相本来就该不同；相同说明画布上是丢失前的残留
+        !staleBuffer,
+    ),
+  );
+
   // ---- 5b. 上下文预算：反复导出会不会把 WebGL 上下文用光 ----
   // Canvas2D 没有这个失效模式，是换后端新引入的风险。Safari 在这个 spike 里
   // 连报 "too many active WebGL contexts, the oldest context will be lost"。
@@ -166,12 +194,25 @@ export async function verifyPixiBackend(): Promise<PixiVerifyResult> {
       budget.survivedCycles === budget.cycles && budget.freshMaxChannel > 32,
     ),
   );
+  //
+  // 断言的是**生产架构**（复用一个常驻合成器，见 pipeline.ts 的 acquireCompositor），
+  // 不是已经废弃的"每轮新建"。后者在 Safari 上必然把预览判死，拿它当断言就是一条
+  // 永远红的检查——那只会训练人忽略整个面板。但那个数字正是"为什么必须复用"的
+  // 证据，所以作为**对照**印在同一行里，连同"被驱逐之后救不救得回来"。
+  //
+  // 对照组救不回来这件事很关键：救得回来的话预览只是闪一下黑，复用就只是优化；
+  // 救不回来意味着预览真的死了，复用是唯一解。实测 Safari 救不回来
+  const churnNote =
+    budget.churnLongLivedMaxChannel > 32
+      ? "没被驱逐"
+      : `被驱逐，${budget.churnLongLivedRecovered ? "但能救回来" : "且救不回来"}`;
   checks.push(
     check(
-      `期间一直握着的那个合成器没被驱逐（预览在生产里就是它）`,
+      `复用一个常驻合成器跑 ${budget.cycles} 轮，预览那个还活着（导出侧复用的验收）`,
       "画得出",
-      `最大通道 ${budget.longLivedMaxChannel}${budget.detail ? ` · ${budget.detail}` : ""}`,
-      budget.longLivedMaxChannel > 32,
+      `复用组最大通道 ${budget.reuseLongLivedMaxChannel}` +
+        ` · 对照（每轮新建）：${churnNote}，最大通道 ${budget.churnLongLivedMaxChannel}`,
+      budget.reuseLongLivedMaxChannel > 32,
     ),
   );
 

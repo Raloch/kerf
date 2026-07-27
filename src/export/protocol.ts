@@ -104,7 +104,16 @@ export interface ExportPlan {
 
 export type WorkerRequest =
   | { readonly type: "start"; readonly request: ExportRequest }
-  | { readonly type: "cancel" };
+  | { readonly type: "cancel" }
+  /**
+   * 放掉常驻资源（合成器画布），但**不结束 Worker**。
+   *
+   * Worker 跨导出存活是为了让渲染上下文只建一次（见 `client.ts` 与
+   * `pipeline.ts` 的 `acquireCompositor`）；代价是一个 4K 项目的画布会一直占着。
+   * 这个口子让"关掉导出面板"能把它还回去，而不必连 Worker 一起销毁——
+   * 销毁了下次导出就又要新建一个上下文，正是要避免的事。
+   */
+  | { readonly type: "release" };
 
 export type WorkerResponse =
   | { readonly type: "progress"; readonly progress: ExportProgress }

@@ -10,9 +10,14 @@
  *
  * 结果也不再回传字节：`StreamTarget` 已经把成品写进用户选定的文件或 OPFS
  * （硬规则 9），回传的只有元信息。
+ *
+ * **这个 Worker 跨导出存活**（主线程侧见 `client.ts`）：合成器常驻在里面，
+ * 每次导出复用同一个渲染上下文。原因是换 Pixi 之后"每导出一次建一个 WebGL
+ * 上下文"会把预览挤掉，见 `pipeline.ts` 的 `acquireCompositor`。所以这里
+ * 每条消息都要把状态复位干净——它不再是"一次性"的。
  */
 
-import { ExportCanceled, runExport } from "./pipeline";
+import { ExportCanceled, releaseResidentCompositor, runExport } from "./pipeline";
 import type { WorkerRequest, WorkerResponse } from "./protocol";
 
 let canceled = false;
@@ -27,6 +32,13 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
 
   if (message.type === "cancel") {
     canceled = true;
+    return;
+  }
+
+  if (message.type === "release") {
+    // 跑着的时候不能放——合成器正被逐帧写。这时忽略即可：
+    // 导出结束后主线程会再发一次
+    if (!running) releaseResidentCompositor();
     return;
   }
 

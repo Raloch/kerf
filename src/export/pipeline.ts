@@ -40,7 +40,11 @@ import {
 } from "mediabunny";
 
 import { measureEncoderDelay, type EncoderDelay } from "../audio/encoder-delay";
-import { createCanvas2DCompositor, type ComposeLayer } from "../compose/compositor";
+import {
+  createCanvas2DCompositor,
+  type ComposeLayer,
+  type Compositor,
+} from "../compose/compositor";
 import { residency, ResidencyTracker } from "./residency";
 import { rasterizeText, textRasterCacheBytes } from "../compose/text-raster";
 import { videoTracksInDrawOrder, visibleVideoClips } from "../edl/sampling";
@@ -124,7 +128,7 @@ export async function runExport(
     trackId: track.id,
     reader: new VideoTrackReader(timeline, track, range),
   }));
-  const compositor = createCanvas2DCompositor(timeline.width, timeline.height);
+  const compositor = await acquireCompositor(timeline.width, timeline.height);
 
   const handle = await resolveHandle(request.target);
   const writable = await handle.createWritable();
@@ -222,8 +226,21 @@ export async function runExport(
         });
       }
 
-      // layers 为空 → 合成器画纯黑，这正是时间轴空隙该有的样子
-      compositor.composeFrame(layers);
+      // layers 为空 → 合成器画纯黑，这正是时间轴空隙该有的样子。
+      // 渲染上下文可能在导出中途被浏览器收走（切标签页、休眠、驱动重置），
+      // 那时 composeFrame 会抛错而不是静默出黑帧——救一次，救不回来就整次失败。
+      // **绝不能吞掉继续跑**：那会写出几百帧黑画面而用户以为导出成功了
+      try {
+        compositor.composeFrame(layers);
+      } catch (error) {
+        if (!compositor.isContextLost()) throw error;
+        if (!(await compositor.recover())) {
+          throw new Error(
+            `第 ${outputFrame} 帧时渲染上下文丢失且无法恢复，导出中止（成品不完整，已撤销）`,
+          );
+        }
+        compositor.composeFrame(layers);
+      }
 
       // await = 背压：编码队列满时这里会等，不会无限堆积帧
       await videoSource.add(
@@ -293,9 +310,58 @@ export async function runExport(
     }
     throw error;
   } finally {
-    compositor.dispose();
+    // **刻意不 dispose 合成器**——它是常驻的，跨导出复用，见 `acquireCompositor`
     await Promise.all(readers.map(({ reader }) => reader.dispose()));
   }
+}
+
+/**
+ * 常驻合成器。**每次导出复用同一个，不新建。**
+ *
+ * 今天的 Canvas2D 后端无所谓，这条是**换 Pixi 之前必须先立起来的前提**：
+ * 浏览器对同时存活的 WebGL 上下文有预算，超了就驱逐**最老的那一个**。
+ * 直觉会去防"连着导出十几次，下一次起不来"，但驱逐顺序决定了那个方向天然安全；
+ * 真正会死的是**预览**——它从打开项目起就一直握着一个合成器，是全场最老的，
+ * 而用户每导出一次就产生一轮创建/销毁。Safari 上 12 轮就把预览判死
+ * （spike 第 8 项）。
+ *
+ * 而且**救不回来**：spike 里量过，被预算驱逐的上下文调 `recover()` 会超时——
+ * 浏览器要等预算腾出来才还，而 Safari 的 `dispose()` 本来就不立刻还。
+ * 所以这不是"闪一下黑再自愈"，是预览真的死了。治因是唯一的解法。
+ *
+ * 尺寸变了才重建（不同项目的输出分辨率不同）。做成 async 是因为 Pixi 的工厂
+ * 是异步的——换后端时只有这个函数体要动。
+ */
+let residentCompositor: Compositor | null = null;
+
+async function acquireCompositor(width: number, height: number): Promise<Compositor> {
+  const existing = residentCompositor;
+  if (existing && existing.width === width && existing.height === height) {
+    // 上一次导出之后上下文可能已经没了（切标签页、休眠、驱动重置）。
+    // 救得回来就接着用，救不回来就当它不存在，下面重建
+    if (!existing.isContextLost() || (await existing.recover())) return existing;
+    existing.dispose();
+    residentCompositor = null;
+  } else if (existing) {
+    existing.dispose();
+    residentCompositor = null;
+  }
+
+  const created = createCanvas2DCompositor(width, height);
+  residentCompositor = created;
+  return created;
+}
+
+/**
+ * 放掉常驻合成器。
+ *
+ * Worker 现在跨导出存活（见 `export/client.ts`），所以要有一个显式的口子——
+ * 否则一个 4K 项目的画布会一直占着，哪怕用户之后再也不导出。
+ * 目前只在 Worker 收到 `release` 时调。
+ */
+export function releaseResidentCompositor(): void {
+  residentCompositor?.dispose();
+  residentCompositor = null;
 }
 
 /**
