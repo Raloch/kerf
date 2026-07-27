@@ -379,6 +379,14 @@ export function ExportDialog({ timeline, caps, selectedRange, onClose }: ExportD
                     {phase.result.mimeType}
                   </div>
                   <ResidencyLine residency={phase.result.residency} />
+                  {phase.result.mixResidency && (
+                    <div className="done-meta m dim">
+                      混音峰值 {formatBytes(phase.result.mixResidency.peak.estimatedBytes)}
+                      {" · "}
+                      其中中间 buffer{" "}
+                      {formatBytes(phase.result.mixResidency.peak.audioMixBytes)}
+                    </div>
+                  )}
                 </div>
               </div>
             </div>

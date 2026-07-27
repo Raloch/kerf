@@ -41,8 +41,16 @@ export interface ResidencySnapshot {
   readonly openInputs: number;
   /** 文字栅格缓存占的字节。每张是**输出尺寸**的画布，1080p 下单张 8.3MB。 */
   readonly textRasterBytes: number;
-  /** 主线程混好后 transfer 进来的 PCM。这一项**随片长线性增长**，是唯一这样的。 */
+  /** 混好的 PCM。这一项**随片长线性增长**。 */
   readonly audioPcmBytes: number;
+  /**
+   * 混音过程中同时活着的中间 buffer：各素材解出来的 PCM、`OfflineAudioContext`
+   * 的渲染目标。**只在主线程的那份计量里非零**——混音跑在主线程（硬规则 6）。
+   *
+   * 这一项容易被忽略而它可能比最终 PCM 还大：所有素材的解码结果要**同时**挂在
+   * 音频图上等渲染，渲染目标是另一整份，拷出来交给 Worker 时又是一份。
+   */
+  readonly audioMixBytes: number;
   /** 上面几项之和。 */
   readonly estimatedBytes: number;
   /** Chrome 私有的 JS 堆用量，拿不到就是 null。**不含解码帧和画布**，只是旁证。 */
@@ -83,6 +91,7 @@ class ResidencyMeter {
   private cursors = 0;
   private inputs = 0;
   private audioPcmBytes = 0;
+  private audioMixBytes = 0;
   /** 文字缓存的字节数由 text-raster 自己算，这里只存一个取值函数，避免反向依赖。 */
   private textRasterBytes: () => number = () => 0;
 
@@ -113,6 +122,14 @@ class ResidencyMeter {
     this.audioPcmBytes = bytes;
   }
 
+  /** 混音中间 buffer 的借出 / 归还。传字节数，因为音频 buffer 的尺寸各不相同。 */
+  retainMixBytes(bytes: number): void {
+    this.audioMixBytes += bytes;
+  }
+  releaseMixBytes(bytes: number): void {
+    this.audioMixBytes -= bytes;
+  }
+
   bindTextRasterBytes(read: () => number): void {
     this.textRasterBytes = read;
   }
@@ -132,6 +149,7 @@ class ResidencyMeter {
     this.cursors = 0;
     this.inputs = 0;
     this.audioPcmBytes = 0;
+    this.audioMixBytes = 0;
     return leftover;
   }
 
@@ -144,13 +162,31 @@ class ResidencyMeter {
       openInputs: this.inputs,
       textRasterBytes,
       audioPcmBytes: this.audioPcmBytes,
-      estimatedBytes: this.sampleBytes + textRasterBytes + this.audioPcmBytes,
+      audioMixBytes: this.audioMixBytes,
+      estimatedBytes:
+        this.sampleBytes + textRasterBytes + this.audioPcmBytes + this.audioMixBytes,
       jsHeapBytes: readJsHeap(),
     };
   }
 }
 
 export const residency = new ResidencyMeter();
+
+/**
+ * 开发期把计量器挂到全局，供控制台和实测脚本读**真实**那一份。
+ *
+ * 和 `__kerfStore` 是同一个坑的同一面：控制台里
+ * `import('/src/export/residency.ts')` 会因为 Vite 的 HMR URL 带参数而拿到
+ * **另一个模块实例**——那份从来没人喂过，读出来恒为 0，看起来像"计量没接上"。
+ * 已经踩过一次：量 30 分钟混音时峰值报 0，查了才发现读的是另一个单例。
+ *
+ * Worker 里也会执行这段（`globalThis` 在 Worker 里是 self），于是导出侧的那份
+ * 也能在 Worker 的控制台里读到。
+ */
+if (import.meta.env.DEV) {
+  (globalThis as typeof globalThis & { __kerfResidency?: ResidencyMeter }).__kerfResidency =
+    residency;
+}
 
 /**
  * 采样器：跟着导出的进度回调走，记峰值和首尾。

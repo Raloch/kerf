@@ -79,6 +79,12 @@ export interface ExportDone {
   readonly audioIncluded: boolean;
   readonly bytesWritten: number;
   readonly residency: ExportResidency;
+  /**
+   * 混音那一段的常驻量。**由主线程填**——Worker 产不出这个字段：混音跑在主线程
+   * （硬规则 6：`OfflineAudioContext` 在 Worker 里不可用），而计量器每个 JS 上下文
+   * 一份。长片的峰值很可能就在这里而不在导出循环里，所以两段都要报。
+   */
+  readonly mixResidency?: ResidencyReport;
   /** 走 OPFS 回退时的文件名；主线程据此读回触发下载。picker 路径为 undefined。 */
   readonly opfsName?: string | undefined;
 }

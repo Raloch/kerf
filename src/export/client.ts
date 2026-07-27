@@ -21,6 +21,7 @@ import type {
   WorkerRequest,
   WorkerResponse,
 } from "./protocol";
+import { residency, ResidencyTracker } from "./residency";
 import { downloadFromOpfs, type WriteTargetSpec } from "./write-target";
 
 export interface ExportOptions {
@@ -56,12 +57,27 @@ export function startExport(
     // 静态 import 会让它经由导出对话框回到首屏 chunk（实测踩过一次）
     const { mixdown, mixedAudioTransferables } = await import("../audio/mixdown");
 
-    onProgress({ stage: "mix", encodedFrames: 0, totalFrames, elapsedMs: 0 });
+    // 混音的常驻量要**主线程自己量**：计量器每个 JS 上下文一份，Worker 那份
+    // 看不到这一段。而混音恰恰是长片最可能先崩的地方——它要一次性把整条
+    // 时间轴的 PCM 分配出来，且中途有两三份同时活着（见 mixdown.ts 文件头）
+    const mixTracker = new ResidencyTracker();
+    residency.reset();
+    const sampleMix = () => {
+      mixTracker.sample(0);
+      onProgress({
+        stage: "mix",
+        encodedFrames: 0,
+        totalFrames,
+        elapsedMs: 0,
+        residency: residency.snapshot(),
+      });
+    };
+
+    sampleMix();
     const audio = options.includeAudio
-      ? await mixdown(options.timeline, options.range, () => {
-          onProgress({ stage: "mix", encodedFrames: 0, totalFrames, elapsedMs: 0 });
-        })
+      ? await mixdown(options.timeline, options.range, sampleMix)
       : null;
+    sampleMix();
     if (canceled) return null;
 
     // ---- 阶段 2：交给 Worker ----
@@ -87,12 +103,14 @@ export function startExport(
     );
 
     if (!result) return null;
+    // Worker 报的 residency 只覆盖导出循环，混音那一段挂在这里合并回去
+    const merged: ExportDone = { ...result, mixResidency: mixTracker.report() };
 
     // ---- 阶段 3：OPFS 回退路径把成品交给浏览器下载 ----
     if (result.opfsName && options.autoDownload !== false) {
       await downloadFromOpfs(result.opfsName, result.mimeType);
     }
-    return result;
+    return merged;
   })();
 
   return {

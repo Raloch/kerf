@@ -16,16 +16,34 @@
  * ## 已知的内存边界
  *
  * 整个区间一次性混完，结果是 `声道数 × 帧数 × 4` 字节的 PCM：
- * 立体声 48kHz 下约 **23MB / 分钟**。10 分钟的项目约 230MB，能跑；
- * 一小时的项目会到 1.4GB，会炸。分段混流 + 边混边喂编码器才是终解，
- * 但那需要 Worker 反过来向主线程请求下一段，是一套请求／应答协议。
- * 留给 M3 的「长视频内存压力测试」一起做，这里先把边界写明。
+ * 立体声 48kHz 下约 **23MB / 分钟**。
+ *
+ * 但**峰值远不止这一份**，这是量过之后才看清的：
+ *
+ * 1. 所有素材的解码结果要**同时**挂在音频图上等渲染（`node.buffer`），
+ *    它们按**源片自己的**采样率和声道数占内存，加起来可能比输出还大；
+ * 2. `OfflineAudioContext` 的渲染目标是完整的另一份；
+ * 3. 拷出来交给 Worker 时（不能直接 transfer 渲染结果，见下）又是一份。
+ *
+ * 于是 2、3 在拷贝那一刻**同时活着**，峰值至少是最终 PCM 的两倍再加上 1。
+ * 一小时的项目最终 PCM 是 1.4GB，峰值会到三四个 GB——所以炸的位置比
+ * "1.4GB"这个数暗示的更早。分段混流 + 边混边喂编码器才是终解，但那需要
+ * Worker 反过来向主线程请求下一段，是一套请求／应答协议，留给 M3。
+ *
+ * 这几项都接进了常驻量计量（`export/residency.ts` 的 `audioMixBytes`），
+ * 所以上面这些不是估的，是能在导出面板上看到的数。
  */
 
 import { ALL_FORMATS, AudioSampleSink, BlobSource, Input } from "mediabunny";
 import type { RenderRange, Timeline } from "../edl/types";
 import { microsToSeconds, sourceMicrosAt } from "../edl/sampling";
+import { residency } from "../export/residency";
 import { frameToMicros } from "../time/timebase";
+
+/** AudioBuffer 的字节数：f32，每声道每帧 4 字节。 */
+function bufferBytes(buffer: AudioBuffer): number {
+  return buffer.length * buffer.numberOfChannels * 4;
+}
 
 /**
  * 混流输出采样率。
@@ -103,6 +121,8 @@ export async function mixdown(
 
   let decoded = 0;
   let scheduled = 0;
+  // 挂上音频图的解码结果在渲染完成前都不能释放，这里记着好在渲染后一次性还掉
+  let scheduledBytes = 0;
   for (const job of jobs) {
     const pcm = await decodeRange(job.file, job.srcStartSeconds, job.srcEndSeconds);
     decoded++;
@@ -115,19 +135,39 @@ export async function mixdown(
     // 采样率不同由音频图重采样，单声道由音频图上混到立体声——都不用我们插手
     node.start(job.whenSeconds);
     scheduled++;
+    scheduledBytes += bufferBytes(pcm);
+    residency.retainMixBytes(bufferBytes(pcm));
   }
 
   // 所有片段都解不出音频（编码不支持等）时不要产出一段静音轨，
   // 那会让用户以为"导出成功但没声音"是我们弄丢的
-  if (scheduled === 0) return null;
+  if (scheduled === 0) {
+    residency.releaseMixBytes(scheduledBytes);
+    return null;
+  }
 
   const rendered = await ctx.startRendering();
+  residency.retainMixBytes(bufferBytes(rendered));
+  // 峰值就在下面这段拷贝里（三份同时活着），采一下才看得到
+  onProgress?.(1);
+
   const channels: Float32Array[] = [];
   for (let ch = 0; ch < rendered.numberOfChannels; ch++) {
     // 复制一份：getChannelData 返回的数组由 AudioBuffer 持有，
     // 直接 transfer 会把它 detach，rendered 自己就坏了
     channels.push(new Float32Array(rendered.getChannelData(ch)));
+    residency.retainMixBytes(rendered.length * 4);
   }
+  onProgress?.(1);
+
+  // **解码结果要到这里才销账，不是渲染一完成就销。** 它们还挂在
+  // `AudioBufferSourceNode.buffer` 上，而那些节点由 `ctx` 引用着，`ctx` 活到函数返回。
+  // 第一版在 startRendering() 之后就减掉了，于是峰值少报了整整一份——
+  // 记账点必须贴着"最后一个引用消失"的地方写，不是贴着"逻辑上用完了"
+  residency.releaseMixBytes(
+    scheduledBytes + bufferBytes(rendered) + rendered.length * 4 * rendered.numberOfChannels,
+  );
+  residency.setAudioPcmBytes(rendered.length * rendered.numberOfChannels * 4);
 
   return {
     sampleRate: rendered.sampleRate,
