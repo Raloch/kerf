@@ -38,7 +38,16 @@ import {
   type Timeline,
   type Track,
   type TrackId,
+  type TrackKind,
+  type Transition,
+  type TransitionKind,
 } from "../edl/types";
+import {
+  MAX_TRANSITION_FRAMES,
+  MIN_TRANSITION_FRAMES,
+  frozenFrames,
+  transitionWindow,
+} from "../edl/transition";
 
 /** 操作失败时返回原对象，并给出原因，便于 UI 提示而不是静默无反应。 */
 export interface EditResult {
@@ -110,8 +119,29 @@ export function computeDuration(tracks: readonly Track[]): number {
   return max;
 }
 
+/**
+ * 丢掉失去前驱的转场。**每次改动片段列表都要过这里**（见 `withClips`）。
+ *
+ * 转场挂在入场片段上，而"和谁交界"由占位决定，不由字段记录（见 `edl/types.ts`
+ * 的 `Transition`）。片段被拖开、前驱被删掉、前驱被裁短之后，那个字段就指向了
+ * 一个不存在的交界。留着它是"存了但不生效"的状态：界面显示有转场、画面上没有，
+ * 而两边都不报错。
+ *
+ * 只在**相邻关系断掉**时清，不因为"片段太短、窗口解不出来"而清——后者是可恢复的
+ * （把片段拉长转场就回来了），和关键帧被平移到片段外仍然保留是同一个道理。
+ */
+function dropOrphanTransitions(sorted: readonly Clip[], kind: TrackKind): Clip[] {
+  return sorted.map((clip, i) => {
+    if (!clip.transitionIn) return clip;
+    const prev = i > 0 ? sorted[i - 1] : undefined;
+    // 音频轨上的转场没有意义（混音走的是另一条路径），一并清掉
+    const live = kind === "video" && prev !== undefined && prev.timelineOut === clip.timelineIn;
+    return live ? clip : setOptional(clip, "transitionIn", undefined);
+  });
+}
+
 function withClips(track: Track, clips: readonly Clip[]): Track {
-  return { ...track, clips: sortClips(clips) };
+  return { ...track, clips: dropOrphanTransitions(sortClips(clips), track.kind) };
 }
 
 function mapTrack(
@@ -361,6 +391,9 @@ export function splitClipAt(timeline: Timeline, clipId: ClipId, frame: number): 
   // 与裁入点同理：右半段的起点换了内容，关键帧偏移要减掉切掉的那一段。
   // 左半段起点没动，原样保留（超出新长度的关键帧不删，见 shiftKeyframes）
   if (clip.keyframes) right = { ...right, keyframes: shiftKeyframes(clip.keyframes, cut) };
+  // **入点转场只跟左半段走。** 不清的话右半段会继承同一个转场，而它的新前驱正是
+  // 左半段——于是用户按一下 ⌘K 就凭空多出一个自己没加过的溶解，还刚好在新切点上
+  right = setOptional(right, "transitionIn", undefined);
 
   return ok(
     mapTrack(timeline, track.id, (t) =>
@@ -621,6 +654,114 @@ export function setClipLut(timeline: Timeline, clipId: ClipId, lutId?: LutId): E
   if (found.clip.lutId === lutId) return unchanged(timeline);
   return ok(replaceClip(timeline, found.track.id, setOptional(found.clip, "lutId", lutId)));
 }
+
+// ---------------------------------------------------------------------------
+// 转场
+// ---------------------------------------------------------------------------
+
+/** 一个交界当前的可编辑状态，给检查器用。 */
+export interface JunctionInfo {
+  /** 前驱片段；没有紧邻前驱时为 null，此时不能加转场。 */
+  readonly previous: Clip | null;
+  readonly transition: Transition | null;
+  /** 按当前时长解算出的实际窗口长度（帧）；解不出来是 0。 */
+  readonly effectiveFrames: number;
+  /** 出场侧、入场侧各有多少帧只能定格（素材余量不足）。 */
+  readonly frozen: { readonly from: number; readonly to: number };
+}
+
+/**
+ * 给片段的入点加上（或改掉、或摘掉）转场。`transition` 传 `undefined` 表示摘掉。
+ *
+ * 拒绝的两种情况都是**结构性**的、改时长也救不回来：没有紧邻前驱（时间轴开头，
+ * 或前面是空档），以及片段在音频轨上（混音是另一条路径，画面转场对它没有意义）。
+ *
+ * **不因为"素材余量不足"而拒绝**：最常见的用法恰恰是两段满长素材相邻，那时
+ * 两侧一帧余量都没有。那种情况按定格处理并把帧数报到界面上，理由见
+ * `edl/transition.ts` 的文件头。
+ */
+export function setTransition(
+  timeline: Timeline,
+  clipId: ClipId,
+  transition?: Transition,
+): EditResult {
+  const found = findClip(timeline, clipId);
+  if (!found) return reject(timeline, `找不到片段 ${clipId}`);
+  if (found.track.locked) return reject(timeline, "轨道已锁定");
+
+  if (transition !== undefined) {
+    if (found.track.kind !== "video") return reject(timeline, "音频轨上没有画面转场");
+    if (!previousClip(found.track, found.clip)) {
+      return reject(timeline, "这个片段前面没有紧邻的片段，无法添加转场");
+    }
+    if (!Number.isInteger(transition.frames)) return reject(timeline, "转场时长必须是整数帧");
+    if (
+      transition.frames < MIN_TRANSITION_FRAMES ||
+      transition.frames > MAX_TRANSITION_FRAMES
+    ) {
+      return reject(
+        timeline,
+        `转场时长要在 ${MIN_TRANSITION_FRAMES}–${MAX_TRANSITION_FRAMES} 帧之间`,
+      );
+    }
+  }
+
+  const current = found.clip.transitionIn;
+  if (
+    current?.kind === transition?.kind &&
+    current?.frames === transition?.frames
+  ) {
+    return unchanged(timeline);
+  }
+
+  return ok(
+    replaceClip(timeline, found.track.id, setOptional(found.clip, "transitionIn", transition)),
+  );
+}
+
+/** 紧邻在这个片段之前的片段；中间有空档或它是第一个时返回 null。 */
+export function previousClip(track: Track, clip: Clip): Clip | null {
+  return track.clips.find((c) => c.id !== clip.id && c.timelineOut === clip.timelineIn) ?? null;
+}
+
+/**
+ * 交界的完整状态。界面拿它决定"能不能加""实际多长""要不要提示定格"。
+ *
+ * 定格帧数在这里算而不是在界面上算：它要用 `transitionWindow` 解出来的**实际**
+ * 窗口，而实际窗口会被两侧片段各自的一半夹住——界面按用户输入的时长去推，
+ * 提示的数字就会和画面对不上，那比不提示更坏。
+ */
+export function junctionInfo(timeline: Timeline, clipId: ClipId): JunctionInfo | null {
+  const found = findClip(timeline, clipId);
+  if (!found) return null;
+  const previous = previousClip(found.track, found.clip);
+  const transition = found.clip.transitionIn ?? null;
+  const empty = { previous, transition, effectiveFrames: 0, frozen: { from: 0, to: 0 } };
+  if (!previous || !transition) return empty;
+
+  const window = transitionWindow(previous, found.clip, transition);
+  if (!window) return empty;
+  return {
+    previous,
+    transition,
+    effectiveFrames: window.frames,
+    frozen: {
+      from: frozenFrames(window, "from", sourceFramesOf(timeline, previous)),
+      to: frozenFrames(window, "to", sourceFramesOf(timeline, found.clip)),
+    },
+  };
+}
+
+/** 片段引用的源片有多少帧。文字片段没有源片，返回 0（它永远不会定格）。 */
+function sourceFramesOf(timeline: Timeline, clip: Clip): number {
+  if (clip.kind !== "media") return 0;
+  return timeline.sources.find((s) => s.id === clip.sourceId)?.durationFrames ?? 0;
+}
+
+/** 转场种类的显示名。加新种类时这里会因为 Record 缺项而编译报错。 */
+export const TRANSITION_LABELS: Record<TransitionKind, string> = {
+  dissolve: "交叉溶解",
+};
 
 /**
  * 改片段的**静态**调色。与 `setClipTransform` 完全同构，见其注释。

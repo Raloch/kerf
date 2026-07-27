@@ -10,6 +10,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { clipDuration, type Clip, type Timeline as Tl, type Track, type TrackId } from "../edl/types";
+import { trackTransitionWindows } from "../edl/transition";
 import { framesToTimecode, secondsToFrameCount } from "../time/timebase";
 import { toNumber } from "../time/rational";
 import { useTimeline } from "../state/timeline-store";
@@ -321,6 +322,18 @@ function TrackRow({
             proxyUrl={clip.kind === "media" ? proxyUrls[clip.sourceId] : undefined}
           />
         ))}
+        {track.kind === "video" &&
+          trackTransitionWindows(track.clips).map((w) => (
+            <div
+              key={`tr-${w.to.id}`}
+              className="tr-mark"
+              title={`${w.frames} 帧交叉溶解`}
+              style={{
+                left: `${w.startFrame * pxPerFrame}px`,
+                width: `${w.frames * pxPerFrame}px`,
+              }}
+            />
+          ))}
         {ghost && <GhostView ghost={ghost} pxPerFrame={pxPerFrame} />}
       </div>
     </div>

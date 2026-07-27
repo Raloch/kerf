@@ -33,6 +33,12 @@ import {
   type Timeline,
   type Track,
 } from "./types";
+import {
+  clampSourceMicros,
+  transitionAt,
+  transitionProgress,
+  type TransitionWindow,
+} from "./transition";
 import { frameDurationMicros, frameToMicros, MICROS_PER_SECOND } from "../time/timebase";
 import { resolveColor, resolveTransform } from "../anim/keyframes";
 import type { ColorAdjust } from "../compose/color";
@@ -157,10 +163,66 @@ export function videoTracksInDrawOrder(timeline: Timeline): Track[] {
 }
 
 /**
+ * 某帧在某条轨上参与画面的一个片段。
+ *
+ * 平时一条轨每帧至多一个，**转场窗口里是两个**（出场压在下面、入场压在上面）。
+ * 「最多借出自己长度的一半」这条约束保证了不会有第三个（见 `edl/transition.ts`）。
+ */
+export interface TrackSlice {
+  readonly clip: Clip;
+  /** 该片段在这一帧的转场角色。不在窗口里时不存在。 */
+  readonly transition?: {
+    readonly window: TransitionWindow;
+    readonly role: "from" | "to";
+    /** 0 → 1，两端都取不到（帧中点采样）。 */
+    readonly progress: number;
+  };
+}
+
+/**
+ * 某帧在某条轨上要画的片段，**按绘制顺序**（转场时出场在前、入场在后）。
+ *
+ * 这是"一条轨这一帧要哪几个片段"的**唯一答案**。导出的 reader 也问它——
+ * 否则 reader 会按老规矩只解码一个片段，转场窗口里入场那层就是黑的，
+ * 而预览侧（走 `visibleVideoClips`）是对的：一个只在成片里出现的画面差异。
+ */
+export function trackClipsAt(track: Track, frame: number): TrackSlice[] {
+  const window = transitionAt(track.clips, frame);
+  if (window) {
+    const progress = transitionProgress(window, frame);
+    return [
+      { clip: window.from, transition: { window, role: "from", progress } },
+      { clip: window.to, transition: { window, role: "to", progress } },
+    ];
+  }
+  const clip = clipAt(track, frame);
+  return clip ? [{ clip }] : [];
+}
+
+/**
+ * 交叉溶解：把入场层的不透明度乘上进度。
+ *
+ * 按 z 序画完出场层再把入场层以 alpha=t 叠上去，结果就是 `A*(1-t) + B*t`——
+ * 标准的交叉溶解，而且**不需要任何新的合成能力**，两个后端都画得出来。
+ * 出场层不动：它的 `1-t` 是被上面那层盖出来的，再乘一遍就会露出下面的轨。
+ *
+ * *已知的语义边界*：出场层自身不透明度 < 1 时（叠加轨、或它自己有透明度关键帧），
+ * 严格的做法是先把两层混好再合成到下层，这里是先各自合成再叠。两层都不透明时
+ * 两者完全相同，而那是绝大多数情况。等 shader 转场落地后这条会自然消失——
+ * 那时两个输入本来就要先渲进各自的纹理。
+ */
+function dissolveTransform(
+  base: LayerTransform | undefined,
+  progress: number,
+): LayerTransform {
+  return { ...base, opacity: (base?.opacity ?? 1) * progress };
+}
+
+/**
  * 收集某帧要画的所有图层，**按 z 序从底到顶**排列。素材层和文字层混在一起返回。
  *
  * 空档（该轨在该帧没有片段）不产生图层——所有轨都空时合成器画纯黑底，
- * 这正是时间轴空隙应有的样子。
+ * 这正是时间轴空隙应有的样子。转场窗口里同一条轨会产生**两层**，见 `trackClipsAt`。
  *
  * 文字层**不拆成第二个函数**：叠加轨的素材和字幕轨的文字谁压谁，是同一个 z 序问题，
  * 拆开就等于让调用方自己再合并一次顺序，而那个反转只允许有一处
@@ -169,36 +231,65 @@ export function videoTracksInDrawOrder(timeline: Timeline): Track[] {
 export function visibleVideoClips(timeline: Timeline, frame: number): VisibleClip[] {
   const out: VisibleClip[] = [];
   for (const track of videoTracksInDrawOrder(timeline)) {
-    const clip = clipAt(track, frame);
-    if (!clip) continue;
-    // `transform` / `color` 用条件展开而不是直接写 `transform: undefined`：
-    // exactOptionalPropertyTypes 下"字段不存在"和"字段是 undefined"是两回事，
-    // 而下游靠"没有变换 / 没有调色"走恒等快路径
-    const transform = transformAt(clip, frame);
-    const color = colorAt(clip, frame);
-    // 引用了已删除的 LUT 时当作没套，而不是整条渲染崩掉——那是编辑器该能扛住的状态
-    const lut = clip.lutId ? findLut(timeline, clip.lutId) : null;
-    const extras = {
-      ...(transform ? { transform } : {}),
-      ...(color ? { color } : {}),
-      ...(lut ? { lut } : {}),
-    };
-    if (clip.kind === "text") {
-      out.push({ kind: "text", trackId: track.id, clip, ...extras });
-      continue;
+    for (const { clip, transition } of trackClipsAt(track, frame)) {
+      // `transform` / `color` 用条件展开而不是直接写 `transform: undefined`：
+      // exactOptionalPropertyTypes 下"字段不存在"和"字段是 undefined"是两回事，
+      // 而下游靠"没有变换 / 没有调色"走恒等快路径
+      const resolved = transformAt(clip, frame);
+      // 入场层在窗口里必然带不透明度，于是必然掉出恒等快路径——这是对的，
+      // 它本来就不是恒等；出场层不带，仍然走原路径逐像素不变
+      const transform =
+        transition?.role === "to"
+          ? dissolveTransform(resolved, transition.progress)
+          : resolved;
+      const color = colorAt(clip, frame);
+      // 引用了已删除的 LUT 时当作没套，而不是整条渲染崩掉——那是编辑器该能扛住的状态
+      const lut = clip.lutId ? findLut(timeline, clip.lutId) : null;
+      const extras = {
+        ...(transform ? { transform } : {}),
+        ...(color ? { color } : {}),
+        ...(lut ? { lut } : {}),
+      };
+      if (clip.kind === "text") {
+        out.push({ kind: "text", trackId: track.id, clip, ...extras });
+        continue;
+      }
+      const source = timeline.sources.find((s) => s.id === clip.sourceId);
+      if (!source) continue;
+      out.push({
+        kind: "media",
+        trackId: track.id,
+        clip,
+        source,
+        sourceMicros: renderSourceMicros(clip, frame, timeline, source, transition !== undefined),
+        ...extras,
+      });
     }
-    const source = timeline.sources.find((s) => s.id === clip.sourceId);
-    if (!source) continue;
-    out.push({
-      kind: "media",
-      trackId: track.id,
-      clip,
-      source,
-      sourceMicros: sourceMicrosAt(clip, frame, timeline.fps, source.fps),
-      ...extras,
-    });
   }
   return out;
+}
+
+/**
+ * 取帧位置，转场窗口里夹回素材真实存在的范围。
+ *
+ * 窗口跨过交界，于是出场层要读它出点**之后**、入场层要读它入点**之前**的素材。
+ * 素材没那么多时夹住 = 定格边缘帧，帧数由 `frozenFrames()` 报到界面上。
+ *
+ * 夹紧**只在窗口里做**：平时越界意味着别处算错了，那时静默定格会把 bug 藏起来。
+ *
+ * 导出的 reader 也调这个函数决定解码位置。**必须是同一个**——reader 夹一套、
+ * 装配图层时夹另一套，成片就会在转场里取到相邻的另一帧，而预览是对的。
+ */
+export function renderSourceMicros(
+  clip: MediaClip,
+  frame: number,
+  timeline: Timeline,
+  source: MediaSource,
+  inTransition: boolean,
+): number {
+  const raw = sourceMicrosAt(clip, frame, timeline.fps, source.fps);
+  if (!inTransition) return raw;
+  return clampSourceMicros(raw, frameToMicros(source.durationFrames - 1, source.fps));
 }
 
 /**

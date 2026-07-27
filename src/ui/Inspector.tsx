@@ -36,11 +36,14 @@ import { clipDuration, findLut, type Clip, type MediaClip, type TextClip, type T
 import {
   findClip,
   isColorProperty,
+  junctionInfo,
   PROPERTY_LABELS,
   PROPERTY_RANGES,
+  TRANSITION_LABELS,
   type ColorPatch,
   type TransformPatch,
 } from "../state/operations";
+import { MAX_TRANSITION_FRAMES, MIN_TRANSITION_FRAMES } from "../edl/transition";
 import { useTimeline } from "../state/timeline-store";
 import { framesToTimecode, formatDuration } from "../time/timebase";
 import { IconX } from "./icons";
@@ -202,9 +205,10 @@ export function Inspector() {
         <SourceSection clip={clip} timeline={timeline} />
       )}
 
-      {/* 音频片段没有画面，变换和调色对它都没有意义 */}
+      {/* 音频片段没有画面，转场、变换和调色对它都没有意义 */}
       {track.kind === "video" && (
         <>
+          <TransitionSection clip={clip} timeline={timeline} />
           <PropertySection group="transform" clip={clip} playhead={playhead} />
           <PropertySection group="color" clip={clip} playhead={playhead} />
         </>
@@ -233,6 +237,107 @@ function SourceSection({
           <span className="val">{framesToTimecode(clip.sourceIn, timeline.fps)}</span>
         </div>
       </div>
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 入点转场
+// ---------------------------------------------------------------------------
+
+/** 新建转场的默认时长（帧）。半秒上下，是最常用的溶解长度。 */
+const DEFAULT_TRANSITION_FRAMES = 16;
+
+/**
+ * 片段**入点**上的转场。挂在入场片段上，所以这一节属于右边那个片段。
+ *
+ * 三件事只在这里说，因为它们只有解算之后才知道，而用户输入的时长推不出来：
+ * 前面有没有紧邻片段（没有就整节禁用）、**实际**窗口多长（会被两侧片段各自的
+ * 一半夹住）、以及素材余量不够时两侧各定格几帧。最后一条是刻意要显眼的——
+ * 定格是画面上看得见的降级，看得见的降级要标注（见 `edl/transition.ts` 文件头）。
+ */
+function TransitionSection({
+  clip,
+  timeline,
+}: {
+  readonly clip: Clip;
+  readonly timeline: Timeline;
+}) {
+  const setTransition = useTimeline((s) => s.setTransition);
+  const info = junctionInfo(timeline, clip.id);
+  if (!info) return null;
+
+  const { previous, transition, effectiveFrames, frozen } = info;
+  const frozenTotal = frozen.from + frozen.to;
+
+  return (
+    <>
+      <div className="grp-title">入点转场</div>
+      <div className="fields">
+        <div className="f ctl wide3">
+          <label>类型</label>
+          {transition ? (
+            <>
+              <span className="val">{TRANSITION_LABELS[transition.kind]}</span>
+              <button type="button" className="mini" onClick={() => setTransition(clip.id)}>
+                移除
+              </button>
+            </>
+          ) : (
+            <button
+              type="button"
+              className="mini"
+              disabled={!previous}
+              title={previous ? "" : "前面没有紧邻的片段"}
+              onClick={() =>
+                setTransition(clip.id, {
+                  kind: "dissolve",
+                  frames: DEFAULT_TRANSITION_FRAMES,
+                })
+              }
+            >
+              添加交叉溶解
+            </button>
+          )}
+        </div>
+        {transition && (
+          <div className="f ctl wide3">
+            <label>时长</label>
+            <input
+              type="range"
+              min={MIN_TRANSITION_FRAMES}
+              max={MAX_TRANSITION_FRAMES}
+              step={2}
+              value={transition.frames}
+              onChange={(e) =>
+                setTransition(clip.id, {
+                  kind: transition.kind,
+                  frames: Number(e.target.value),
+                })
+              }
+            />
+            <span className="val">{transition.frames} 帧</span>
+          </div>
+        )}
+      </div>
+      {transition && effectiveFrames !== transition.frames && (
+        <p className="hint">
+          实际 {effectiveFrames} 帧：窗口以剪切点为中心左右对称，且每个片段最多借出
+          自己长度的一半。
+        </p>
+      )}
+      {frozenTotal > 0 && (
+        <p className="hint err">
+          {"素材余量不足，转场里"}
+          {[
+            frozen.from > 0 ? `前一段末尾定格 ${frozen.from} 帧` : null,
+            frozen.to > 0 ? `这一段开头定格 ${frozen.to} 帧` : null,
+          ]
+            .filter(Boolean)
+            .join("、")}
+          {"。把两侧的入/出点各往里裁一些就能拿回真实画面。"}
+        </p>
+      )}
     </>
   );
 }
@@ -368,7 +473,7 @@ function LutRow({
   return (
     <>
       <div className="fields">
-        <div className="f ctl lut">
+        <div className="f ctl wide3">
           <label>LUT</label>
           {current ? (
             <>

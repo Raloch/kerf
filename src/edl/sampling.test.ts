@@ -13,6 +13,7 @@ import {
   audioClipsAt,
   sourceCenterMicrosAt,
   sourceMicrosAt,
+  trackClipsAt,
   videoTracksInDrawOrder,
   visibleVideoClips,
 } from "./sampling";
@@ -262,5 +263,159 @@ describe("audioClipsAt", () => {
       [source()],
     );
     expect(audioClipsAt(tl, 10).map((v) => v.clip.id)).toEqual(["a2"]);
+  });
+});
+
+describe("转场窗口里的取样", () => {
+  /** A[0,100) 与 B[100,200)，B 挂 20 帧溶解 → 窗口 [90,110)。 */
+  const dissolvePair = (over: Partial<MediaClip> = {}): Timeline =>
+    timeline(
+      [
+        {
+          id: "V1",
+          kind: "video",
+          clips: [
+            clip({ id: "a", timelineIn: 0, timelineOut: 100, sourceIn: 0 }),
+            clip({
+              id: "b",
+              timelineIn: 100,
+              timelineOut: 200,
+              sourceIn: 100,
+              transitionIn: { kind: "dissolve", frames: 20 },
+              ...over,
+            }),
+          ],
+        },
+      ],
+      [source({ durationFrames: 300 })],
+    );
+
+  it("窗口外只有一层，窗口内两层——出场在下、入场在上", () => {
+    const tl = dissolvePair();
+    expect(visibleVideoClips(tl, 89).map((v) => v.clip.id)).toEqual(["a"]);
+    expect(visibleVideoClips(tl, 90).map((v) => v.clip.id)).toEqual(["a", "b"]);
+    expect(visibleVideoClips(tl, 109).map((v) => v.clip.id)).toEqual(["a", "b"]);
+    expect(visibleVideoClips(tl, 110).map((v) => v.clip.id)).toEqual(["b"]);
+  });
+
+  it("入场层带上不透明度，出场层不带——溶解由上层的 alpha 表达", () => {
+    const tl = dissolvePair();
+    const [from, to] = visibleVideoClips(tl, 90);
+    expect(from!.transform).toBeUndefined();
+    expect(to!.transform?.opacity).toBeCloseTo(0.025, 6);
+  });
+
+  it("不透明度逐帧递增，且叠在片段自己的透明度上而不是覆盖它", () => {
+    const tl = dissolvePair({ transform: { opacity: 0.5 } });
+    const at = (f: number) => visibleVideoClips(tl, f)[1]!.transform!.opacity!;
+    expect(at(90)).toBeCloseTo(0.5 * 0.025, 6);
+    expect(at(109)).toBeCloseTo(0.5 * 0.975, 6);
+    expect(at(100)).toBeGreaterThan(at(95));
+  });
+
+  it("出场层在交界之后继续读源片——这正是它需要素材余量的原因", () => {
+    const tl = dissolvePair();
+    const from = visibleVideoClips(tl, 105)[0]!;
+    // A 占源片 [0,100)，第 105 帧要读的是源片第 105 帧（出点之后 5 帧）
+    expect(from.clip.id).toBe("a");
+    expect(from.kind === "media" && from.sourceMicros).toBe(frameToMicros(105, FPS.ntsc30));
+  });
+
+  it("素材余量不足时夹回末帧 = 定格，而不是读到源片外面去", () => {
+    // 源片只有 100 帧，A 用满了 → 出点之后一帧余量都没有
+    const tl = timeline(
+      [
+        {
+          id: "V1",
+          kind: "video",
+          clips: [
+            clip({ id: "a", timelineIn: 0, timelineOut: 100, sourceIn: 0 }),
+            clip({
+              id: "b",
+              timelineIn: 100,
+              timelineOut: 200,
+              sourceIn: 0,
+              transitionIn: { kind: "dissolve", frames: 20 },
+            }),
+          ],
+        },
+      ],
+      [source({ durationFrames: 100 })],
+    );
+    const last = frameToMicros(99, FPS.ntsc30);
+    for (const f of [100, 105, 109]) {
+      const from = visibleVideoClips(tl, f)[0]!;
+      expect(from.kind === "media" && from.sourceMicros).toBe(last);
+    }
+    // 入场侧同理：窗口前半段算出来是负位置，夹到 0
+    for (const f of [90, 95, 99]) {
+      const to = visibleVideoClips(tl, f)[1]!;
+      expect(to.kind === "media" && to.sourceMicros).toBe(0);
+    }
+  });
+
+  it("孤儿转场不生效：前驱被拖开之后仍然只画一层", () => {
+    const tl = timeline(
+      [
+        {
+          id: "V1",
+          kind: "video",
+          clips: [
+            clip({ id: "a", timelineIn: 0, timelineOut: 80 }),
+            clip({
+              id: "b",
+              timelineIn: 100,
+              timelineOut: 200,
+              transitionIn: { kind: "dissolve", frames: 20 },
+            }),
+          ],
+        },
+      ],
+      [source()],
+    );
+    expect(visibleVideoClips(tl, 95)).toEqual([]);
+    expect(visibleVideoClips(tl, 105).map((v) => v.clip.id)).toEqual(["b"]);
+  });
+});
+
+describe("trackClipsAt", () => {
+  it("平时至多一个，转场窗口里恰好两个", () => {
+    const track: Track = {
+      id: "V1",
+      kind: "video",
+      clips: [
+        clip({ id: "a", timelineIn: 0, timelineOut: 100 }),
+        clip({
+          id: "b",
+          timelineIn: 100,
+          timelineOut: 200,
+          transitionIn: { kind: "dissolve", frames: 20 },
+        }),
+      ],
+    };
+    expect(trackClipsAt(track, 50)).toHaveLength(1);
+    expect(trackClipsAt(track, 95)).toHaveLength(2);
+    expect(trackClipsAt(track, 150)).toHaveLength(1);
+    expect(trackClipsAt(track, 250)).toHaveLength(0);
+  });
+
+  it("角色标对：先出场后入场", () => {
+    const track: Track = {
+      id: "V1",
+      kind: "video",
+      clips: [
+        clip({ id: "a", timelineIn: 0, timelineOut: 100 }),
+        clip({
+          id: "b",
+          timelineIn: 100,
+          timelineOut: 200,
+          transitionIn: { kind: "dissolve", frames: 20 },
+        }),
+      ],
+    };
+    expect(trackClipsAt(track, 95).map((s) => [s.clip.id, s.transition?.role])).toEqual([
+      ["a", "from"],
+      ["b", "to"],
+    ]);
   });
 });

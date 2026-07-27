@@ -49,6 +49,32 @@ export interface LutSource {
  */
 export type TrackKind = "video" | "audio";
 
+/**
+ * 转场的种类。
+ *
+ * `dissolve` 走既有的图层不透明度通道（入场层画在出场层之上、alpha = 进度），
+ * 因此**两个后端都画得出来、不需要任何新的合成能力**。需要同时采样两张纹理的
+ * shader 转场（擦除 / 推移 / 故障）会加在这里，那时它们归 `supportsEffects` 管。
+ */
+export type TransitionKind = "dissolve";
+
+/**
+ * 挂在两个**紧邻**片段交界上的转场。
+ *
+ * 存在**入场片段**（右边那个）的 `transitionIn` 上，不单独放一张表：转场天然
+ * 属于一个交界，而交界由"这个片段和它的前驱"唯一确定；单独放表就要自己维护
+ * 一组片段 id 引用，而片段会被移动、切分、删除——那些引用会悄悄变成孤儿。
+ * 挂在片段上时，删掉片段就删掉了转场，切分时它跟着左半段走，都是对的。
+ *
+ * `frames` 是**请求**时长。实际窗口恒对称、恒为偶数、且被两侧片段各自的一半
+ * 夹住，由 `edl/transition.ts` 的 `transitionWindow()` 算出来——**不要在别处
+ * 用这个数字推窗口**。
+ */
+export interface Transition {
+  readonly kind: TransitionKind;
+  readonly frames: number;
+}
+
 /** 导入的素材。M0 直接持有 File；M1 起改为 OPFS 句柄 + 代理文件。 */
 export interface MediaSource {
   readonly id: SourceId;
@@ -110,6 +136,16 @@ interface ClipBase {
    * 打点、删点、平移、撤销都与"这个属性最后作用到哪儿"无关。
    */
   readonly keyframes?: KeyframeChannels;
+  /**
+   * 与**前一个紧邻片段**之间的转场。缺省 = 硬切。
+   *
+   * 放在入场片段上而不是出场片段上，是为了让"第一个片段"天然没有转场——
+   * 时间轴开头没有可以溶解过来的东西。理由与窗口算法见 `edl/transition.ts`。
+   *
+   * **相邻关系不由类型保证**：片段被拖开之后这个字段会变成孤儿。归一化在
+   * `state/operations.ts`（每次编辑后清理），渲染侧再防一道（窗口解不出来就当没有）。
+   */
+  readonly transitionIn?: Transition;
 }
 
 /** 引用一段导入素材的片段。`sourceIn` 是它引用源片的起始帧。 */

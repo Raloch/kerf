@@ -120,9 +120,7 @@ export async function runExport(
   const drawOrder = videoTracksInDrawOrder(timeline);
   if (drawOrder.length === 0) throw new Error("时间轴上没有可见的视频轨");
 
-  // 带上 trackId：装配图层时要按轨对上 `visibleVideoClips` 给的那一层
   const readers = drawOrder.map((track) => ({
-    trackId: track.id,
     reader: new VideoTrackReader(timeline, track, range),
   }));
   const compositor = await acquireCompositor(timeline.width, timeline.height);
@@ -183,11 +181,13 @@ export async function runExport(
       // 第一步：把**每条**轨都推进到这一帧，包括这一帧没有片段的。
       // 不能只问"有可见图层"的那几条轨——空档轨也要被问到才会主动释放解码器，
       // 而且 reader 只允许向前问（硬规则 3），漏问一帧就再也补不回来。
-      // sample 归 reader 所有，这里不能 close（硬规则 4）
+      // sample 归 reader 所有，这里不能 close（硬规则 4）。
+      // **按 clipId 索引而不是按轨**：转场窗口里一条轨会同时吐出两个片段的帧
       const samples = new Map<string, VideoSample>();
-      for (const { trackId, reader } of readers) {
-        const sample = await reader.sampleAt(outputFrame);
-        if (sample) samples.set(trackId, sample);
+      for (const { reader } of readers) {
+        for (const [clipId, sample] of await reader.samplesAt(outputFrame)) {
+          samples.set(clipId, sample);
+        }
       }
 
       // 第二步：按图层顺序装配。顺序、每层的变换和调色都来自 sampling.ts，
@@ -219,7 +219,7 @@ export async function runExport(
           }
           continue;
         }
-        const sample = samples.get(visible.trackId);
+        const sample = samples.get(visible.clip.id);
         if (!sample) continue;
         layers.push({ kind: "sample", sample, ...looks });
       }

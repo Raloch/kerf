@@ -12,7 +12,16 @@
 
 import { create } from "zustand";
 import type { AnimatableProperty, Easing } from "../anim/keyframes";
-import type { Clip, ClipId, LutId, LutSource, MediaSource, Timeline, TrackId } from "../edl/types";
+import type {
+  Clip,
+  ClipId,
+  LutId,
+  LutSource,
+  MediaSource,
+  Timeline,
+  TrackId,
+  Transition,
+} from "../edl/types";
 import { singleClipTimeline } from "../edl/types";
 import { FPS } from "../time/rational";
 import {
@@ -38,6 +47,7 @@ import {
   rippleDeleteClip,
   setClipColor,
   setClipLut,
+  setTransition,
   setClipTransform,
   setKeyframe,
   setTextContent,
@@ -113,6 +123,13 @@ export interface TimelineState {
   addLut: (lut: LutSource) => void;
   /** 给片段挂上 / 摘掉 LUT。传 undefined 表示摘掉。 */
   setClipLut: (clipId: ClipId, lutId?: LutId) => void;
+  /**
+   * 给片段的入点设置（或摘掉）转场。
+   *
+   * 合并键带 clipId：拖时长滑块时连续发同一个交界的改动，应该合成一次撤销，
+   * 但换一个交界必须断开——否则一次 ⌘Z 会同时撤掉两个交界上的编辑。
+   */
+  setTransition: (clipId: ClipId, transition?: Transition) => void;
   /** 在**时间轴帧号** `frame` 处打关键帧；内部换算成片段内偏移。 */
   setKeyframeAt: (
     clipId: ClipId,
@@ -319,6 +336,14 @@ export const useTimeline = create<TimelineState>((set, get) => {
 
     setClipLut(clipId, lutId) {
       apply(setClipLut(get().timeline(), clipId, lutId), lutId ? "套用 LUT" : "移除 LUT");
+    },
+
+    setTransition(clipId, transition) {
+      apply(
+        setTransition(get().timeline(), clipId, transition),
+        transition ? "设置转场" : "移除转场",
+        transition ? `transition:${clipId}` : undefined,
+      );
     },
 
     setKeyframeAt(clipId, property, frame, value, easing) {

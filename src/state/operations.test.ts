@@ -2,13 +2,22 @@ import { describe, expect, it } from "vitest";
 import { FPS } from "../time/rational";
 import { clipsUsingEffects } from "../edl/types";
 import type { LutSource } from "../edl/types";
-import type { Clip, MediaClip, MediaSource, TextClip, Timeline, Track } from "../edl/types";
+import type {
+  Clip,
+  MediaClip,
+  MediaSource,
+  TextClip,
+  Timeline,
+  Track,
+  Transition,
+} from "../edl/types";
 import {
   addLut,
   addTextClip,
   clearKeyframes,
   computeDuration,
   findClip,
+  junctionInfo,
   moveClip,
   removeClip,
   removeKeyframe,
@@ -22,6 +31,7 @@ import {
   snapDrag,
   snapFrame,
   snapTargets,
+  setTransition,
   splitClipAt,
   trimClip,
 } from "./operations";
@@ -872,5 +882,187 @@ describe("新建文字片段", () => {
   it("时长至少 1 帧", () => {
     const r = addTextClip(layout(), { timelineIn: 0, durationFrames: 0, text: "x" });
     expect(r.reason).toContain("1 帧");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 转场
+// ---------------------------------------------------------------------------
+
+describe("setTransition", () => {
+  const adjacent = () =>
+    timeline([
+      { id: "V1", kind: "video", clips: [clip("a", 0, 100), clip("b", 100, 200, 100)] },
+    ]);
+  const dissolve = (frames: number): Transition => ({ kind: "dissolve", frames });
+
+  it("给紧邻的入场片段加转场", () => {
+    const r = setTransition(adjacent(), "b", dissolve(20));
+    expect(r.changed).toBe(true);
+    expect(findClip(r.timeline, "b")?.clip.transitionIn).toEqual(dissolve(20));
+  });
+
+  it("前面是空档时拒绝——没有可以溶解过来的东西", () => {
+    const tl = timeline([
+      { id: "V1", kind: "video", clips: [clip("a", 0, 80), clip("b", 100, 200)] },
+    ]);
+    const r = setTransition(tl, "b", dissolve(20));
+    expect(r.changed).toBe(false);
+    expect(r.reason).toContain("没有紧邻");
+  });
+
+  it("时间轴上第一个片段拒绝", () => {
+    const r = setTransition(adjacent(), "a", dissolve(20));
+    expect(r.changed).toBe(false);
+  });
+
+  it("音频轨上拒绝", () => {
+    const tl = timeline([
+      { id: "A1", kind: "audio", clips: [clip("a", 0, 100), clip("b", 100, 200)] },
+    ]);
+    expect(setTransition(tl, "b", dissolve(20)).changed).toBe(false);
+  });
+
+  it("时长越界拒绝并给出范围", () => {
+    expect(setTransition(adjacent(), "b", dissolve(1)).reason).toContain("帧之间");
+    expect(setTransition(adjacent(), "b", dissolve(99999)).reason).toContain("帧之间");
+  });
+
+  it("素材余量不足**不**拒绝——最常见的用法恰恰一帧余量都没有", () => {
+    // 源片只有 200 帧，两段各用 100 帧用满
+    const tl = timeline(
+      [{ id: "V1", kind: "video", clips: [clip("a", 0, 100), clip("b", 100, 200, 100)] }],
+      200,
+    );
+    expect(setTransition(tl, "b", dissolve(20)).changed).toBe(true);
+  });
+
+  it("传 undefined 摘掉，且字段整个删掉不留 undefined", () => {
+    const added = setTransition(adjacent(), "b", dissolve(20)).timeline;
+    const removed = setTransition(added, "b").timeline;
+    expect("transitionIn" in (findClip(removed, "b")!.clip as object)).toBe(false);
+  });
+
+  it("值没变时返回 changed:false 且不给 reason", () => {
+    const added = setTransition(adjacent(), "b", dissolve(20)).timeline;
+    const again = setTransition(added, "b", dissolve(20));
+    expect(again.changed).toBe(false);
+    expect(again.reason).toBeUndefined();
+  });
+});
+
+describe("转场的孤儿清理", () => {
+  const dissolve = (frames: number): Transition => ({ kind: "dissolve", frames });
+  const withTransition = () =>
+    timeline([
+      {
+        id: "V1",
+        kind: "video",
+        clips: [
+          clip("a", 0, 100),
+          { ...clip("b", 100, 200, 100), transitionIn: dissolve(20) },
+        ],
+      },
+    ]);
+
+  it("把入场片段拖开之后转场被清掉", () => {
+    const r = moveClip(withTransition(), "b", 40);
+    expect(r.changed).toBe(true);
+    expect(findClip(r.timeline, "b")?.clip.transitionIn).toBeUndefined();
+  });
+
+  it("把出场片段裁短之后转场被清掉", () => {
+    const r = trimClip(withTransition(), "a", "out", -20);
+    expect(findClip(r.timeline, "b")?.clip.transitionIn).toBeUndefined();
+  });
+
+  it("删掉出场片段之后转场被清掉", () => {
+    const r = removeClip(withTransition(), "a");
+    expect(findClip(r.timeline, "b")?.clip.transitionIn).toBeUndefined();
+  });
+
+  it("跨轨拖到音频轨会被移动本身拒绝，转场不受影响", () => {
+    const tl = timeline([
+      {
+        id: "V1",
+        kind: "video",
+        clips: [clip("a", 0, 100), { ...clip("b", 100, 200, 100), transitionIn: dissolve(20) }],
+      },
+      { id: "A1", kind: "audio", clips: [] },
+    ]);
+    const r = moveClip(tl, "b", 0, { toTrack: "A1" });
+    expect(r.changed).toBe(false);
+    expect(findClip(r.timeline, "b")?.clip.transitionIn).toEqual(dissolve(20));
+  });
+
+  it("相邻关系还在时不清——只是片段太短解不出窗口也保留", () => {
+    // B 只有 2 帧，20 帧的转场解出来只剩 2 帧，但字段要留着
+    const tl = timeline([
+      {
+        id: "V1",
+        kind: "video",
+        clips: [clip("a", 0, 100), { ...clip("b", 100, 102, 100), transitionIn: dissolve(20) }],
+      },
+    ]);
+    const r = setClipTransform(tl, "b", { opacity: 0.5 });
+    expect(findClip(r.timeline, "b")?.clip.transitionIn).toEqual(dissolve(20));
+  });
+
+  it("切分不会让右半段继承转场——否则按一下 ⌘K 就凭空多一个溶解", () => {
+    const r = splitClipAt(withTransition(), "b", 150);
+    const clips = r.timeline.tracks[0]!.clips;
+    expect(clips.map((c) => c.transitionIn?.frames)).toEqual([undefined, 20, undefined]);
+  });
+});
+
+describe("junctionInfo", () => {
+  const dissolve = (frames: number): Transition => ({ kind: "dissolve", frames });
+
+  it("余量充足时不报定格", () => {
+    const tl = timeline([
+      {
+        id: "V1",
+        kind: "video",
+        clips: [clip("a", 0, 100, 200), { ...clip("b", 100, 200, 400), transitionIn: dissolve(20) }],
+      },
+    ]);
+    expect(junctionInfo(tl, "b")).toMatchObject({
+      effectiveFrames: 20,
+      frozen: { from: 0, to: 0 },
+    });
+  });
+
+  it("两段满长素材相邻时两侧都报满定格", () => {
+    const tl = timeline(
+      [
+        {
+          id: "V1",
+          kind: "video",
+          clips: [clip("a", 0, 100, 0), { ...clip("b", 100, 200, 0), transitionIn: dissolve(20) }],
+        },
+      ],
+      100,
+    );
+    expect(junctionInfo(tl, "b")).toMatchObject({
+      effectiveFrames: 20,
+      frozen: { from: 10, to: 10 },
+    });
+  });
+
+  it("报的是**实际**窗口长度，不是用户输入的时长", () => {
+    // B 只有 10 帧 → 最多借 5 → 实际 10 帧，而不是输入的 40
+    const tl = timeline([
+      {
+        id: "V1",
+        kind: "video",
+        clips: [clip("a", 0, 100, 200), { ...clip("b", 100, 110, 400), transitionIn: dissolve(40) }],
+      },
+    ]);
+    expect(junctionInfo(tl, "b")?.effectiveFrames).toBe(10);
+  });
+
+  it("没有前驱时给出 previous:null，界面据此禁掉添加", () => {
+    const tl = timeline([{ id: "V1", kind: "video", clips: [clip("a", 0, 100)] }]);
+    expect(junctionInfo(tl, "a")).toMatchObject({ previous: null, transition: null });
   });
 });

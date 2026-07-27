@@ -20,7 +20,7 @@
  */
 
 import type { MediaSource, Timeline } from "../edl/types";
-import { microsToSeconds, sourceCenterMicrosAt, visibleVideoClips } from "../edl/sampling";
+import { microsToSeconds, visibleVideoClips } from "../edl/sampling";
 import { createCompositor, type CompositorBackend } from "../compose/backend";
 import type { ComposeLayer, Compositor } from "../compose/compositor";
 import { rasterizeText } from "../compose/text-raster";
@@ -30,7 +30,24 @@ import type { Rational } from "../time/rational";
 /** video 时间与期望时间的容许偏差（源片帧数）。超过就重新 seek 纠正。 */
 const DRIFT_TOLERANCE_FRAMES = 3;
 
+/**
+ * 同时存活的 video 元素上限。
+ *
+ * 元素**按片段**建（见 `handleFor`），而片段数没有上界，所以必须淘汰。
+ * 6 的来源：一条转场窗口里最多 2 层 × 多轨叠加时的常见轨数 3，再留一点余量。
+ * 每个元素都握着一个解码器，放任不管会在长时间编辑后把解码器配额吃满。
+ */
+const MAX_VIDEO_HANDLES = 6;
+
+/** 这一帧要对齐的一个 video 元素。`clipId` 是索引键，见 `handleFor`。 */
+interface ActiveSource {
+  readonly source: MediaSource;
+  readonly clipId: string;
+  readonly seekSeconds: number;
+}
+
 interface SourceHandle {
+  readonly sourceId: string;
   readonly video: HTMLVideoElement;
   readonly url: string;
   ready: boolean;
@@ -104,9 +121,35 @@ export async function createPreviewEngine(
   const proxies = new Map<string, string>();
   let playing = false;
 
-  function handleFor(source: MediaSource): SourceHandle {
-    const existing = handles.get(source.id);
-    if (existing) return existing;
+  /** 拆掉一个 video 元素并回收它的 URL。 */
+  function dropHandle(key: string): void {
+    const handle = handles.get(key);
+    if (!handle) return;
+    handles.delete(key);
+    handle.video.pause();
+    handle.video.removeAttribute("src");
+    handle.video.load();
+    if (handle.ownsUrl) URL.revokeObjectURL(handle.url);
+  }
+
+  /**
+   * 取（或建）某个**片段**的 video 元素。
+   *
+   * **按 clipId 索引，不是按 sourceId。** 转场窗口里出场和入场两个片段常常来自
+   * 同一个源文件（切开之后再溶解是最常见的用法），而它们要停在两个不同的时刻——
+   * 共用一个元素时后写的 `currentTime` 会覆盖前一个，画面表现为转场两侧完全同帧。
+   * 这和导出侧"同源片的并发游标要各自一份 Input"是同一件事。
+   *
+   * 代价是元素数量随片段数增长，所以配一个 LRU（见 `MAX_VIDEO_HANDLES`）。
+   */
+  function handleFor(source: MediaSource, clipId: string): SourceHandle {
+    const existing = handles.get(clipId);
+    if (existing) {
+      // Map 保持插入序，删了再塞就是"移到最近使用"
+      handles.delete(clipId);
+      handles.set(clipId, existing);
+      return existing;
+    }
 
     const video = document.createElement("video");
     // 有代理用代理（seek 快一个量级），没有才读原片
@@ -116,11 +159,23 @@ export async function createPreviewEngine(
     video.muted = true; // 见文件头注释：M1 预览刻意静音
     video.playsInline = true;
     video.preload = "auto";
-    const handle: SourceHandle = { video, url, ready: false, ownsUrl: proxyUrl === undefined };
+    const handle: SourceHandle = {
+      sourceId: source.id,
+      video,
+      url,
+      ready: false,
+      ownsUrl: proxyUrl === undefined,
+    };
     video.addEventListener("loadeddata", () => {
       handle.ready = true;
     });
-    handles.set(source.id, handle);
+    handles.set(clipId, handle);
+
+    while (handles.size > MAX_VIDEO_HANDLES) {
+      const oldest = handles.keys().next();
+      if (oldest.done) break;
+      dropHandle(oldest.value);
+    }
     return handle;
   }
 
@@ -177,8 +232,8 @@ export async function createPreviewEngine(
    * 导出管道走同一个函数。这一层**不允许**自己判断可见性或算源片位置——
    * 那样预览和导出就是两套取帧逻辑，而共用 compose() 只能保证画法一致（硬规则 2）。
    *
-   * seek 目标用 `sourceCenterMicrosAt`（帧中点）：seek 到帧的左边界时浏览器常常
-   * 返回前一帧，于是时间码显示 30 而画面是 frame 29。
+   * seek 目标落在**帧中点**：seek 到帧的左边界时浏览器常常返回前一帧，
+   * 于是时间码显示 30 而画面是 frame 29。
    *
    * 文字层走 `rasterizeText()`——**和导出侧调的是同一个函数、同一份缓存**，
    * 所以字形、断行、描边宽度一致是结构性的，不靠两边小心对齐（硬规则 2）。
@@ -186,9 +241,9 @@ export async function createPreviewEngine(
   function layersFor(
     timeline: Timeline,
     frame: number,
-  ): { layers: ComposeLayer[]; active: { source: MediaSource; seekSeconds: number }[] } {
+  ): { layers: ComposeLayer[]; active: ActiveSource[] } {
     const layers: ComposeLayer[] = [];
-    const active: { source: MediaSource; seekSeconds: number }[] = [];
+    const active: ActiveSource[] = [];
 
     for (const visible of visibleVideoClips(timeline, frame)) {
       // 摆位和调色都来自 visibleVideoClips，这一层一个都不自己算——
@@ -217,11 +272,15 @@ export async function createPreviewEngine(
         continue;
       }
       const { source, clip } = visible;
-      const handle = handleFor(source);
+      const handle = handleFor(source, clip.id);
+      // seek 目标由 `visible.sourceMicros` 加半帧得到，**不重算**：转场窗口里
+      // 那个值已经被夹回素材真实范围（余量不足时的定格），这里再算一遍就会
+      // 在预览里 seek 到一个不存在的位置，而导出是对的
       active.push({
         source,
+        clipId: clip.id,
         seekSeconds: microsToSeconds(
-          sourceCenterMicrosAt(clip, frame, timeline.fps, source.fps),
+          visible.sourceMicros + Math.round(frameDurationMicros(source.fps) / 2),
         ),
       });
 
@@ -268,8 +327,8 @@ export async function createPreviewEngine(
       const { layers, active } = layersFor(timeline, frame);
       // 暂停态要等素材就绪 + seek 完成再画，否则显示的是上一次的画面或纯黑
       await Promise.all(
-        active.map(async ({ source, seekSeconds }) => {
-          const handle = handleFor(source);
+        active.map(async ({ source, clipId, seekSeconds }) => {
+          const handle = handleFor(source, clipId);
           await ensureLoaded(handle.video);
           await seekTo(handle.video, seekSeconds);
         }),
@@ -285,8 +344,8 @@ export async function createPreviewEngine(
       // 漂移纠正：video 自己走，偏差超过阈值才拉回来，避免每帧 seek。
       // 容差按**源片**帧长算：慢速素材放到高帧率时间轴上时，3 个时间轴帧
       // 可能还不到源片的 1 帧，按时间轴帧算会导致每帧都判超差、每帧都 seek
-      for (const { source, seekSeconds } of active) {
-        const handle = handleFor(source);
+      for (const { source, clipId, seekSeconds } of active) {
+        const handle = handleFor(source, clipId);
         if (handle.video.readyState < 2) continue;
         const tolerance =
           (DRIFT_TOLERANCE_FRAMES * frameDurationMicros(source.fps)) / MICROS_PER_SECOND;
@@ -303,8 +362,8 @@ export async function createPreviewEngine(
       playing = true;
       const { active } = layersFor(timeline, frame);
       await Promise.all(
-        active.map(async ({ source, seekSeconds }) => {
-          const handle = handleFor(source);
+        active.map(async ({ source, clipId, seekSeconds }) => {
+          const handle = handleFor(source, clipId);
           await ensureLoaded(handle.video);
           await seekTo(handle.video, seekSeconds);
           if (!playing) return;
@@ -317,14 +376,10 @@ export async function createPreviewEngine(
     useProxy(sourceId, proxyUrl) {
       if (proxies.get(sourceId) === proxyUrl) return;
       proxies.set(sourceId, proxyUrl);
-      // 丢掉已建的原片 video，下次取帧会用代理重建
-      const existing = handles.get(sourceId);
-      if (existing) {
-        existing.video.pause();
-        existing.video.removeAttribute("src");
-        existing.video.load();
-        if (existing.ownsUrl) URL.revokeObjectURL(existing.url);
-        handles.delete(sourceId);
+      // 丢掉这个源片已建的所有原片 video，下次取帧会用代理重建。
+      // 元素按片段索引，所以同一个源片可能有好几个（见 handleFor）
+      for (const [key, handle] of [...handles]) {
+        if (handle.sourceId === sourceId) dropHandle(key);
       }
     },
 
@@ -335,13 +390,7 @@ export async function createPreviewEngine(
 
     dispose() {
       playing = false;
-      for (const handle of handles.values()) {
-        handle.video.pause();
-        handle.video.removeAttribute("src");
-        handle.video.load();
-        if (handle.ownsUrl) URL.revokeObjectURL(handle.url);
-      }
-      handles.clear();
+      for (const key of [...handles.keys()]) dropHandle(key);
       compositor.dispose();
       // 画布是这个引擎建的，销毁时一并摘掉。**不能留着给下一个引擎用**——
       // Pixi 销毁渲染器时丢掉了它的 GL 上下文，在这张画布上再建会死循环

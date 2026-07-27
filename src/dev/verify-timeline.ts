@@ -47,7 +47,28 @@ const B_IN = 80;
 const B_OUT = 140;
 const B_SOURCE_IN = 200;
 
-const TIMELINE_FRAMES = B_OUT;
+/**
+ * 转场段：空档 140–160 之后 C[160,220) 与 D[220,280) 紧邻，D 挂 20 帧交叉溶解。
+ *
+ * 单独摆在后面而不是复用 A/B，是因为转场窗口会盖住交界两侧各 10 帧——挂在
+ * A/B 上会把"片段末帧取到源片第几帧"那几条断言变成一个混合色，两件事就纠缠了。
+ *
+ * C 和 D **来自同一个源文件**，这是刻意的：那时一条轨上要同时开两个游标去读
+ * 同一份素材，而 Input 的 demuxer 有读取位置——共用一份会互相打乱拉包顺序，
+ * 表现是转场两侧同帧或花屏。这条路径只有同源片时才走得到。
+ */
+const C_IN = 160;
+const C_OUT = 220;
+const C_SOURCE_IN = 0;
+const D_IN = 220;
+const D_OUT = 280;
+const D_SOURCE_IN = 200;
+const TRANSITION_FRAMES = 20;
+/** 解算后的窗口：以交界 D_IN 为中心，左右各一半。 */
+const WIN_IN = D_IN - TRANSITION_FRAMES / 2;
+const WIN_OUT = D_IN + TRANSITION_FRAMES / 2;
+
+const TIMELINE_FRAMES = D_OUT;
 const VERIFY_OUT = "kerf-verify-timeline.mp4";
 
 /** 色相容差。素材每帧变 1°，编码有损再加几度，20° 足够区分"差一帧"和"差一个片段"。 */
@@ -58,8 +79,13 @@ const BLACK_MAX_CHANNEL = 24;
 interface Probe {
   readonly frame: number;
   readonly label: string;
-  /** 期望读到的源片帧号；null 表示这一帧应该是黑的（空档）。 */
-  readonly expectSourceFrame: number | null;
+  /**
+   * 期望读到的源片帧号；`null` = 空档（应为纯黑）；`"blend"` = 落在转场窗口里。
+   *
+   * 窗口内没有"应该是源片第几帧"这个说法——画面是两层混出来的，所以那几帧
+   * 的色相断言换成下面 §6 的混合比例断言。
+   */
+  readonly expectSourceFrame: number | null | "blend";
 }
 
 const PROBES: readonly Probe[] = [
@@ -70,7 +96,41 @@ const PROBES: readonly Probe[] = [
   { frame: B_IN, label: "片段 B 首帧（跨片段边界）", expectSourceFrame: B_SOURCE_IN },
   { frame: B_IN + 30, label: "片段 B 内部", expectSourceFrame: B_SOURCE_IN + 30 },
   { frame: B_OUT - 1, label: "片段 B 末帧", expectSourceFrame: B_SOURCE_IN + B_OUT - B_IN - 1 },
+  { frame: WIN_IN - 5, label: "转场之前（纯 C）", expectSourceFrame: C_SOURCE_IN + WIN_IN - 5 - C_IN },
+  { frame: WIN_IN + 1, label: "转场窗口刚开始", expectSourceFrame: "blend" },
+  { frame: D_IN - 1, label: "转场窗口·交界前一帧", expectSourceFrame: "blend" },
+  { frame: D_IN + 1, label: "转场窗口·交界后一帧", expectSourceFrame: "blend" },
+  { frame: WIN_OUT - 1, label: "转场窗口末帧", expectSourceFrame: "blend" },
+  { frame: WIN_OUT + 5, label: "转场之后（纯 D）", expectSourceFrame: D_SOURCE_IN + WIN_OUT + 5 - D_IN },
 ];
+
+/** 落在转场窗口里的取样帧，按上面 PROBES 里的顺序。 */
+const BLEND_PROBES = PROBES.filter((p) => p.expectSourceFrame === "blend").map((p) => p.frame);
+
+/**
+ * 混合比例的允许偏差（每通道 0–255）。
+ *
+ * 参照值由两次**纯层预览**加权算出，再和实际画面比。误差来源是 H.264 有损压缩
+ * 和两条路径各自的重采样，**实测为 1**。
+ *
+ * 10 这个数是反向验证定出来的，不是拍的：第一版取 30，而"把溶解整个丢掉"这个
+ * 破坏在交界前一帧只造成 32 的偏差——余量只剩 2，等于把断言交给运气。容差要
+ * 同时离健康值（1）和破坏值（32）都远，10 落在中间偏低。
+ */
+const BLEND_TOLERANCE = 10;
+
+/**
+ * "画面确实被混过"的下限（每通道 0–255）。
+ *
+ * 与"同一帧但没挂转场"的画面比，交界附近至少要差这么多。**没有这一条，
+ * 整个转场被丢掉时前面那些断言仍然全绿**——预览和导出共用同一份取样映射，
+ * 一起丢掉的话两边照样一致。同 D17 那条"摆位真的在变"。
+ *
+ * 阈值要落在"坏掉时的值"和"实测健康值"**之间**，不能贴着后者：这条差值的
+ * 上界是 0.5×两层色差，测试素材上实测 29，而转场被丢掉时是 0（噪声实测 ≤1）。
+ * 12 离两头都远。取 24 的话每次重编码抖一点就会误报，而那种阈值只是看起来严格。
+ */
+const BLEND_MIN_DIFF = 12;
 
 export interface TimelineVerifyRow {
   readonly label: string;
@@ -91,6 +151,20 @@ export interface TimelineVerifyResult {
   readonly encodedFrames: number;
   readonly bytesWritten: number;
   readonly elapsedMs: number;
+}
+
+/** 两次测量的平均色逐通道最大差。混合色的色相不稳定，比 RGB 更可靠。 */
+function rgbDistance(
+  a: { meanR: number; meanG: number; meanB: number },
+  b: { meanR: number; meanG: number; meanB: number },
+): number {
+  return Math.round(
+    Math.max(
+      Math.abs(a.meanR - b.meanR),
+      Math.abs(a.meanG - b.meanG),
+      Math.abs(a.meanB - b.meanB),
+    ),
+  );
 }
 
 function check(name: string, expected: unknown, actual: unknown, pass?: boolean): Check {
@@ -126,7 +200,26 @@ export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult>
     timelineOut: B_OUT,
     sourceIn: B_SOURCE_IN,
   };
-  const track: Track = { id: "V1", kind: "video", clips: [clipA, clipB] };
+  // C 与 D 紧邻，D 的入点挂交叉溶解。两者同源片 → 转场窗口里要在一条轨上
+  // 同时开两个游标读同一份素材（见常量处的注释）
+  const clipC: Clip = {
+    id: "C",
+    kind: "media",
+    sourceId: probe.source.id,
+    timelineIn: C_IN,
+    timelineOut: C_OUT,
+    sourceIn: C_SOURCE_IN,
+  };
+  const clipD: Clip = {
+    id: "D",
+    kind: "media",
+    sourceId: probe.source.id,
+    timelineIn: D_IN,
+    timelineOut: D_OUT,
+    sourceIn: D_SOURCE_IN,
+    transitionIn: { kind: "dissolve", frames: TRANSITION_FRAMES },
+  };
+  const track: Track = { id: "V1", kind: "video", clips: [clipA, clipB, clipC, clipD] };
   const timeline: Timeline = {
     fps: probe.source.fps,
     width: OUT_SIZE,
@@ -139,6 +232,9 @@ export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult>
   // ---- 2. 预览路径：逐个取样帧渲染并测量 ----
   const engine = await createPreviewEngine(document.createElement("div"), OUT_SIZE, OUT_SIZE);
   const previewBands = new Map<number, Bands>();
+  let noTransition = new Map<number, Bands>();
+  let pureFrom = new Map<number, Bands>();
+  let pureTo = new Map<number, Bands>();
   try {
     // 引擎画布接了 Pixi 之后是 WebGL 画布，不能直接 getContext("2d")——
     // 一张画布只能有一种上下文类型。先 drawImage 到干净的 2D 画布上再量
@@ -152,6 +248,46 @@ export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult>
       pctx.drawImage(engine.canvas as CanvasImageSource, 0, 0);
       previewBands.set(p.frame, measure(pctx, OUT_SIZE, OUT_SIZE));
     }
+
+    // 转场用的三组参照，全部走预览路径（不用再导出一遍）：
+    //   noTransition —— 同一份 EDL 摘掉转场，用来证明"画面确实被混过"
+    //   pureFrom / pureTo —— 把两层各自铺满窗口，用来算出期望的混合色
+    // 两个纯层的取帧映射与真实转场里**完全一致**（占位与 sourceIn 同步偏移），
+    // 所以 (1-t)·from + t·to 就是这一帧应该长的样子
+    const shoot = async (tl: Timeline, frames: readonly number[]) => {
+      const out = new Map<number, Bands>();
+      for (const f of frames) {
+        await engine.renderFrame(tl, f);
+        pctx.drawImage(engine.canvas as CanvasImageSource, 0, 0);
+        out.set(f, measure(pctx, OUT_SIZE, OUT_SIZE));
+      }
+      return out;
+    };
+    const bare: Clip = { ...clipD };
+    delete (bare as { transitionIn?: unknown }).transitionIn;
+    noTransition = await shoot(
+      { ...timeline, tracks: [{ ...track, clips: [clipA, clipB, clipC, bare] }] },
+      BLEND_PROBES,
+    );
+    pureFrom = await shoot(
+      {
+        ...timeline,
+        tracks: [{ ...track, clips: [{ ...clipC, timelineOut: D_OUT }] }],
+      },
+      BLEND_PROBES,
+    );
+    pureTo = await shoot(
+      {
+        ...timeline,
+        tracks: [
+          {
+            ...track,
+            clips: [{ ...bare, timelineIn: WIN_IN, sourceIn: D_SOURCE_IN - (D_IN - WIN_IN) }],
+          },
+        ],
+      },
+      BLEND_PROBES,
+    );
   } finally {
     engine.dispose();
   }
@@ -219,7 +355,10 @@ export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult>
   for (const p of PROBES) {
     const pv = previewBands.get(p.frame)!;
     const ex = exportedBands.get(p.frame)!;
-    const expectedHue = p.expectSourceFrame === null ? null : sampleHueAt(p.expectSourceFrame, SOURCE_FRAMES);
+    const expectedHue =
+      typeof p.expectSourceFrame === "number"
+        ? sampleHueAt(p.expectSourceFrame, SOURCE_FRAMES)
+        : null;
 
     rows.push({
       label: p.label,
@@ -232,6 +371,30 @@ export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult>
       previewBands: `${pv.top}/${pv.bottom}`,
       exportedBands: `${ex.top}/${ex.bottom}`,
     });
+
+    if (p.expectSourceFrame === "blend") {
+      // 窗口内没有"应该是源片第几帧"，只断言两条路径画的是同一张画面。
+      // **这一条正是这次结构性改动的护栏**：导出侧漏解第二层时，成片里只有出场层，
+      // 而预览是对的——用色相比不够（混合色的色相不稳定），改用平均色逐通道比
+      const delta = rgbDistance(pv, ex);
+      checks.push(
+        check(
+          `帧 ${p.frame}（${p.label}）预览与导出画面一致`,
+          `每通道 Δ ≤ ${BLEND_TOLERANCE}`,
+          delta,
+          delta <= BLEND_TOLERANCE,
+        ),
+      );
+      checks.push(
+        check(
+          `帧 ${p.frame}（${p.label}）留边几何一致`,
+          `${pv.top}/${pv.bottom}`,
+          `${ex.top}/${ex.bottom}`,
+          pv.top === ex.top && pv.bottom === ex.bottom,
+        ),
+      );
+      continue;
+    }
 
     if (p.expectSourceFrame === null) {
       // 空档：两条路径都必须是纯黑，而不是"上一帧的残留画面"
@@ -291,6 +454,67 @@ export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult>
       `不接近色相 ${wrongHue}°（那是没换游标的表现）`,
       `${boundary.exportedHue}°`,
       hueDistance(boundary.exportedHue, wrongHue) > HUE_TOLERANCE,
+    ),
+  );
+
+  // ---- 6. 转场：画面确实被混过，而且混的比例对得上 ----
+  //
+  // 两条一起才有意义。只比"预览 == 导出"的话，**整个转场被丢掉时它照样绿**——
+  // 两条路径共用同一份取样映射，一起丢掉当然还是一致（同 D17 那条"摆位真的在变"）。
+  // 所以先证明画面被改过（对照没挂转场的同一帧），再证明改成了该有的样子
+  // （对照两个纯层按进度加权算出来的参照值）。
+  for (const frame of BLEND_PROBES) {
+    const actual = previewBands.get(frame)!;
+    const bare = noTransition.get(frame)!;
+    const from = pureFrom.get(frame)!;
+    const to = pureTo.get(frame)!;
+    // 与 transitionProgress() 同一个公式：帧中点采样
+    const t = (frame - WIN_IN + 0.5) / TRANSITION_FRAMES;
+    const expected = {
+      meanR: from.meanR * (1 - t) + to.meanR * t,
+      meanG: from.meanG * (1 - t) + to.meanG * t,
+      meanB: from.meanB * (1 - t) + to.meanB * t,
+    };
+    const blended = rgbDistance(actual, bare);
+    const offBy = rgbDistance(actual, expected);
+    // 交界两侧靠外的取样帧本来就接近单层，那两帧不要求"差得多"
+    const nearJunction = Math.abs(frame - D_IN) <= 2;
+    if (nearJunction) {
+      checks.push(
+        check(
+          `帧 ${frame} 的画面确实是混出来的（对照没挂转场的同一帧）`,
+          `每通道 Δ ≥ ${BLEND_MIN_DIFF}`,
+          blended,
+          blended >= BLEND_MIN_DIFF,
+        ),
+      );
+    }
+    checks.push(
+      check(
+        `帧 ${frame} 的混合比例落在 (1-t)·出场 + t·入场 上（t=${t.toFixed(3)}）`,
+        `每通道 Δ ≤ ${BLEND_TOLERANCE}`,
+        offBy,
+        offBy <= BLEND_TOLERANCE,
+      ),
+    );
+  }
+
+  // 窗口外必须回到单层：窗口算宽了会让溶解漫出剪切点，而那不报错
+  const beforeWindow = rows.find((r) => r.frame === WIN_IN - 5)!;
+  const afterWindow = rows.find((r) => r.frame === WIN_OUT + 5)!;
+  checks.push(
+    check(
+      "转场窗口之外恢复单层（窗口没有漫出去）",
+      `${sampleHueAt(C_SOURCE_IN + WIN_IN - 5 - C_IN, SOURCE_FRAMES)}° / ${sampleHueAt(D_SOURCE_IN + WIN_OUT + 5 - D_IN, SOURCE_FRAMES)}°`,
+      `${beforeWindow.exportedHue}° / ${afterWindow.exportedHue}°`,
+      hueDistance(
+        beforeWindow.exportedHue,
+        sampleHueAt(C_SOURCE_IN + WIN_IN - 5 - C_IN, SOURCE_FRAMES),
+      ) <= HUE_TOLERANCE &&
+        hueDistance(
+          afterWindow.exportedHue,
+          sampleHueAt(D_SOURCE_IN + WIN_OUT + 5 - D_IN, SOURCE_FRAMES),
+        ) <= HUE_TOLERANCE,
     ),
   );
 
