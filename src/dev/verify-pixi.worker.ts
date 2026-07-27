@@ -44,6 +44,7 @@ import {
   sampleLutTexture8,
   type LutData,
 } from "../compose/lut";
+import { mixTransition } from "../compose/transition-shader";
 import {
   createCanvas2DCompositor,
   type Compositor,
@@ -176,6 +177,7 @@ export interface PixiProbeReport {
   readonly colors: readonly ColorComparison[];
   /** 3D LUT：同上，外加"先调色再 LUT"这个顺序的钉子。 */
   readonly luts: readonly LutComparison[];
+  readonly transitions: readonly TransitionComparison[];
   /** 720p 上的吞吐，`pixiNoPreserve` 用来量 preserveDrawingBuffer 的开销。 */
   readonly perf: {
     readonly width: number;
@@ -622,6 +624,135 @@ async function lutPass(sample: VideoSample): Promise<LutComparison[]> {
   }
 }
 
+/**
+ * shader 转场的取样点。
+ *
+ * **刻意挑在羽化带和硬边界两侧**，而不是随便找几个点：擦除类效果在带外是纯色，
+ * 那里 GPU 和参照实现"一致"只说明两边都读到了同一层，说明不了混合算得对。
+ * 每个用例都带一个落在带内（或紧贴 slide 硬边界）的点。
+ */
+const TRANSITION_CASES = [
+  { name: "擦除 · t=0.25（带外·出场侧）", effect: "wipe", progress: 0.25, u: 0.7, v: 0.5 },
+  { name: "擦除 · t=0.5（羽化带正中）", effect: "wipe", progress: 0.5, u: 0.5, v: 0.5 },
+  { name: "擦除 · t=0.5（带内偏入场）", effect: "wipe", progress: 0.5, u: 0.495, v: 0.5 },
+  { name: "圆形张开 · t=0.5（中心）", effect: "iris", progress: 0.5, u: 0.5, v: 0.5 },
+  { name: "圆形张开 · t=0.5（半径上的羽化带）", effect: "iris", progress: 0.5, u: 0.5, v: 0.146 },
+  { name: "推移 · t=0.4（出场侧）", effect: "slide", progress: 0.4, u: 0.3, v: 0.5 },
+  { name: "推移 · t=0.4（入场侧）", effect: "slide", progress: 0.4, u: 0.8, v: 0.5 },
+] as const;
+
+export interface TransitionComparison {
+  readonly name: string;
+  readonly expected: readonly [number, number, number];
+  readonly actual: readonly [number, number, number];
+  readonly worst: number;
+  /** 该点与"只画出场层"和"只画入场层"的差，用来证明这一点真的被混过。 */
+  readonly awayFromPure: number;
+}
+
+/**
+ * GPU 的双输入 shader 对上 `mixTransition()` 的 CPU 参照。
+ *
+ * 两个输入用**纯色铺满**输出（正方形源 → 没有留边），于是任意取样点上"该层的
+ * 颜色"是已知常量，参照值可以精确算出来，不受纹理过滤影响。slide 要在别的
+ * 坐标取样，但纯色层在哪儿取都一样——**这正是用纯色的理由**：它把被测对象
+ * 从"采样精度"里剥出来，只剩下混合函数本身。
+ */
+async function transitionPass(): Promise<TransitionComparison[]> {
+  const probe = new OffscreenCanvas(OUT, OUT);
+  const probeCtx = probe.getContext("2d", { willReadFrequently: true });
+  if (!probeCtx) throw new Error("转场比对画布没有 2D 上下文");
+
+  const solid = (r: number, g: number, b: number): OffscreenCanvas => {
+    const cv = new OffscreenCanvas(OUT, OUT);
+    const ctx = cv.getContext("2d");
+    if (!ctx) throw new Error("造纯色层失败");
+    ctx.fillStyle = `rgb(${r},${g},${b})`;
+    ctx.fillRect(0, 0, OUT, OUT);
+    return cv;
+  };
+
+  const FROM_RGB: [number, number, number] = [220, 40, 30];
+  const TO_RGB: [number, number, number] = [20, 60, 210];
+  const fromLayer = {
+    kind: "image" as const,
+    image: solid(...FROM_RGB),
+    width: OUT,
+    height: OUT,
+  };
+  const toLayer = { kind: "image" as const, image: solid(...TO_RGB), width: OUT, height: OUT };
+
+  const pixelAt = (u: number, v: number): [number, number, number] => {
+    probeCtx.clearRect(0, 0, OUT, OUT);
+    probeCtx.drawImage(pixiCanvasOf(), 0, 0);
+    const x = Math.min(OUT - 1, Math.max(0, Math.round(u * OUT - 0.5)));
+    const y = Math.min(OUT - 1, Math.max(0, Math.round(v * OUT - 0.5)));
+    const { data } = probeCtx.getImageData(x, y, 1, 1);
+    return [data[0]!, data[1]!, data[2]!];
+  };
+
+  let canvasRef: OffscreenCanvas | HTMLCanvasElement | null = null;
+  const pixiCanvasOf = () => canvasRef!;
+
+  const pixi = await createPixiCompositor(OUT, OUT);
+  canvasRef = pixi.canvas;
+  try {
+    return TRANSITION_CASES.map((testCase) => {
+      pixi.composeFrame([
+        {
+          kind: "transition",
+          from: fromLayer,
+          to: toLayer,
+          progress: testCase.progress,
+          effect: testCase.effect,
+        },
+      ]);
+      const actual = pixelAt(testCase.u, testCase.v);
+
+      // CPU 参照。两层都是纯色，所以 slide 的位移取样返回的还是同一个常量
+      const asRgba = (c: readonly [number, number, number]) => ({
+        r: c[0] / 255,
+        g: c[1] / 255,
+        b: c[2] / 255,
+        a: 1,
+      });
+      // 取样点用**像素中心**，与 GPU 光栅化落点一致；用格点会在羽化带上差半个纹素
+      const px = Math.min(OUT - 1, Math.max(0, Math.round(testCase.u * OUT - 0.5)));
+      const py = Math.min(OUT - 1, Math.max(0, Math.round(testCase.v * OUT - 0.5)));
+      const cu = (px + 0.5) / OUT;
+      const cv = (py + 0.5) / OUT;
+      const mixed = mixTransition(
+        testCase.effect,
+        asRgba(FROM_RGB),
+        asRgba(TO_RGB),
+        cu,
+        cv,
+        testCase.progress,
+        { from: () => asRgba(FROM_RGB), to: () => asRgba(TO_RGB) },
+      );
+      const expected: [number, number, number] = [
+        Math.round(mixed.r * 255),
+        Math.round(mixed.g * 255),
+        Math.round(mixed.b * 255),
+      ];
+
+      const dist = (a: readonly [number, number, number], b: readonly [number, number, number]) =>
+        Math.max(Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1]), Math.abs(a[2] - b[2]));
+
+      return {
+        name: testCase.name,
+        expected,
+        actual,
+        worst: dist(actual, expected),
+        // 离两个纯色都远 = 这一点确实被混过；两者取小，所以纯色点会得到 0
+        awayFromPure: Math.min(dist(actual, FROM_RGB), dist(actual, TO_RGB)),
+      };
+    });
+  } finally {
+    pixi.dispose();
+  }
+}
+
 /** 红→蓝、绿→红、蓝→绿。线性映射，插值精确，适合当断言的真值。 */
 function swapLut(size: number): LutData {
   const rgb = new Float32Array(size * size * size * 3);
@@ -1003,6 +1134,7 @@ async function run(): Promise<PixiProbeReport> {
 
     // ---- 5c. 3D LUT：GPU 查出来的是不是 sampleLutTexture() 查出来的 ----
     const luts = await lutPass(probeSample);
+    const transitions = await transitionPass();
 
     // ---- 6. 三个失效模式 ----
     // 上下文预算放最后：它会连开十几个上下文，跑完之后 GPU 侧的状态最脏，
@@ -1035,6 +1167,7 @@ async function run(): Promise<PixiProbeReport> {
       transforms,
       colors,
       luts,
+      transitions,
       perf,
     };
   } finally {

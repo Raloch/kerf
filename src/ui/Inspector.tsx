@@ -32,7 +32,15 @@ import { useRef, useState } from "react";
 import { valueAt, type AnimatableProperty, type Easing } from "../anim/keyframes";
 import { parseCubeLut } from "../compose/lut";
 import { TEXT_STYLE_DEFAULTS } from "../compose/text-raster";
-import { clipDuration, findLut, type Clip, type MediaClip, type TextClip, type Timeline } from "../edl/types";
+import {
+  clipDuration,
+  findLut,
+  type Clip,
+  type MediaClip,
+  type TextClip,
+  type Timeline,
+  type TransitionKind,
+} from "../edl/types";
 import {
   findClip,
   isColorProperty,
@@ -40,10 +48,13 @@ import {
   PROPERTY_LABELS,
   PROPERTY_RANGES,
   TRANSITION_LABELS,
+  TRANSITION_ORDER,
   type ColorPatch,
   type TransformPatch,
 } from "../state/operations";
 import { MAX_TRANSITION_FRAMES, MIN_TRANSITION_FRAMES } from "../edl/transition";
+import { isShaderTransition } from "../compose/transition-shader";
+import { observedCapabilities } from "../compose/backend";
 import { useTimeline } from "../state/timeline-store";
 import { framesToTimecode, formatDuration } from "../time/timebase";
 import { IconX } from "./icons";
@@ -278,7 +289,22 @@ function TransitionSection({
           <label>类型</label>
           {transition ? (
             <>
-              <span className="val">{TRANSITION_LABELS[transition.kind]}</span>
+              <select
+                value={transition.kind}
+                aria-label="转场类型"
+                onChange={(e) =>
+                  setTransition(clip.id, {
+                    kind: e.target.value as TransitionKind,
+                    frames: transition.frames,
+                  })
+                }
+              >
+                {TRANSITION_ORDER.map((kind) => (
+                  <option key={kind} value={kind}>
+                    {TRANSITION_LABELS[kind]}
+                  </option>
+                ))}
+              </select>
               <button type="button" className="mini" onClick={() => setTransition(clip.id)}>
                 移除
               </button>
@@ -320,6 +346,16 @@ function TransitionSection({
           </div>
         )}
       </div>
+      {/* 还没建过合成器时是 null（用户刚打开、预览未初始化），那时不下结论——
+          报一个还没测过的能力比不报更坏。真正的闸门在导出面板上 */}
+      {transition &&
+        isShaderTransition(transition.kind) &&
+        observedCapabilities()?.supportsEffects === false && (
+          <p className="hint err">
+            这台机器起不来 WebGL，这种转场画不出来（交叉溶解可以）。导出会被禁掉，
+            换 Chrome / Safari，或改用交叉溶解。
+          </p>
+        )}
       {transition && effectiveFrames !== transition.frames && (
         <p className="hint">
           实际 {effectiveFrames} 帧：窗口以剪切点为中心左右对称，且每个片段最多借出

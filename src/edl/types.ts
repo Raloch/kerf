@@ -12,6 +12,7 @@ import { COLOR_PROPERTIES, type KeyframeChannels } from "../anim/keyframes";
 import type { ColorAdjust } from "../compose/color";
 import type { LayerTransform } from "../compose/compositor";
 import type { TextStyle } from "../compose/text-raster";
+import { isShaderTransition } from "../compose/transition-shader";
 import type { Rational } from "../time/rational";
 
 export type SourceId = string;
@@ -53,10 +54,14 @@ export type TrackKind = "video" | "audio";
  * 转场的种类。
  *
  * `dissolve` 走既有的图层不透明度通道（入场层画在出场层之上、alpha = 进度），
- * 因此**两个后端都画得出来、不需要任何新的合成能力**。需要同时采样两张纹理的
- * shader 转场（擦除 / 推移 / 故障）会加在这里，那时它们归 `supportsEffects` 管。
+ * 因此**两个后端都画得出来、不需要任何新的合成能力**。
+ *
+ * 其余三种要同时采样两张纹理，只有 Pixi 后端做得了，因此归 `supportsEffects` 管
+ * （判据是 `compose/transition-shader.ts` 的 `isShaderTransition()`，不要在别处
+ * 另写一份"哪些算 shader 转场"的名单——漏一种的表现是导出闸门放行，用户拿到
+ * 一个转场变成硬切的成片）。
  */
-export type TransitionKind = "dissolve";
+export type TransitionKind = "dissolve" | "wipe" | "iris" | "slide";
 
 /**
  * 挂在两个**紧邻**片段交界上的转场。
@@ -227,7 +232,7 @@ export function clipAt(track: Track, frame: number): Clip | null {
 }
 
 /**
- * 用了 GPU 效果的片段——一级调色或 LUT，静态值和关键帧任一算数。
+ * 用了 GPU 效果的片段——一级调色、LUT，或 **shader 转场**；静态值和关键帧任一算数。
  *
  * 存在的理由是**导出前的能力闸门**：这台机器起不来 WebGL 时这些效果画不出来，
  * 界面要在开始导出之前就拦下来并说明（见 `ui/ExportDialog.tsx`）。
@@ -235,6 +240,10 @@ export function clipAt(track: Track, frame: number): Clip | null {
  * 判据必须**把关键帧也算进去**。只看 `clip.color` 会漏掉"静态值是缺省、全靠
  * 关键帧动"的片段——那种片段的 `color` 字段根本不存在（归一化会把全缺省的整个
  * 删掉，见 `state/operations.ts`），于是闸门放行，用户拿到一个丢了效果的成片。
+ *
+ * **交叉溶解不算**：它走图层不透明度，Canvas2D 也画得出来。把它一起算进去会让
+ * 一个只用了溶解的项目在没有 WebGL 的机器上被无谓地禁掉导出——那是另一种形态的
+ * 错误提示，和漏报一样坏。判据用 `isShaderTransition()`，不在这里另抄一份名单。
  */
 export function clipsUsingEffects(timeline: Timeline): Clip[] {
   const out: Clip[] = [];
@@ -244,7 +253,16 @@ export function clipsUsingEffects(timeline: Timeline): Clip[] {
       const animated = clip.keyframes
         ? COLOR_PROPERTIES.some((p) => (clip.keyframes?.[p]?.length ?? 0) > 0)
         : false;
-      if (clip.color !== undefined || clip.lutId !== undefined || animated) out.push(clip);
+      const shaderTransition =
+        clip.transitionIn !== undefined && isShaderTransition(clip.transitionIn.kind);
+      if (
+        clip.color !== undefined ||
+        clip.lutId !== undefined ||
+        animated ||
+        shaderTransition
+      ) {
+        out.push(clip);
+      }
     }
   }
   return out;

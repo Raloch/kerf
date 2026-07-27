@@ -57,6 +57,20 @@ const COLOR_TOLERANCE = 2;
  * 差的都是几十上百，卡不到这个量级。
  */
 const LUT_TOLERANCE = 3;
+/**
+ * shader 转场的容差（每通道 0–255）。
+ *
+ * 两个输入都是纯色，所以取样精度不参与——剩下的只有 shader 里的浮点和一次
+ * 8 位量化。实测为 0；给 2 是为了不被将来某个驱动的 round-to-even 差异误伤。
+ */
+const TRANSITION_TOLERANCE = 2;
+/**
+ * 羽化带上"确实被混过"的下限。
+ *
+ * 两层色差最大约 200，带中央的混合会离两边各 ~100。取 20 是按 D19 的教训定的：
+ * 阈值要落在"坏掉时的 0"和"实测健康值"之间，而不是贴着后者。
+ */
+const FEATHER_MIN_MIX = 20;
 
 export interface PixiVerifyResult {
   readonly checks: readonly Check[];
@@ -452,6 +466,56 @@ export async function verifyPixiBackend(): Promise<PixiVerifyResult> {
         ? `差 ${identityDrift}（原色 ${identityCase.base.join(",")} → ${identityCase.actual.join(",")}）`
         : "找不到恒等 LUT 用例",
       identityDrift <= LUT_TOLERANCE,
+    ),
+  );
+
+  // ---- shader 转场：双输入 shader 对上 CPU 参照 ----
+  const trCases = report.transitions;
+  const worstTransition = trCases.reduce((m, c) => Math.max(m, c.worst), 0);
+  const worstTransitionCase = trCases.reduce(
+    (worst, c) => (c.worst >= worst.worst ? c : worst),
+    trCases[0] ?? { name: "（无）", worst: 0 },
+  ).name;
+  checks.push(
+    check(
+      "shader 转场：GPU 混出来的像素 == mixTransition() 的 CPU 参照",
+      `≤ ${TRANSITION_TOLERANCE} / 255`,
+      worstTransition === 0
+        ? `${trCases.length} 个用例逐通道完全相同`
+        : `最差 ${worstTransition} · ${worstTransitionCase}`,
+      trCases.length > 0 && worstTransition <= TRANSITION_TOLERANCE,
+    ),
+  );
+
+  // 羽化带上的点必须**既不是出场色也不是入场色**。没有这一条，把整个混合函数
+  // 换成"永远返回入场层"时上面那条仍然可能绿——参照实现在带外也返回纯色，
+  // 而带外的点占多数。同 D17 那条"摆位真的在变"、D19 那条"画面确实被混过"
+  const feathered = trCases.filter((c) => c.name.includes("羽化带"));
+  const leastMixed = feathered.reduce(
+    (m, c) => Math.min(m, c.awayFromPure),
+    Number.POSITIVE_INFINITY,
+  );
+  checks.push(
+    check(
+      "羽化带上的像素确实是混出来的（不等于任一纯层）",
+      `≥ ${FEATHER_MIN_MIX} / 255`,
+      feathered.length > 0 ? `最小 ${leastMixed}（${feathered.length} 个带内取样点）` : "没有带内取样点",
+      feathered.length > 0 && leastMixed >= FEATHER_MIN_MIX,
+    ),
+  );
+
+  // 三种效果都要真的不一样。全都退化成同一个分支（例如 uEffect 没传到）时，
+  // 上面两条会因为参照实现也被同一个 kind 驱动而**一起错、于是一起绿**——
+  // 不，参照是按用例自己的 kind 算的，所以那种情况上面会红。这一条兜的是另一头：
+  // 三个分支恰好在取样点上给出同一个值，那说明取样点选得没有区分力
+  const byEffect = new Map<string, string>();
+  for (const c of trCases) byEffect.set(c.name.split(" ·")[0]!, c.actual.join(","));
+  checks.push(
+    check(
+      "三种效果在各自取样点上给出不同的像素（取样点有区分力）",
+      "3 组各不相同",
+      `${byEffect.size} 组：${[...byEffect.values()].join(" | ")}`,
+      new Set(byEffect.values()).size === byEffect.size,
     ),
   );
 

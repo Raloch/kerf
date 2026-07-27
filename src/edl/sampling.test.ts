@@ -16,6 +16,8 @@ import {
   trackClipsAt,
   videoTracksInDrawOrder,
   visibleVideoClips,
+  type VisibleClip,
+  type VisibleEntry,
 } from "./sampling";
 import {
   toSourceFrame,
@@ -60,6 +62,20 @@ const source = (over: Partial<MediaSource> = {}): MediaSource => ({
   audioCodec: "aac",
   ...over,
 });
+
+/**
+ * 断言这一帧全是普通图层，并把类型收窄。
+ *
+ * `visibleVideoClips` 现在返回的是联合（普通层 | shader 转场节点），所以取
+ * `.clip` 之前必须表态。用 `as` 强转就等于把这层保护关掉——而"本该是转场节点
+ * 却退化成两个普通层"正是最该被抓住的那类错。
+ */
+function layersOf(entries: readonly VisibleEntry[]): VisibleClip[] {
+  return entries.map((e) => {
+    if (e.kind === "transition") throw new Error("期望普通图层，实际是转场节点");
+    return e;
+  });
+}
 
 const timeline = (tracks: Track[], sources: MediaSource[], fps = FPS.ntsc30): Timeline => ({
   fps,
@@ -157,12 +173,12 @@ describe("visibleVideoClips", () => {
     );
 
   it("两层都覆盖时，底层在前", () => {
-    const got = visibleVideoClips(twoLayers(), 100);
+    const got = layersOf(visibleVideoClips(twoLayers(), 100));
     expect(got.map((v) => v.clip.id)).toEqual(["base", "top"]);
   });
 
   it("只有底层覆盖时只返回底层", () => {
-    const got = visibleVideoClips(twoLayers(), 20);
+    const got = layersOf(visibleVideoClips(twoLayers(), 20));
     expect(got.map((v) => v.clip.id)).toEqual(["base"]);
   });
 
@@ -171,7 +187,7 @@ describe("visibleVideoClips", () => {
       [{ id: "V1", kind: "video", clips: [clip({ timelineIn: 0, timelineOut: 50 })] }],
       [source()],
     );
-    expect(visibleVideoClips(tl, 60)).toEqual([]);
+    expect(layersOf(visibleVideoClips(tl, 60))).toEqual([]);
   });
 
   it("片段引用了不存在的素材时跳过，而不是抛错中断整帧", () => {
@@ -179,7 +195,7 @@ describe("visibleVideoClips", () => {
       [{ id: "V1", kind: "video", clips: [clip({ sourceId: "missing" })] }],
       [source()],
     );
-    expect(visibleVideoClips(tl, 10)).toEqual([]);
+    expect(layersOf(visibleVideoClips(tl, 10))).toEqual([]);
   });
 
   it("带上该帧对应的源片时刻", () => {
@@ -187,7 +203,7 @@ describe("visibleVideoClips", () => {
       [{ id: "V1", kind: "video", clips: [clip({ timelineIn: 0, sourceIn: 30 })] }],
       [source()],
     );
-    const got = visibleVideoClips(tl, 30)[0];
+    const got = layersOf(visibleVideoClips(tl, 30))[0];
     expect(got?.kind).toBe("media");
     expect(got?.kind === "media" && got.sourceMicros).toBe(2_000_000);
   });
@@ -200,7 +216,7 @@ describe("visibleVideoClips", () => {
       [{ id: "T1", kind: "video", clips: [textClip({ id: "title" })] }],
       [source()],
     );
-    expect(visibleVideoClips(tl, 10)).toEqual([
+    expect(layersOf(visibleVideoClips(tl, 10))).toEqual([
       { kind: "text", trackId: "T1", clip: textClip({ id: "title" }) },
     ]);
   });
@@ -214,7 +230,7 @@ describe("visibleVideoClips", () => {
       ],
       [source()],
     );
-    const got = visibleVideoClips(tl, 100);
+    const got = layersOf(visibleVideoClips(tl, 100));
     expect(got.map((v) => v.clip.id)).toEqual(["base", "top", "title"]);
     expect(got.map((v) => v.kind)).toEqual(["media", "media", "text"]);
   });
@@ -227,7 +243,7 @@ describe("visibleVideoClips", () => {
       ],
       [source()],
     );
-    expect(visibleVideoClips(tl, 10).map((v) => v.clip.id)).toEqual(["title"]);
+    expect(layersOf(visibleVideoClips(tl, 10)).map((v) => v.clip.id)).toEqual(["title"]);
   });
 });
 
@@ -292,22 +308,22 @@ describe("转场窗口里的取样", () => {
 
   it("窗口外只有一层，窗口内两层——出场在下、入场在上", () => {
     const tl = dissolvePair();
-    expect(visibleVideoClips(tl, 89).map((v) => v.clip.id)).toEqual(["a"]);
-    expect(visibleVideoClips(tl, 90).map((v) => v.clip.id)).toEqual(["a", "b"]);
-    expect(visibleVideoClips(tl, 109).map((v) => v.clip.id)).toEqual(["a", "b"]);
-    expect(visibleVideoClips(tl, 110).map((v) => v.clip.id)).toEqual(["b"]);
+    expect(layersOf(visibleVideoClips(tl, 89)).map((v) => v.clip.id)).toEqual(["a"]);
+    expect(layersOf(visibleVideoClips(tl, 90)).map((v) => v.clip.id)).toEqual(["a", "b"]);
+    expect(layersOf(visibleVideoClips(tl, 109)).map((v) => v.clip.id)).toEqual(["a", "b"]);
+    expect(layersOf(visibleVideoClips(tl, 110)).map((v) => v.clip.id)).toEqual(["b"]);
   });
 
   it("入场层带上不透明度，出场层不带——溶解由上层的 alpha 表达", () => {
     const tl = dissolvePair();
-    const [from, to] = visibleVideoClips(tl, 90);
+    const [from, to] = layersOf(visibleVideoClips(tl, 90));
     expect(from!.transform).toBeUndefined();
     expect(to!.transform?.opacity).toBeCloseTo(0.025, 6);
   });
 
   it("不透明度逐帧递增，且叠在片段自己的透明度上而不是覆盖它", () => {
     const tl = dissolvePair({ transform: { opacity: 0.5 } });
-    const at = (f: number) => visibleVideoClips(tl, f)[1]!.transform!.opacity!;
+    const at = (f: number) => layersOf(visibleVideoClips(tl, f))[1]!.transform!.opacity!;
     expect(at(90)).toBeCloseTo(0.5 * 0.025, 6);
     expect(at(109)).toBeCloseTo(0.5 * 0.975, 6);
     expect(at(100)).toBeGreaterThan(at(95));
@@ -315,7 +331,7 @@ describe("转场窗口里的取样", () => {
 
   it("出场层在交界之后继续读源片——这正是它需要素材余量的原因", () => {
     const tl = dissolvePair();
-    const from = visibleVideoClips(tl, 105)[0]!;
+    const from = layersOf(visibleVideoClips(tl, 105))[0]!;
     // A 占源片 [0,100)，第 105 帧要读的是源片第 105 帧（出点之后 5 帧）
     expect(from.clip.id).toBe("a");
     expect(from.kind === "media" && from.sourceMicros).toBe(frameToMicros(105, FPS.ntsc30));
@@ -344,12 +360,12 @@ describe("转场窗口里的取样", () => {
     );
     const last = frameToMicros(99, FPS.ntsc30);
     for (const f of [100, 105, 109]) {
-      const from = visibleVideoClips(tl, f)[0]!;
+      const from = layersOf(visibleVideoClips(tl, f))[0]!;
       expect(from.kind === "media" && from.sourceMicros).toBe(last);
     }
     // 入场侧同理：窗口前半段算出来是负位置，夹到 0
     for (const f of [90, 95, 99]) {
-      const to = visibleVideoClips(tl, f)[1]!;
+      const to = layersOf(visibleVideoClips(tl, f))[1]!;
       expect(to.kind === "media" && to.sourceMicros).toBe(0);
     }
   });
@@ -373,8 +389,8 @@ describe("转场窗口里的取样", () => {
       ],
       [source()],
     );
-    expect(visibleVideoClips(tl, 95)).toEqual([]);
-    expect(visibleVideoClips(tl, 105).map((v) => v.clip.id)).toEqual(["b"]);
+    expect(layersOf(visibleVideoClips(tl, 95))).toEqual([]);
+    expect(layersOf(visibleVideoClips(tl, 105)).map((v) => v.clip.id)).toEqual(["b"]);
   });
 });
 

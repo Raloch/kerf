@@ -761,7 +761,13 @@ function sourceFramesOf(timeline: Timeline, clip: Clip): number {
 /** 转场种类的显示名。加新种类时这里会因为 Record 缺项而编译报错。 */
 export const TRANSITION_LABELS: Record<TransitionKind, string> = {
   dissolve: "交叉溶解",
+  wipe: "线性擦除",
+  iris: "圆形张开",
+  slide: "推移",
 };
+
+/** 界面上按这个顺序排。溶解在最前——它是唯一不需要 GPU 的那个。 */
+export const TRANSITION_ORDER: readonly TransitionKind[] = ["dissolve", "wipe", "iris", "slide"];
 
 /**
  * 改片段的**静态**调色。与 `setClipTransform` 完全同构，见其注释。

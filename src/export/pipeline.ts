@@ -41,10 +41,10 @@ import {
 
 import { measureEncoderDelay, type EncoderDelay } from "../audio/encoder-delay";
 import { createCompositor, type CompositorBackend } from "../compose/backend";
-import type { ComposeLayer, Compositor } from "../compose/compositor";
+import type { ComposeLayer, ComposeSourceLayer, Compositor } from "../compose/compositor";
 import { residency, ResidencyTracker } from "./residency";
 import { rasterizeText, textRasterCacheBytes } from "../compose/text-raster";
-import { videoTracksInDrawOrder, visibleVideoClips } from "../edl/sampling";
+import { videoTracksInDrawOrder, visibleVideoClips, type VisibleClip } from "../edl/sampling";
 import { decideFormat } from "../media/capability";
 import { probeCapabilities } from "../media/capability-probe";
 import { frameToSeconds, frameDurationMicros, MICROS_PER_SECOND } from "../time/timebase";
@@ -192,8 +192,7 @@ export async function runExport(
 
       // 第二步：按图层顺序装配。顺序、每层的变换和调色都来自 sampling.ts，
       // 导出侧一个都不自己算——预览侧拿的是同一个函数的同一份结果（硬规则 2）
-      const layers: ComposeLayer[] = [];
-      for (const visible of visibleVideoClips(timeline, outputFrame)) {
+      const toLayer = (visible: VisibleClip): ComposeSourceLayer | null => {
         const looks = {
           ...(visible.transform ? { transform: visible.transform } : {}),
           ...(visible.color ? { color: visible.color } : {}),
@@ -208,20 +207,39 @@ export async function runExport(
             timeline.width,
             timeline.height,
           );
-          if (raster) {
-            layers.push({
-              kind: "image",
-              image: raster.canvas,
-              width: raster.width,
-              height: raster.height,
-              ...looks,
-            });
-          }
-          continue;
+          if (!raster) return null;
+          return {
+            kind: "image",
+            image: raster.canvas,
+            width: raster.width,
+            height: raster.height,
+            ...looks,
+          };
         }
         const sample = samples.get(visible.clip.id);
-        if (!sample) continue;
-        layers.push({ kind: "sample", sample, ...looks });
+        if (!sample) return null;
+        return { kind: "sample", sample, ...looks };
+      };
+
+      const layers: ComposeLayer[] = [];
+      for (const entry of visibleVideoClips(timeline, outputFrame)) {
+        if (entry.kind === "transition") {
+          // shader 转场：两层配成一个双输入节点。任一侧取不到帧（reader 漏解）
+          // 就整个节点跳过——只画一侧的话成片里转场会突然只剩一层，比不画更难查
+          const from = toLayer(entry.from);
+          const to = toLayer(entry.to);
+          if (!from || !to) continue;
+          layers.push({
+            kind: "transition",
+            from,
+            to,
+            progress: entry.progress,
+            effect: entry.effect,
+          });
+          continue;
+        }
+        const layer = toLayer(entry);
+        if (layer) layers.push(layer);
       }
 
       // layers 为空 → 合成器画纯黑，这正是时间轴空隙该有的样子。

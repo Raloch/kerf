@@ -37,9 +37,13 @@ import type {
   ColorMatrixFilter,
   Container,
   Filter,
+  Geometry,
   ICanvas,
   ImageResource,
   ImageSource,
+  Mesh,
+  RenderTexture,
+  Shader,
   Sprite,
   Texture,
   WebGLRenderer,
@@ -47,7 +51,19 @@ import type {
 
 import { colorMatrixOf, isDefaultColorMatrix, lutIntensityOf, type ColorAdjust } from "./color";
 import { buildLutTexture, LUT_FRAGMENT, LUT_VERTEX, type LutTable } from "./lut";
-import { containRect, isDefaultGeometry, placeLayer, type Compositor } from "./compositor";
+import {
+  TRANSITION_CODES,
+  TRANSITION_FEATHER,
+  TRANSITION_FRAGMENT,
+  TRANSITION_VERTEX,
+} from "./transition-shader";
+import {
+  containRect,
+  isDefaultGeometry,
+  placeLayer,
+  type ComposeSourceLayer,
+  type Compositor,
+} from "./compositor";
 
 /** 仅供自检使用的观察窗口。生产代码不要依赖这里的任何东西。 */
 export interface PixiCompositorDebug {
@@ -80,6 +96,31 @@ interface LayerSlot {
   lutData: LutTable | null;
   /** LUT 查找纹理。跟着 `lutFilter` 的生命周期走。 */
   lutTexture: Texture | null;
+}
+
+/**
+ * 一个 shader 转场节点的常驻 GPU 资源。
+ *
+ * 每个转场要**两张输出尺寸的渲染目标**外加一个全屏网格。全部跨帧复用，理由同
+ * 文件头第 4 条：逐帧新建渲染目标比逐帧新建纹理更贵，而这一整套只在"这一帧
+ * 有转场"时才第一次建出来——没用转场的项目一张渲染目标都不会有。
+ */
+interface TransitionSlot {
+  /** 两个输入各自的槽位。它们的 sprite **不在 stage 上**，只在自己的离屏容器里。 */
+  readonly fromSlot: LayerSlot;
+  readonly toSlot: LayerSlot;
+  readonly fromScratch: Container;
+  readonly toScratch: Container;
+  fromTexture: RenderTexture;
+  toTexture: RenderTexture;
+  /**
+   * 全屏四边形，挂在 stage 上，按 z 序参与合成。
+   *
+   * 泛型要显式写成 `<Geometry, Shader>`：`Mesh` 的默认参数是
+   * `<MeshGeometry, TextureShader>`，而我们给的是自建几何 + 自建着色器。
+   */
+  readonly mesh: Mesh<Geometry, Shader>;
+  readonly shader: Shader;
 }
 
 /** `recover()` 等上下文回来的上限。浏览器主动恢复通常在一两帧内，给足富余。 */
@@ -142,6 +183,7 @@ export async function createPixiCompositor(
 
   const stage: Container = new pixi.Container();
   const slots: LayerSlot[] = [];
+  const transitions: TransitionSlot[] = [];
   let disposed = false;
 
   /**
@@ -181,16 +223,13 @@ export async function createPixiCompositor(
   canvas.addEventListener("webglcontextlost", onContextLost);
   canvas.addEventListener("webglcontextrestored", onContextRestored);
 
-  const ensureSlot = (index: number): LayerSlot => {
-    const existing = slots[index];
-    if (existing) return existing;
-
+  /** 造一个空槽位。**不挂到任何容器上**——挂哪儿由调用方决定。 */
+  const makeSlot = (): LayerSlot => {
     // 先建 1×1 的空源，真正的尺寸在第一帧 resize 出来
     const source = new pixi.ImageSource({ width: 1, height: 1 });
     const texture = new pixi.Texture({ source });
     const sprite = new pixi.Sprite(texture);
-    stage.addChild(sprite);
-    const slot: LayerSlot = {
+    return {
       source,
       texture,
       sprite,
@@ -199,6 +238,13 @@ export async function createPixiCompositor(
       lutData: null,
       lutTexture: null,
     };
+  };
+
+  const ensureSlot = (index: number): LayerSlot => {
+    const existing = slots[index];
+    if (existing) return existing;
+    const slot = makeSlot();
+    stage.addChild(slot.sprite);
     slots[index] = slot;
     return slot;
   };
@@ -310,6 +356,139 @@ export async function createPixiCompositor(
     if (!same) slot.sprite.filters = chain;
   };
 
+  /**
+   * 把一个有来源的图层配置到槽位上：换纹理资源、算摆位、挂效果。
+   *
+   * 抽出来是因为**转场的两个输入走的是完全相同的这套逻辑**，只是最后渲到一张
+   * 离屏纹理而不是主画布。各写一遍的话，"转场里的那一层不吃调色 / 不吃变换"
+   * 会是个只在转场窗口里出现、且不报错的画面差异。
+   *
+   * 返回 false 表示这一层画不出来（源尺寸非法），调用方应当跳过。
+   */
+  const configureSlot = (slot: LayerSlot, layer: ComposeSourceLayer): VideoFrame | null | false => {
+    let resource: ImageResource;
+    let srcWidth: number;
+    let srcHeight: number;
+    let temporary: VideoFrame | null = null;
+
+    if (layer.kind === "sample") {
+      const frame = layer.sample.toVideoFrame();
+      temporary = frame;
+      resource = frame;
+      srcWidth = frame.displayWidth;
+      srcHeight = frame.displayHeight;
+    } else {
+      // CanvasImageSource 比 Pixi 的 ImageResource 多一个 SVGImageElement，
+      // 取帧路径不会产出它
+      resource = layer.image as ImageResource;
+      srcWidth = layer.width;
+      srcHeight = layer.height;
+    }
+
+    const rect = containRect(srcWidth, srcHeight, width, height);
+    if (!rect) {
+      temporary?.close();
+      return false;
+    }
+
+    slot.source.resource = resource;
+    // 尺寸没变时 resize 是 no-op，Pixi 的上传就会走 texSubImage2D 复用纹理
+    slot.source.resize(srcWidth, srcHeight);
+    slot.source.update();
+
+    slot.sprite.visible = true;
+    slot.sprite.alpha = layer.transform?.opacity ?? 1;
+    applyEffects(slot, layer.color, layer.lut);
+
+    // anchor 和 rotation 两条分支都要显式写。slot 是**跨帧复用**的，
+    // 上一帧留下的 anchor 0.5 会让这一帧的恒等摆位整体偏半个图层——
+    // 而且只在"某帧有变换、下一帧没有"时才出现，最难复现的那种
+    if (isDefaultGeometry(layer.transform)) {
+      // 与加变换之前完全相同的摆法：anchor 留在左上角，直接摆到 containRect 的位置
+      slot.sprite.anchor.set(0, 0);
+      slot.sprite.rotation = 0;
+      slot.sprite.position.set(rect.dx, rect.dy);
+      // 不用 sprite.width/height：那两个 setter 依赖纹理尺寸的记账，
+      // 换源尺寸时容易慢一帧。直接算缩放是确定的
+      slot.sprite.scale.set(rect.width / srcWidth, rect.height / srcHeight);
+    } else {
+      // 旋转要绕图层中心，所以 anchor 挪到中心、position 跟着变成中心点
+      const placement = placeLayer(rect, layer.transform);
+      slot.sprite.anchor.set(0.5, 0.5);
+      slot.sprite.rotation = placement.rotation;
+      slot.sprite.position.set(placement.centerX, placement.centerY);
+      slot.sprite.scale.set(placement.width / srcWidth, placement.height / srcHeight);
+    }
+    return temporary;
+  };
+
+  /**
+   * 造（或复用）一个转场节点的 GPU 资源。
+   *
+   * 渲染目标的尺寸跟着输出走，所以每次都对一下——`resize()` 只改渲染器，
+   * 不知道这些离屏目标的存在。尺寸对不上时画出来的是一张被拉伸的旧画面，
+   * 而且**不报错**：改分辨率之后转场那几帧会莫名其妙地糊。
+   */
+  const ensureTransition = (index: number): TransitionSlot => {
+    const existing = transitions[index];
+    if (existing) {
+      if (existing.fromTexture.width !== width || existing.fromTexture.height !== height) {
+        existing.fromTexture.resize(width, height);
+        existing.toTexture.resize(width, height);
+      }
+      return existing;
+    }
+
+    const fromSlot = makeSlot();
+    const toSlot = makeSlot();
+    const fromScratch: Container = new pixi.Container();
+    const toScratch: Container = new pixi.Container();
+    fromScratch.addChild(fromSlot.sprite);
+    toScratch.addChild(toSlot.sprite);
+
+    const fromTexture = pixi.RenderTexture.create({ width, height, antialias: false });
+    const toTexture = pixi.RenderTexture.create({ width, height, antialias: false });
+
+    // 自己给几何和 UV，不借 Pixi 的 filter 管线——理由见 TRANSITION_VERTEX 的注释。
+    // aPosition 是 0–1 的单位四边形，顶点着色器直接映到裁剪空间，所以这个网格
+    // 永远铺满屏幕，与它在场景图里的变换无关
+    const geometry = new pixi.Geometry({
+      attributes: { aPosition: [0, 0, 1, 0, 1, 1, 0, 1] },
+      indexBuffer: [0, 1, 2, 0, 2, 3],
+    });
+    const shader: Shader = pixi.Shader.from({
+      gl: { vertex: TRANSITION_VERTEX, fragment: TRANSITION_FRAGMENT },
+      resources: {
+        uFrom: fromTexture.source,
+        uFromSampler: fromTexture.source.style,
+        uTo: toTexture.source,
+        uToSampler: toTexture.source.style,
+        transitionUniforms: {
+          uProgress: { value: 0, type: "f32" },
+          uEffect: { value: 0, type: "f32" },
+          // 羽化宽度走 uniform 而不是写死进 GLSL：只有这样它才能和 JS 参照实现
+          // 共用同一个常量，而两边不一致时 GPU-vs-CPU 断言只会在羽化带上红
+          uFeather: { value: TRANSITION_FEATHER, type: "f32" },
+        },
+      },
+    });
+    const mesh: Mesh<Geometry, Shader> = new pixi.Mesh({ geometry, shader });
+    stage.addChild(mesh);
+
+    const slot: TransitionSlot = {
+      fromSlot,
+      toSlot,
+      fromScratch,
+      toScratch,
+      fromTexture,
+      toTexture,
+      mesh,
+      shader,
+    };
+    transitions[index] = slot;
+    return slot;
+  };
+
   return {
     get width() {
       return width;
@@ -397,63 +576,68 @@ export async function createPixiCompositor(
       // sample.toVideoFrame() 产出的临时帧：**render 之后**才能 close（第 5 条）
       const temporaries: VideoFrame[] = [];
       try {
-        let used = 0;
+        let usedSlots = 0;
+        let usedTransitions = 0;
+        // stage 的子节点顺序必须与图层顺序一致，而普通层和转场节点来自两个池，
+        // 创建顺序对不上 z 序。每帧按序 addChild 一遍——已在 stage 上的节点会被
+        // 移到末尾，于是顺序总是对的。层数是个位数，这点开销可以忽略
+        const ordered: Container[] = [];
+
         for (const layer of layers) {
-          let resource: ImageResource;
-          let srcWidth: number;
-          let srcHeight: number;
+          if (layer.kind === "transition") {
+            const slot = ensureTransition(usedTransitions);
+            const fromTemp = configureSlot(slot.fromSlot, layer.from);
+            const toTemp = configureSlot(slot.toSlot, layer.to);
+            if (fromTemp) temporaries.push(fromTemp);
+            if (toTemp) temporaries.push(toTemp);
+            // 任一侧画不出来（源尺寸非法）就整个节点跳过：只画一侧的话，
+            // 用户看到的是"转场那几帧突然只剩一层"，比不画更难查
+            if (fromTemp === false || toTemp === false) {
+              slot.mesh.visible = false;
+              continue;
+            }
 
-          if (layer.kind === "sample") {
-            const frame = layer.sample.toVideoFrame();
-            temporaries.push(frame);
-            resource = frame;
-            srcWidth = frame.displayWidth;
-            srcHeight = frame.displayHeight;
-          } else {
-            // CanvasImageSource 比 Pixi 的 ImageResource 多一个 SVGImageElement，
-            // 取帧路径不会产出它
-            resource = layer.image as ImageResource;
-            srcWidth = layer.width;
-            srcHeight = layer.height;
+            // 两个输入各渲进自己的离屏目标。**清成全透明**而不是渲染器的黑底：
+            // 混合是在预乘 alpha 上做的，底色不透明的话留边区域会把黑铺进结果，
+            // 下面那条轨就被这一层的黑边盖住了
+            renderer.render({
+              container: slot.fromScratch,
+              target: slot.fromTexture,
+              clear: true,
+              clearColor: [0, 0, 0, 0],
+            });
+            renderer.render({
+              container: slot.toScratch,
+              target: slot.toTexture,
+              clear: true,
+              clearColor: [0, 0, 0, 0],
+            });
+
+            const group = slot.shader.resources["transitionUniforms"] as {
+              uniforms: { uProgress: number; uEffect: number };
+            };
+            group.uniforms.uProgress = layer.progress;
+            group.uniforms.uEffect = TRANSITION_CODES[layer.effect];
+            slot.mesh.visible = true;
+            ordered.push(slot.mesh);
+            usedTransitions++;
+            continue;
           }
 
-          const rect = containRect(srcWidth, srcHeight, width, height);
-          if (!rect) continue;
-
-          const slot = ensureSlot(used);
-          slot.source.resource = resource;
-          // 尺寸没变时 resize 是 no-op，Pixi 的上传就会走 texSubImage2D 复用纹理
-          slot.source.resize(srcWidth, srcHeight);
-          slot.source.update();
-
-          slot.sprite.visible = true;
-          slot.sprite.alpha = layer.transform?.opacity ?? 1;
-          applyEffects(slot, layer.color, layer.lut);
-
-          // anchor 和 rotation 两条分支都要显式写。slot 是**跨帧复用**的，
-          // 上一帧留下的 anchor 0.5 会让这一帧的恒等摆位整体偏半个图层——
-          // 而且只在"某帧有变换、下一帧没有"时才出现，最难复现的那种
-          if (isDefaultGeometry(layer.transform)) {
-            // 与加变换之前完全相同的摆法：anchor 留在左上角，直接摆到 containRect 的位置
-            slot.sprite.anchor.set(0, 0);
-            slot.sprite.rotation = 0;
-            slot.sprite.position.set(rect.dx, rect.dy);
-            // 不用 sprite.width/height：那两个 setter 依赖纹理尺寸的记账，
-            // 换源尺寸时容易慢一帧。直接算缩放是确定的
-            slot.sprite.scale.set(rect.width / srcWidth, rect.height / srcHeight);
-          } else {
-            // 旋转要绕图层中心，所以 anchor 挪到中心、position 跟着变成中心点
-            const placement = placeLayer(rect, layer.transform);
-            slot.sprite.anchor.set(0.5, 0.5);
-            slot.sprite.rotation = placement.rotation;
-            slot.sprite.position.set(placement.centerX, placement.centerY);
-            slot.sprite.scale.set(placement.width / srcWidth, placement.height / srcHeight);
-          }
-          used++;
+          const slot = ensureSlot(usedSlots);
+          const temporary = configureSlot(slot, layer);
+          if (temporary === false) continue;
+          if (temporary) temporaries.push(temporary);
+          ordered.push(slot.sprite);
+          usedSlots++;
         }
 
-        for (let i = used; i < slots.length; i++) {
+        for (const node of ordered) stage.addChild(node);
+        for (let i = usedSlots; i < slots.length; i++) {
           slots[i]!.sprite.visible = false;
+        }
+        for (let i = usedTransitions; i < transitions.length; i++) {
+          transitions[i]!.mesh.visible = false;
         }
 
         renderer.render(stage);
@@ -482,6 +666,26 @@ export async function createPixiCompositor(
         slot.texture.destroy(true);
       }
       slots.length = 0;
+      for (const t of transitions) {
+        // 渲染目标是两张**输出尺寸**的 GPU 纹理，1080p 下每张 8MB——
+        // 漏掉的话每建一次合成器就少 16MB 显存，而它在导出侧是跨导出常驻的
+        t.fromTexture.destroy(true);
+        t.toTexture.destroy(true);
+        t.mesh.destroy();
+        t.shader.destroy();
+        for (const slot of [t.fromSlot, t.toSlot]) {
+          slot.source.resource = null as unknown as ImageResource;
+          slot.sprite.filters = [];
+          slot.colorFilter?.destroy();
+          slot.lutFilter?.destroy();
+          slot.lutTexture?.destroy(true);
+          slot.sprite.destroy();
+          slot.texture.destroy(true);
+        }
+        t.fromScratch.destroy();
+        t.toScratch.destroy();
+      }
+      transitions.length = 0;
       stage.destroy();
       renderer.destroy();
     },

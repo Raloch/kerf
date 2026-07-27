@@ -68,7 +68,29 @@ const TRANSITION_FRAMES = 20;
 const WIN_IN = D_IN - TRANSITION_FRAMES / 2;
 const WIN_OUT = D_IN + TRANSITION_FRAMES / 2;
 
-const TIMELINE_FRAMES = D_OUT;
+/**
+ * 擦除段：E[280,340) 紧跟 D，挂 20 帧**线性擦除**（shader 转场）。
+ *
+ * 溶解那一段验的是"两层有没有被混"，这一段验的是**只有这个自检能验的东西**：
+ * shader 转场在**导出路径**上也画对了。逐像素的混合算术由 Pixi spike 里的
+ * GPU-vs-CPU 断言管（那里两层是纯色，取样精度不参与）；这里管的是
+ * reader 有没有解出两层、Worker 里的合成器有没有拿到转场节点、边界落在哪。
+ *
+ * 擦除在画面上是**左右分区**的，所以这里能用 D6 的分区测量做一条很强的断言：
+ * 边界左边整块是入场层的色相、右边整块是出场层的，两条路径都要成立。
+ */
+const E_IN = 280;
+const E_OUT = 340;
+const E_SOURCE_IN = 100;
+const WIPE_FRAMES = 20;
+const WIPE_WIN_IN = E_IN - WIPE_FRAMES / 2;
+/** 取样帧：进度 0.275，擦除边界落在画面 28% 处。 */
+const WIPE_PROBE = WIPE_WIN_IN + 5;
+/** 边界左侧（已被入场层覆盖）与右侧（仍是出场层）的取样区，都避开留边黑区。 */
+const WIPE_LEFT = { x: 0, y: 90, width: 60, height: 140 };
+const WIPE_RIGHT = { x: 160, y: 90, width: 160, height: 140 };
+
+const TIMELINE_FRAMES = E_OUT;
 const VERIFY_OUT = "kerf-verify-timeline.mp4";
 
 /** 色相容差。素材每帧变 1°，编码有损再加几度，20° 足够区分"差一帧"和"差一个片段"。 */
@@ -102,10 +124,20 @@ const PROBES: readonly Probe[] = [
   { frame: D_IN + 1, label: "转场窗口·交界后一帧", expectSourceFrame: "blend" },
   { frame: WIN_OUT - 1, label: "转场窗口末帧", expectSourceFrame: "blend" },
   { frame: WIN_OUT + 5, label: "转场之后（纯 D）", expectSourceFrame: D_SOURCE_IN + WIN_OUT + 5 - D_IN },
+  { frame: WIPE_PROBE, label: "擦除窗口内（shader 转场）", expectSourceFrame: "blend" },
+  { frame: E_IN + 20, label: "擦除之后（纯 E）", expectSourceFrame: E_SOURCE_IN + 20 },
 ];
 
-/** 落在转场窗口里的取样帧，按上面 PROBES 里的顺序。 */
-const BLEND_PROBES = PROBES.filter((p) => p.expectSourceFrame === "blend").map((p) => p.frame);
+/**
+ * 落在**溶解**窗口里的取样帧。
+ *
+ * 擦除那一帧刻意不在其中：混合比例那一节算的是"逐点 `(1-t)·出场 + t·入场`"，
+ * 而擦除在每一点上都是纯的一层、混合发生在**空间**上。拿溶解的公式去套它会
+ * 得到一个必然对不上的参照值，那种红是噪声不是信号。擦除由分区色相断言管。
+ */
+const DISSOLVE_PROBES = PROBES.filter(
+  (p) => p.expectSourceFrame === "blend" && p.frame >= WIN_IN && p.frame < WIN_OUT,
+).map((p) => p.frame);
 
 /**
  * 混合比例的允许偏差（每通道 0–255）。
@@ -219,7 +251,17 @@ export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult>
     sourceIn: D_SOURCE_IN,
     transitionIn: { kind: "dissolve", frames: TRANSITION_FRAMES },
   };
-  const track: Track = { id: "V1", kind: "video", clips: [clipA, clipB, clipC, clipD] };
+  // E 紧跟 D，挂线性擦除——这是唯一走**双输入 shader** 的一段
+  const clipE: Clip = {
+    id: "E",
+    kind: "media",
+    sourceId: probe.source.id,
+    timelineIn: E_IN,
+    timelineOut: E_OUT,
+    sourceIn: E_SOURCE_IN,
+    transitionIn: { kind: "wipe", frames: WIPE_FRAMES },
+  };
+  const track: Track = { id: "V1", kind: "video", clips: [clipA, clipB, clipC, clipD, clipE] };
   const timeline: Timeline = {
     fps: probe.source.fps,
     width: OUT_SIZE,
@@ -232,6 +274,8 @@ export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult>
   // ---- 2. 预览路径：逐个取样帧渲染并测量 ----
   const engine = await createPreviewEngine(document.createElement("div"), OUT_SIZE, OUT_SIZE);
   const previewBands = new Map<number, Bands>();
+  let previewWipe: { left: Bands; right: Bands } | null = null;
+  let exportedWipe: { left: Bands; right: Bands } | null = null;
   let noTransition = new Map<number, Bands>();
   let pureFrom = new Map<number, Bands>();
   let pureTo = new Map<number, Bands>();
@@ -247,6 +291,13 @@ export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult>
       await engine.renderFrame(timeline, p.frame);
       pctx.drawImage(engine.canvas as CanvasImageSource, 0, 0);
       previewBands.set(p.frame, measure(pctx, OUT_SIZE, OUT_SIZE));
+      // 擦除那一帧另外做分区测量（D6）：整幅平均色对左右分区的效果是瞎的
+      if (p.frame === WIPE_PROBE) {
+        previewWipe = {
+          left: measure(pctx, OUT_SIZE, OUT_SIZE, WIPE_LEFT),
+          right: measure(pctx, OUT_SIZE, OUT_SIZE, WIPE_RIGHT),
+        };
+      }
     }
 
     // 转场用的三组参照，全部走预览路径（不用再导出一遍）：
@@ -267,14 +318,14 @@ export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult>
     delete (bare as { transitionIn?: unknown }).transitionIn;
     noTransition = await shoot(
       { ...timeline, tracks: [{ ...track, clips: [clipA, clipB, clipC, bare] }] },
-      BLEND_PROBES,
+      DISSOLVE_PROBES,
     );
     pureFrom = await shoot(
       {
         ...timeline,
         tracks: [{ ...track, clips: [{ ...clipC, timelineOut: D_OUT }] }],
       },
-      BLEND_PROBES,
+      DISSOLVE_PROBES,
     );
     pureTo = await shoot(
       {
@@ -286,7 +337,7 @@ export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult>
           },
         ],
       },
-      BLEND_PROBES,
+      DISSOLVE_PROBES,
     );
   } finally {
     engine.dispose();
@@ -345,6 +396,12 @@ export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult>
         decoded.close();
       }
       exportedBands.set(p.frame, measure(ectx, OUT_SIZE, OUT_SIZE));
+      if (p.frame === WIPE_PROBE) {
+        exportedWipe = {
+          left: measure(ectx, OUT_SIZE, OUT_SIZE, WIPE_LEFT),
+          right: measure(ectx, OUT_SIZE, OUT_SIZE, WIPE_RIGHT),
+        };
+      }
     }
   } finally {
     input.dispose();
@@ -463,7 +520,7 @@ export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult>
   // 两条路径共用同一份取样映射，一起丢掉当然还是一致（同 D17 那条"摆位真的在变"）。
   // 所以先证明画面被改过（对照没挂转场的同一帧），再证明改成了该有的样子
   // （对照两个纯层按进度加权算出来的参照值）。
-  for (const frame of BLEND_PROBES) {
+  for (const frame of DISSOLVE_PROBES) {
     const actual = previewBands.get(frame)!;
     const bare = noTransition.get(frame)!;
     const from = pureFrom.get(frame)!;
@@ -517,6 +574,56 @@ export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult>
         ) <= HUE_TOLERANCE,
     ),
   );
+
+  // ---- 7. shader 转场（擦除）：边界两侧各是哪一层，两条路径都要对上 ----
+  //
+  // 这是**只有这个自检能验的东西**。逐像素的混合算术由 Pixi spike 里的
+  // GPU-vs-CPU 断言管；这里管的是整条导出路径：reader 有没有解出第二层、
+  // Worker 里的合成器有没有收到转场节点、边界落在画面的哪一处。
+  //
+  // 擦除是**空间**上的分区，所以用 D6 的分区测量：左块应当整块是入场层 E 的
+  // 色相、右块整块是出场层 D 的。这一条同时钉住了三件事——方向（左→右）、
+  // 角色（谁进谁出）、以及进度到边界位置的映射。
+  const wipeProgress = (WIPE_PROBE - WIPE_WIN_IN + 0.5) / WIPE_FRAMES;
+  const wipeIncomingHue = sampleHueAt(E_SOURCE_IN + WIPE_PROBE - E_IN, SOURCE_FRAMES);
+  const wipeOutgoingHue = sampleHueAt(D_SOURCE_IN + WIPE_PROBE - D_IN, SOURCE_FRAMES);
+  for (const [pathName, bands] of [
+    ["预览", previewWipe],
+    ["导出", exportedWipe],
+  ] as const) {
+    if (!bands) {
+      checks.push(check(`擦除·${pathName}分区测量`, "有数据", "缺失", false));
+      continue;
+    }
+    checks.push(
+      check(
+        `擦除·${pathName}：边界左侧是入场层 E（t=${wipeProgress.toFixed(3)}）`,
+        `色相 ${wipeIncomingHue}° ±${HUE_TOLERANCE}`,
+        `${bands.left.hue}°`,
+        hueDistance(bands.left.hue, wipeIncomingHue) <= HUE_TOLERANCE,
+      ),
+    );
+    checks.push(
+      check(
+        `擦除·${pathName}：边界右侧仍是出场层 D`,
+        `色相 ${wipeOutgoingHue}° ±${HUE_TOLERANCE}`,
+        `${bands.right.hue}°`,
+        hueDistance(bands.right.hue, wipeOutgoingHue) <= HUE_TOLERANCE,
+      ),
+    );
+  }
+  // 两侧必须**不同**。整个转场退化成"只画一层"时，上面四条里会有两条仍然绿
+  // （那一层恰好是被断言的那个），只有这一条能一次抓住
+  if (previewWipe) {
+    checks.push(
+      check(
+        "擦除：边界两侧确实是不同的两层（没有退化成单层）",
+        `色相相差 > ${HUE_TOLERANCE}°`,
+        `${hueDistance(previewWipe.left.hue, previewWipe.right.hue)}°`,
+        hueDistance(previewWipe.left.hue, previewWipe.right.hue) > HUE_TOLERANCE,
+      ),
+    );
+  }
 
   // 确实产生了留边，否则几何比对是空的
   const first = rows[0]!;

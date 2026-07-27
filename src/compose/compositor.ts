@@ -18,6 +18,7 @@ import type { VideoSample } from "mediabunny";
 
 import type { ColorAdjust } from "./color";
 import type { LutTable } from "./lut";
+import type { ShaderTransitionKind } from "./transition-shader";
 
 /**
  * 图层变换：位置 / 缩放 / 旋转 / 不透明度。**这四个量正是关键帧的作用目标。**
@@ -42,8 +43,8 @@ export interface LayerTransform {
   readonly opacity?: number;
 }
 
-/** 一个图层的画面来源。两种形态对应两条取帧路径，但走同一个合成函数。 */
-export type ComposeLayer =
+/** 一个**有画面来源**的图层。两种形态对应两条取帧路径，但走同一个合成函数。 */
+export type ComposeSourceLayer =
   | {
       readonly kind: "sample";
       /** mediabunny 解码出的帧。生命周期由调用方负责，合成器只读不关。 */
@@ -64,6 +65,32 @@ export type ComposeLayer =
       readonly color?: ColorAdjust;
       readonly lut?: LutTable;
     };
+
+/**
+ * **双输入**节点：两层各自渲进一张纹理，再跑一个同时采样两张的 shader。
+ *
+ * 这是 shader 转场（擦除 / 径向 / 推移）唯一需要的新合成能力。交叉溶解**不走
+ * 这里**——它是"入场层画在出场层之上、alpha = 进度"，用既有的图层不透明度就够，
+ * 因此两个后端都画得出来。把溶解也塞进这个节点会让它凭空要求 WebGL。
+ *
+ * `from` / `to` 只能是**有来源的单层**，不能再套一个转场节点。这不是偷懒：
+ * 时间模型那边"每个片段最多借出自己长度的一半"已经保证了一帧最多两层参与转场
+ * （见 `edl/transition.ts`），类型在这里把那条结构性保证钉住——能嵌套的话
+ * 渲染目标的数量就不再有上界，而 GPU 纹理是有预算的。
+ *
+ * 节点自身没有 `transform`：两个输入各自带着自己的摆位渲进**输出尺寸**的纹理，
+ * 效果作用在输出空间。所以画中画层做擦除时擦的是整屏，不是那个小窗口。
+ */
+export interface ComposeTransitionLayer {
+  readonly kind: "transition";
+  readonly from: ComposeSourceLayer;
+  readonly to: ComposeSourceLayer;
+  /** 0 → 1，语义由 `compose/transition-shader.ts` 定义。 */
+  readonly progress: number;
+  readonly effect: ShaderTransitionKind;
+}
+
+export type ComposeLayer = ComposeSourceLayer | ComposeTransitionLayer;
 
 /** 等比缩放居中（contain）后，图层在输出画布上占据的矩形。 */
 export interface ContainRect {
@@ -260,18 +287,16 @@ export function createCanvas2DCompositor(
       ctx.fillRect(0, 0, width, height);
 
       for (const layer of layers) {
-        if (layer.kind === "sample") {
-          // toVideoFrame() 产出的 VideoFrame 必须单独 close，
-          // 它的生命周期与传入的 sample 是分开的（mediabunny 明确要求）
-          const frame = layer.sample.toVideoFrame();
-          try {
-            drawLayer(ctx, frame, frame.displayWidth, frame.displayHeight, width, height, layer.transform);
-          } finally {
-            frame.close();
-          }
-        } else {
-          drawLayer(ctx, layer.image, layer.width, layer.height, width, height, layer.transform);
+        // 转场节点画不了（要同时采样两张纹理），**照常把两层依次画出来**——
+        // 于是画面表现为交界处硬切。不抛错的理由同 `supportsEffects` 的注释：
+        // 一次导出跑到第三千帧才发现画不了是更坏的失败方式。也**不拿溶解去近似**：
+        // 那会让同一份 EDL 在两台机器上出两张画面，而上层本来就会禁掉导出
+        if (layer.kind === "transition") {
+          drawSourceLayer(ctx, layer.from, width, height);
+          drawSourceLayer(ctx, layer.to, width, height);
+          continue;
         }
+        drawSourceLayer(ctx, layer, width, height);
       }
     },
 
@@ -286,6 +311,27 @@ export function createCanvas2DCompositor(
       ctx.clearRect(0, 0, width, height);
     },
   };
+}
+
+/** 画一个有来源的图层。`color` / `lut` 在这个后端上被忽略，见 `supportsEffects`。 */
+function drawSourceLayer(
+  ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+  layer: ComposeSourceLayer,
+  outWidth: number,
+  outHeight: number,
+): void {
+  if (layer.kind === "sample") {
+    // toVideoFrame() 产出的 VideoFrame 必须单独 close，
+    // 它的生命周期与传入的 sample 是分开的（mediabunny 明确要求）
+    const frame = layer.sample.toVideoFrame();
+    try {
+      drawLayer(ctx, frame, frame.displayWidth, frame.displayHeight, outWidth, outHeight, layer.transform);
+    } finally {
+      frame.close();
+    }
+    return;
+  }
+  drawLayer(ctx, layer.image, layer.width, layer.height, outWidth, outHeight, layer.transform);
 }
 
 /**

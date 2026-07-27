@@ -20,9 +20,9 @@
  */
 
 import type { MediaSource, Timeline } from "../edl/types";
-import { microsToSeconds, visibleVideoClips } from "../edl/sampling";
+import { microsToSeconds, visibleVideoClips, type VisibleClip } from "../edl/sampling";
 import { createCompositor, type CompositorBackend } from "../compose/backend";
-import type { ComposeLayer, Compositor } from "../compose/compositor";
+import type { ComposeLayer, ComposeSourceLayer, Compositor } from "../compose/compositor";
 import { rasterizeText } from "../compose/text-raster";
 import { frameDurationMicros, MICROS_PER_SECOND } from "../time/timebase";
 import type { Rational } from "../time/rational";
@@ -245,7 +245,13 @@ export async function createPreviewEngine(
     const layers: ComposeLayer[] = [];
     const active: ActiveSource[] = [];
 
-    for (const visible of visibleVideoClips(timeline, frame)) {
+    /**
+     * 一层 → 一个合成图层。素材还没就绪时返回 null（这一帧先不画它）。
+     *
+     * **顺带把该层要对齐的 video 记进 `active`**，所以转场里的两个输入也会被
+     * seek——漏掉的话转场那几帧其中一层停在上一个位置，而且只在窗口里出现。
+     */
+    const toLayer = (visible: VisibleClip): ComposeSourceLayer | null => {
       // 摆位和调色都来自 visibleVideoClips，这一层一个都不自己算——
       // 导出侧拿的是同一份（硬规则 2 的第二个落点，见 edl/sampling.ts）
       const looks = {
@@ -260,16 +266,14 @@ export async function createPreviewEngine(
           compositor.width,
           compositor.height,
         );
-        if (raster) {
-          layers.push({
-            kind: "image",
-            image: raster.canvas,
-            width: raster.width,
-            height: raster.height,
-            ...looks,
-          });
-        }
-        continue;
+        if (!raster) return null;
+        return {
+          kind: "image",
+          image: raster.canvas,
+          width: raster.width,
+          height: raster.height,
+          ...looks,
+        };
       }
       const { source, clip } = visible;
       const handle = handleFor(source, clip.id);
@@ -285,15 +289,35 @@ export async function createPreviewEngine(
       });
 
       // 用 readyState 而不是缓存的标志位：事件可能在我们订阅之前就已触发过
-      if (handle.video.readyState >= 2) {
-        layers.push({
-          kind: "image",
-          image: handle.video,
-          width: source.width,
-          height: source.height,
-          ...looks,
-        });
+      if (handle.video.readyState < 2) return null;
+      return {
+        kind: "image",
+        image: handle.video,
+        width: source.width,
+        height: source.height,
+        ...looks,
+      };
+    };
+
+    for (const entry of visibleVideoClips(timeline, frame)) {
+      if (entry.kind === "transition") {
+        // 两个输入都要 toLayer 一遍（于是两个 video 都进 active 被 seek），
+        // 但只有两边都就绪才能画——只画一侧会让转场那几帧闪烁
+        const from = toLayer(entry.from);
+        const to = toLayer(entry.to);
+        if (from && to) {
+          layers.push({
+            kind: "transition",
+            from,
+            to,
+            progress: entry.progress,
+            effect: entry.effect,
+          });
+        }
+        continue;
       }
+      const layer = toLayer(entry);
+      if (layer) layers.push(layer);
     }
     return { layers, active };
   }

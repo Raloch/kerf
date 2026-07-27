@@ -39,6 +39,7 @@ import {
   transitionProgress,
   type TransitionWindow,
 } from "./transition";
+import { isShaderTransition, type ShaderTransitionKind } from "../compose/transition-shader";
 import { frameDurationMicros, frameToMicros, MICROS_PER_SECOND } from "../time/timebase";
 import { resolveColor, resolveTransform } from "../anim/keyframes";
 import type { ColorAdjust } from "../compose/color";
@@ -136,6 +137,29 @@ export interface VisibleTextClip {
 export type VisibleClip = VisibleMediaClip | VisibleTextClip;
 
 /**
+ * 一帧里的一个 shader 转场：两层已经各自解算好，等着被渲进两张纹理再混。
+ *
+ * **只有 shader 转场走这个形态**。交叉溶解仍然是两个普通图层（入场层带不透明度），
+ * 因为它不需要任何新的合成能力——把它也包成节点会让它凭空要求 WebGL。
+ */
+export interface VisibleTransition {
+  readonly kind: "transition";
+  readonly trackId: string;
+  readonly from: VisibleClip;
+  readonly to: VisibleClip;
+  readonly progress: number;
+  readonly effect: ShaderTransitionKind;
+}
+
+/**
+ * 这一帧要画的一个东西：一层，或者一个双输入转场节点。
+ *
+ * 两条渲染路径都遍历这个联合，`kind === "transition"` 的分支必须显式处理——
+ * 漏掉不会报错，只会让转场那几帧少画东西。
+ */
+export type VisibleEntry = VisibleClip | VisibleTransition;
+
+/**
  * 算某片段在某帧的变换。**关键帧的帧偏移相对片段起点**（D10），换算只有这一处。
  *
  * 放在这个模块里是刻意的：预览和导出都从 `visibleVideoClips` 拿变换，谁都不自己算。
@@ -228,45 +252,88 @@ function dissolveTransform(
  * 拆开就等于让调用方自己再合并一次顺序，而那个反转只允许有一处
  * （见 `videoTracksInDrawOrder`）。
  */
-export function visibleVideoClips(timeline: Timeline, frame: number): VisibleClip[] {
-  const out: VisibleClip[] = [];
+export function visibleVideoClips(timeline: Timeline, frame: number): VisibleEntry[] {
+  const out: VisibleEntry[] = [];
   for (const track of videoTracksInDrawOrder(timeline)) {
-    for (const { clip, transition } of trackClipsAt(track, frame)) {
-      // `transform` / `color` 用条件展开而不是直接写 `transform: undefined`：
-      // exactOptionalPropertyTypes 下"字段不存在"和"字段是 undefined"是两回事，
-      // 而下游靠"没有变换 / 没有调色"走恒等快路径
-      const resolved = transformAt(clip, frame);
-      // 入场层在窗口里必然带不透明度，于是必然掉出恒等快路径——这是对的，
-      // 它本来就不是恒等；出场层不带，仍然走原路径逐像素不变
-      const transform =
-        transition?.role === "to"
-          ? dissolveTransform(resolved, transition.progress)
-          : resolved;
-      const color = colorAt(clip, frame);
-      // 引用了已删除的 LUT 时当作没套，而不是整条渲染崩掉——那是编辑器该能扛住的状态
-      const lut = clip.lutId ? findLut(timeline, clip.lutId) : null;
-      const extras = {
-        ...(transform ? { transform } : {}),
-        ...(color ? { color } : {}),
-        ...(lut ? { lut } : {}),
-      };
-      if (clip.kind === "text") {
-        out.push({ kind: "text", trackId: track.id, clip, ...extras });
+    // shader 转场要把两层**配成一个节点**交给合成器（双输入 shader），
+    // 而溶解仍然是两个独立图层叠加。判据只有 `isShaderTransition` 一处——
+    // 另写一份名单的话，漏掉的那一种会退化成"两层直接叠"，画面表现为硬切
+    const window = transitionAt(track.clips, frame);
+    if (window && isShaderTransition(window.kind)) {
+      const from = visibleFor(timeline, track, window.from, frame, true);
+      const to = visibleFor(timeline, track, window.to, frame, true);
+      // 任一侧解不出来（素材被删了）就退化成只画另一侧，而不是整帧空掉
+      if (!from || !to) {
+        if (from) out.push(from);
+        if (to) out.push(to);
         continue;
       }
-      const source = timeline.sources.find((s) => s.id === clip.sourceId);
-      if (!source) continue;
       out.push({
-        kind: "media",
+        kind: "transition",
         trackId: track.id,
-        clip,
-        source,
-        sourceMicros: renderSourceMicros(clip, frame, timeline, source, transition !== undefined),
-        ...extras,
+        from,
+        to,
+        progress: transitionProgress(window, frame),
+        effect: window.kind,
       });
+      continue;
+    }
+
+    for (const { clip, transition } of trackClipsAt(track, frame)) {
+      // 溶解：入场层乘上进度，出场层不动。见 `dissolveTransform`
+      const dissolve = transition?.role === "to" ? transition.progress : undefined;
+      const visible = visibleFor(timeline, track, clip, frame, transition !== undefined, dissolve);
+      if (visible) out.push(visible);
     }
   }
   return out;
+}
+
+/**
+ * 把一个片段变成"这一帧要画的一层"。转场的两个输入和普通图层走的是**同一条**
+ * 路径，所以摆位、调色、LUT、取帧夹紧在转场里的行为与平时完全一致。
+ *
+ * @param inTransition 该帧是否落在转场窗口里；决定取帧位置要不要夹回素材范围
+ * @param dissolveProgress 交叉溶解的进度，只有入场层会传；shader 转场不传
+ *                         （它的混合由 shader 做，再乘一次不透明度就混两遍了）
+ */
+function visibleFor(
+  timeline: Timeline,
+  track: Track,
+  clip: Clip,
+  frame: number,
+  inTransition: boolean,
+  dissolveProgress?: number,
+): VisibleClip | null {
+  // `transform` / `color` 用条件展开而不是直接写 `transform: undefined`：
+  // exactOptionalPropertyTypes 下"字段不存在"和"字段是 undefined"是两回事，
+  // 而下游靠"没有变换 / 没有调色"走恒等快路径
+  const resolved = transformAt(clip, frame);
+  // 入场层在溶解窗口里必然带不透明度，于是必然掉出恒等快路径——这是对的，
+  // 它本来就不是恒等；出场层不带，仍然走原路径逐像素不变
+  const transform =
+    dissolveProgress === undefined ? resolved : dissolveTransform(resolved, dissolveProgress);
+  const color = colorAt(clip, frame);
+  // 引用了已删除的 LUT 时当作没套，而不是整条渲染崩掉——那是编辑器该能扛住的状态
+  const lut = clip.lutId ? findLut(timeline, clip.lutId) : null;
+  const extras = {
+    ...(transform ? { transform } : {}),
+    ...(color ? { color } : {}),
+    ...(lut ? { lut } : {}),
+  };
+  if (clip.kind === "text") {
+    return { kind: "text", trackId: track.id, clip, ...extras };
+  }
+  const source = timeline.sources.find((s) => s.id === clip.sourceId);
+  if (!source) return null;
+  return {
+    kind: "media",
+    trackId: track.id,
+    clip,
+    source,
+    sourceMicros: renderSourceMicros(clip, frame, timeline, source, inTransition),
+    ...extras,
+  };
 }
 
 /**
