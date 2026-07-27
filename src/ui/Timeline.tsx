@@ -10,7 +10,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { clipDuration, type Clip, type Timeline as Tl, type Track, type TrackId } from "../edl/types";
-import { framesToTimecode } from "../time/timebase";
+import { framesToTimecode, secondsToFrameCount } from "../time/timebase";
 import { toNumber } from "../time/rational";
 import { useTimeline } from "../state/timeline-store";
 import { ghostForTrack, useClipDrag, type ClipDragApi, type Ghost } from "./use-clip-drag";
@@ -25,6 +25,9 @@ const STRIP_HEIGHT = 32;
 const ZOOM_MIN = 8;
 const ZOOM_MAX = 200;
 
+/** 新建文字片段的默认时长（秒）。够读完一句话，又不至于压住下一句。 */
+const TEXT_CLIP_SECONDS = 3;
+
 export function TimelinePanel() {
   const timeline = useTimeline((s) => s.timeline());
   const playhead = useTimeline((s) => s.playhead);
@@ -37,6 +40,7 @@ export function TimelinePanel() {
   const removeSelected = useTimeline((s) => s.removeSelected);
   const zoom = useTimeline((s) => s.zoom);
   const setZoom = useTimeline((s) => s.setZoom);
+  const addTextClip = useTimeline((s) => s.addTextClip);
 
   const pxPerFrame = zoom / 100;
   const ticksRef = useRef<HTMLDivElement>(null);
@@ -115,6 +119,21 @@ export function TimelinePanel() {
           onClick={() => removeSelected(false)}
         >
           <IconTrash />
+        </button>
+        <button
+          type="button"
+          className="ib sm"
+          title={`在播放头新建文字片段（${TEXT_CLIP_SECONDS} 秒）`}
+          onClick={() =>
+            addTextClip({
+              timelineIn: playhead,
+              // 时长按秒定、按当前帧率换算：写死帧数会让 60fps 项目里的字幕只有一半时间
+              durationFrames: Math.max(1, secondsToFrameCount(TEXT_CLIP_SECONDS, timeline.fps)),
+              text: "新建文字",
+            })
+          }
+        >
+          <IconText />
         </button>
         <span className="sep" />
         <button type="button" className="ib sm" title="新建轨道（M1 后续）" disabled>

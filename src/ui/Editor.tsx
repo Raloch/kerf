@@ -14,6 +14,7 @@ import { findClip } from "../state/operations";
 import { clipDuration } from "../edl/types";
 import { formatDuration, framesToTimecode } from "../time/timebase";
 import { formatFps } from "../time/rational";
+import { Inspector } from "./Inspector";
 import { Preview } from "./Preview";
 import { TimelinePanel } from "./Timeline";
 import { ExportDialog } from "./ExportDialog";
@@ -148,16 +149,9 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
     return () => window.removeEventListener("keydown", onKey);
   }, [exportOpen, playhead, redo, removeSelected, setPlayhead, splitAtPlayhead, undo]);
 
+  // 检查器自己从 store 读选中片段；这里留一份是给状态栏和导出范围用的
   const selected = selectedClipId ? findClip(timeline, selectedClipId) : undefined;
   const hasContent = timeline.durationFrames > 0;
-
-  // 先落到 const 局部变量再判别：`selected.clip.kind` 这种属性路径的收窄
-  // 进不到 `find()` 的回调里（TS 只对 const 变量保留收窄），在 JSX 里直接写会编译不过
-  const selectedClip = selected?.clip;
-  const selectedSourceName =
-    selectedClip?.kind === "media"
-      ? timeline.sources.find((s) => s.id === selectedClip.sourceId)?.name
-      : undefined;
 
   return (
     <div className="ed">
@@ -268,92 +262,7 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
             <h3>检查器</h3>
           </div>
           <div className="pane-body">
-            {!selected ? (
-              <p className="empty">未选中片段。点时间轴上的片段查看属性。</p>
-            ) : (
-              <>
-                <div className="insp-hd">
-                  <span
-                    className="swatch"
-                    style={{
-                      background:
-                        selected.clip.kind === "text"
-                          ? "var(--c-text-hi)"
-                          : selected.track.kind === "video"
-                            ? "var(--c-video-hi)"
-                            : "var(--c-audio-hi)",
-                    }}
-                  />
-                  <div style={{ minWidth: 0 }}>
-                    <div className="n">
-                      {selected.clip.name ??
-                        (selected.clip.kind === "text" ? selected.clip.text : selectedSourceName) ??
-                        selected.clip.id}
-                    </div>
-                    <div className="s">
-                      {selected.clip.kind === "text"
-                        ? "文字"
-                        : selected.track.kind === "video"
-                          ? "视频"
-                          : "音频"}{" "}
-                      · {selected.track.id}
-                    </div>
-                  </div>
-                </div>
-                <div className="grp-title">时间轴位置</div>
-                <div className="fields">
-                  <div className="f">
-                    <label>入点</label>
-                    <span className="val">
-                      {framesToTimecode(selected.clip.timelineIn, timeline.fps)}
-                    </span>
-                  </div>
-                  <div className="f">
-                    <label>出点</label>
-                    <span className="val">
-                      {framesToTimecode(selected.clip.timelineOut, timeline.fps)}
-                    </span>
-                  </div>
-                  <div className="f">
-                    <label>时长</label>
-                    <span className="val">
-                      {clipDuration(selected.clip)} 帧 ·{" "}
-                      {formatDuration(clipDuration(selected.clip), timeline.fps)}
-                    </span>
-                  </div>
-                </div>
-                {selected.clip.kind === "text" ? (
-                  <>
-                    <div className="grp-title">文字内容</div>
-                    <div className="fields">
-                      <div className="f">
-                        <label>文本</label>
-                        <span className="val">{selected.clip.text}</span>
-                      </div>
-                    </div>
-                  </>
-                ) : (
-                  <>
-                    <div className="grp-title">源片引用</div>
-                    <div className="fields">
-                      <div className="f">
-                        <label>源起始帧</label>
-                        <span className="val">{selected.clip.sourceIn}</span>
-                      </div>
-                      <div className="f">
-                        <label>源时间码</label>
-                        <span className="val">
-                          {framesToTimecode(selected.clip.sourceIn, timeline.fps)}
-                        </span>
-                      </div>
-                    </div>
-                  </>
-                )}
-                <p className="empty">
-                  变换与关键帧已进入 EDL，编辑界面稍后接入。速度、滤镜、音量包络在 M2 后半段。
-                </p>
-              </>
-            )}
+            <Inspector />
           </div>
         </div>
       </div>

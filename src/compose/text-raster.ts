@@ -58,7 +58,8 @@ export interface TextStyle {
   readonly maxWidthRatio?: number;
 }
 
-const DEFAULTS = {
+/** 各样式项的默认值。检查器要显示"没设过时实际长什么样"，所以导出。 */
+export const TEXT_STYLE_DEFAULTS = {
   fontSizeRatio: 0.08,
   fontFamily: '"PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif',
   fontWeight: 600,
@@ -265,7 +266,7 @@ export function rasterizeText(
   const hit = cache.get(key);
   if (hit) return hit;
 
-  const s = { ...DEFAULTS, ...style };
+  const s = { ...TEXT_STYLE_DEFAULTS, ...style };
   const fontSize = s.fontSizeRatio * outHeight;
   if (!(fontSize > 0)) return null;
 

@@ -479,6 +479,232 @@
   font-weight: 600;
   padding: 10px 11px 0;
 }
+.ed .grp-title.row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.ed .grp-title .mini {
+  font-family: var(--ui);
+  font-size: 10px;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--tx-dim);
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+.ed .grp-title .mini:hover:not(:disabled) {
+  color: var(--tx);
+}
+.ed .grp-title .mini:disabled {
+  color: var(--tx-faint);
+  opacity: 0.5;
+  cursor: default;
+}
+.ed .hint {
+  margin: 0;
+  padding: 6px 11px 0;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--tx-faint);
+}
+
+/* ---------- 检查器：可编辑控件 ---------- */
+/* 三列：标签 / 输入 / 关键帧钻石。右栏只有 248px，列宽是数出来的，
+   加控件前先量一遍，别让输入框被挤成看不清数字的一条。 */
+.ed .f.ctl {
+  grid-template-columns: 54px minmax(0, 1fr) 20px;
+}
+.ed .numw {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
+}
+.ed .numw > i {
+  font-style: normal;
+  font-size: 9.5px;
+  color: var(--tx-faint);
+  flex: none;
+}
+.ed .num {
+  min-width: 0;
+  flex: 1 1 auto;
+  height: 21px;
+  padding: 0 4px;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--tx);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+}
+.ed .num:focus {
+  outline: none;
+  border-color: var(--line-2);
+  background: var(--panel-3);
+}
+.ed .num:disabled {
+  color: var(--tx-faint);
+  cursor: not-allowed;
+}
+.ed .sel {
+  height: 21px;
+  padding: 0 2px;
+  font-family: var(--ui);
+  font-size: 10px;
+  color: var(--tx);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+}
+.ed .sel.wide {
+  width: 100%;
+}
+.ed .color {
+  width: 100%;
+  height: 21px;
+  padding: 1px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.ed .color.sm {
+  width: 26px;
+  flex: none;
+}
+.ed .ta {
+  width: 100%;
+  min-height: 46px;
+  padding: 5px 6px;
+  font-family: var(--ui);
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--tx);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  resize: vertical;
+}
+.ed .ta:focus {
+  outline: none;
+  border-color: var(--line-2);
+}
+.ed .seg {
+  display: flex;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.ed .seg button {
+  flex: 1;
+  height: 19px;
+  font-family: var(--ui);
+  font-size: 10px;
+  color: var(--tx-dim);
+  background: var(--panel-2);
+  border: 0;
+  border-right: 1px solid var(--line);
+  cursor: pointer;
+}
+.ed .seg button:last-child {
+  border-right: 0;
+}
+.ed .seg button[aria-pressed="true"] {
+  color: var(--ink);
+  background: var(--kerf);
+}
+
+/* ---------- 检查器：关键帧 ---------- */
+/* 钻石有三态，颜色是唯一的区分：暗 = 没动画，描边 = 有动画但不在这一帧，
+   实心 = 这一帧上就有一个。三态挤在 16px 里，所以不要再加第四种含义。 */
+.ed .kf {
+  width: 18px;
+  height: 18px;
+  padding: 3px;
+  color: var(--tx-faint);
+  background: none;
+  border: 0;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.ed .kf svg {
+  width: 100%;
+  height: 100%;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+}
+.ed .kf:hover:not(:disabled) {
+  color: var(--tx);
+  background: var(--panel-3);
+}
+.ed .kf.anim {
+  color: var(--kerf);
+}
+.ed .kf.on {
+  color: var(--kerf);
+}
+.ed .kf.on svg {
+  fill: var(--kerf);
+}
+.ed .kf:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+/* 关键帧条是 .fields（纵向 flex）里的独立一行，紧跟在它所属的属性行下面 */
+.ed .kfrow {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: -3px 0 2px;
+}
+.ed .kfbar {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 14px;
+  background: var(--panel-2);
+  border-radius: 3px;
+}
+.ed .kfbar::before {
+  content: "";
+  position: absolute;
+  inset: 6px 3px auto;
+  height: 1px;
+  background: var(--line-2);
+}
+.ed .kfm {
+  position: absolute;
+  top: 3px;
+  width: 8px;
+  height: 8px;
+  margin-left: -4px;
+  padding: 0;
+  background: var(--kerf);
+  border: 0;
+  transform: rotate(45deg);
+  cursor: pointer;
+}
+/* 裁入点之后落到片段外的关键帧：保留着（shiftKeyframes 不删），
+   但要看得出它现在不生效，否则用户会以为动画坏了 */
+.ed .kfm.out {
+  background: var(--tx-faint);
+}
+.ed .kfm.cur {
+  outline: 1px solid var(--tx);
+}
+.ed .ib.xs {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  padding: 3px;
+}
 /* ---------- 时间轴 ---------- */
 /* 高度要容得下 5 条默认轨道：工具条 32 + 标尺 25 + 轨道 (54×3 + 44×2) = 307。
    给到 316 留余量；轨道更多时靠 .tl-scroll 滚动兜底。 */

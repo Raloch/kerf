@@ -15,9 +15,19 @@
  */
 
 import {
+  ANIMATABLE_PROPERTIES,
+  type AnimatableProperty,
+  type Easing,
+  type Keyframe,
+  type KeyframeChannels,
+} from "../anim/keyframes";
+import type { LayerTransform } from "../compose/compositor";
+import type { TextStyle } from "../compose/text-raster";
+import {
   clipDuration,
   type Clip,
   type ClipId,
+  type TextClip,
   type Timeline,
   type Track,
   type TrackId,
@@ -27,6 +37,13 @@ import {
 export interface EditResult {
   readonly timeline: Timeline;
   readonly changed: boolean;
+  /**
+   * 失败原因。
+   *
+   * `changed:false` 且**没有** reason 是第三种结果：**值没变**——不是失败，
+   * 只是不该产生历史条目。滑块拖到边界后继续拖会一直发同一个值，
+   * 把它当失败会让状态栏一直闪红字。store 的 `apply()` 据此决定要不要提示。
+   */
   readonly reason?: string;
 }
 
@@ -35,6 +52,10 @@ function ok(timeline: Timeline): EditResult {
 }
 function reject(timeline: Timeline, reason: string): EditResult {
   return { timeline, changed: false, reason };
+}
+/** 值没变：不进撤销栈，也不算失败。见 `EditResult.reason`。 */
+function unchanged(timeline: Timeline): EditResult {
+  return { timeline, changed: false };
 }
 
 function findTrack(timeline: Timeline, trackId: TrackId): Track | undefined {
@@ -93,6 +114,28 @@ function mapTrack(
 ): Timeline {
   const tracks = timeline.tracks.map((t) => (t.id === trackId ? fn(t) : t));
   return replaceTracks(timeline, tracks);
+}
+
+/** 原地替换一个片段。只给**不改时间占位**的操作用，所以不做重叠检查。 */
+function replaceClip(timeline: Timeline, trackId: TrackId, next: Clip): Timeline {
+  return mapTrack(timeline, trackId, (t) =>
+    withClips(t, t.clips.map((c) => (c.id === next.id ? next : c))),
+  );
+}
+
+/**
+ * 设置或**删除**一个可选字段。
+ *
+ * 不能写成 `{ ...clip, transform: undefined }`：严格模式开了
+ * `exactOptionalPropertyTypes`，"字段存在但值是 undefined"和"字段不存在"是
+ * 两种类型，而下游判的正是**存在与否**——合成器的恒等快路径（D9）和
+ * `resolveTransform` 原样返回 base（D10）都靠它。所以清除必须真的 delete。
+ */
+function setOptional<T extends object>(obj: T, key: string, value: unknown): T {
+  const next = { ...obj } as Record<string, unknown>;
+  if (value === undefined) delete next[key];
+  else next[key] = value;
+  return next as T;
 }
 
 // ---------------------------------------------------------------------------
@@ -178,6 +221,32 @@ export function moveClip(
 export type TrimEdge = "in" | "out";
 
 /**
+ * 把关键帧偏移整体平移 `delta` 帧。
+ *
+ * 关键帧的 `frame` 是**相对片段起点**的偏移（PLAN.md 的 D10），所以片段起点
+ * 一旦改变指向的内容，就必须跟着改：入点右移 10 帧意味着少用开头 10 帧，
+ * 原本挂在"片段第 30 帧"上的动作，现在是这个片段的第 20 帧。不平移的话
+ * 整条动画会相对画面内容滑走，而这**不会报错**——只会让用户发现"裁了一下，
+ * 字幕的飞入时机就不对了"。
+ *
+ * 只有两处会改变"片段起点对应哪一刻内容"：**裁入点**和**切分出来的右半段**。
+ * 在时间轴上平移片段不需要动它——那正是当初选相对偏移的理由。
+ *
+ * 平移后落到 `[0, 时长)` 之外的关键帧**保留不删**：`valueAt` 在区间外取端点值，
+ * 语义仍然正确，而且用户把入点拖回去时动画能原样回来。删掉则不可逆。
+ */
+function shiftKeyframes(channels: KeyframeChannels, delta: number): KeyframeChannels {
+  if (delta === 0) return channels;
+  const next: { -readonly [K in AnimatableProperty]?: readonly Keyframe[] } = {};
+  for (const property of ANIMATABLE_PROPERTIES) {
+    const series = channels[property];
+    if (!series) continue;
+    next[property] = series.map((k) => ({ ...k, frame: k.frame - delta }));
+  }
+  return next;
+}
+
+/**
  * 拖动片段边缘裁切。
  *
  * 关键约束：入点裁切会同步改 `sourceIn`——把左边缘往右拖 10 帧，
@@ -220,6 +289,8 @@ export function trimClip(
     } else {
       next = { ...clip, timelineIn: newIn };
     }
+    // 起点动了，关键帧偏移要跟着动，否则动画从内容上滑走。出点裁切不需要
+    if (clip.keyframes) next = { ...next, keyframes: shiftKeyframes(clip.keyframes, deltaFrames) };
   } else {
     const newOut = clip.timelineOut + deltaFrames;
     if (newOut <= clip.timelineIn) return reject(timeline, "片段至少要保留 1 帧");
@@ -268,17 +339,21 @@ export function splitClipAt(timeline: Timeline, clipId: ClipId, frame: number): 
 
   const left: Clip = { ...clip, timelineOut: frame };
   const rightId = `${clip.id}-s${++splitSeq}`;
-  const right: Clip =
+  const cut = frame - clip.timelineIn;
+  let right: Clip =
     clip.kind === "media"
       ? {
           ...clip,
           id: rightId,
           timelineIn: frame,
           // 右半段引用源片的起点要跟着推进，否则右半段会重播左半段的内容
-          sourceIn: clip.sourceIn + (frame - clip.timelineIn),
+          sourceIn: clip.sourceIn + cut,
         }
       // 文字层没有源片游标，两半段显示同一段文字
       : { ...clip, id: rightId, timelineIn: frame };
+  // 与裁入点同理：右半段的起点换了内容，关键帧偏移要减掉切掉的那一段。
+  // 左半段起点没动，原样保留（超出新长度的关键帧不删，见 shiftKeyframes）
+  if (clip.keyframes) right = { ...right, keyframes: shiftKeyframes(clip.keyframes, cut) };
 
   return ok(
     mapTrack(timeline, track.id, (t) =>
@@ -326,6 +401,372 @@ export function rippleDeleteClip(timeline: Timeline, clipId: ClipId): EditResult
       ),
     ),
   );
+}
+
+// ---------------------------------------------------------------------------
+// 变换 / 关键帧 / 文字
+// ---------------------------------------------------------------------------
+
+/** 检查器里的属性名。与错误提示共用一套字面量，避免同一个属性有两种叫法。 */
+export const PROPERTY_LABELS: Record<AnimatableProperty, string> = {
+  x: "位置 X",
+  y: "位置 Y",
+  scaleX: "缩放 X",
+  scaleY: "缩放 Y",
+  rotation: "旋转",
+  opacity: "不透明度",
+};
+
+export interface PropertyRange {
+  /** 缺省值。等于它的属性会被归一化掉——见 `normalizeTransform`。 */
+  readonly fallback: number;
+  readonly min: number;
+  readonly max: number;
+}
+
+/**
+ * 每个属性的缺省值与取值范围。
+ *
+ * 和 `PROPERTY_LABELS` 一样按 `Record<AnimatableProperty, …>` 声明：将来往
+ * `ANIMATABLE_PROPERTIES` 里加一个属性，这两处会**编译不过**，而不是静默漏配。
+ *
+ * 检查器的输入框也从这里取上下限和缺省值——夹紧规则写两份，就会出现
+ * "界面拦不住但纯函数拦得住"的诡异反馈（滑块能拖到底，松手却弹回来）。
+ */
+export const TRANSFORM_RANGES: Record<AnimatableProperty, PropertyRange> = {
+  // 位移单位是输出画布像素，允许移出画面外（飞入飞出要用），只挡住离谱的值
+  x: { fallback: 0, min: -100_000, max: 100_000 },
+  y: { fallback: 0, min: -100_000, max: 100_000 },
+  // 缩放下限取 0 而不是某个小正数：0 → 1 的"弹出"是最常见的关键帧动画之一，
+  // 卡在 0.01 会让动画起点留一个看得见的小方块。负数（翻转）暂不支持——
+  // 两个后端对负尺寸的处理没验过，要开得先在 Pixi spike 里加用例
+  scaleX: { fallback: 1, min: 0, max: 20 },
+  scaleY: { fallback: 1, min: 0, max: 20 },
+  // 弧度（合成层的单位，见 D9）。±100 圈足够任何"转起来"，也挡住手滑输入
+  rotation: { fallback: 0, min: -200 * Math.PI, max: 200 * Math.PI },
+  opacity: { fallback: 1, min: 0, max: 1 },
+};
+
+/** 变换补丁：给数值就设，显式给 `undefined` 就**删掉**这个属性（回到缺省）。 */
+export type TransformPatch = {
+  readonly [K in AnimatableProperty]?: number | undefined;
+};
+
+function clampProperty(property: AnimatableProperty, value: number): number {
+  const range = TRANSFORM_RANGES[property];
+  return Math.min(range.max, Math.max(range.min, value));
+}
+
+/**
+ * 丢掉所有等于缺省值的属性；全都是缺省则返回 `undefined`（= 没有变换）。
+ *
+ * 这样"调上去又调回来"的片段会回到**真的没有 transform 字段**的状态，
+ * 而不是留一个 `{ x: 0 }`。合成器的恒等判定看的是值不是字段，所以这不是
+ * 正确性问题；但它让"这个片段动过变换没有"在数据层一眼可判，
+ * UI 的重置按钮和 D9 那条"没用变换的输出逐像素不变"也就有了同一个依据。
+ */
+function normalizeTransform(
+  transform: { readonly [K in AnimatableProperty]?: number },
+): LayerTransform | undefined {
+  const next: { -readonly [K in AnimatableProperty]?: number } = {};
+  let any = false;
+  for (const property of ANIMATABLE_PROPERTIES) {
+    const value = transform[property];
+    if (value === undefined || value === TRANSFORM_RANGES[property].fallback) continue;
+    next[property] = value;
+    any = true;
+  }
+  return any ? next : undefined;
+}
+
+function sameTransform(a: LayerTransform | undefined, b: LayerTransform | undefined): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return ANIMATABLE_PROPERTIES.every((property) => a[property] === b[property]);
+}
+
+/** 校验 + 夹紧 + 归一化。返回错误文案或合并后的变换。 */
+function applyTransformPatch(
+  base: LayerTransform | undefined,
+  patch: TransformPatch,
+): { readonly ok: true; readonly transform: LayerTransform | undefined } | { readonly ok: false; readonly reason: string } {
+  const merged: { -readonly [K in AnimatableProperty]?: number } = { ...base };
+  for (const property of ANIMATABLE_PROPERTIES) {
+    if (!(property in patch)) continue;
+    const raw = patch[property];
+    if (raw === undefined) {
+      delete merged[property];
+      continue;
+    }
+    // NaN 会一路传到 drawImage，画面整层消失且不报错——必须在入口挡掉
+    if (!Number.isFinite(raw)) return { ok: false, reason: `${PROPERTY_LABELS[property]}必须是有限数` };
+    merged[property] = clampProperty(property, raw);
+  }
+  return { ok: true, transform: normalizeTransform(merged) };
+}
+
+/**
+ * 改片段的**静态**变换。
+ *
+ * 与关键帧并存：某属性有关键帧时，渲染以关键帧为准（`resolveTransform`），
+ * 这里改的是"关掉动画之后的那个值"。要改动画上的值请用 `setKeyframe`。
+ */
+export function setClipTransform(
+  timeline: Timeline,
+  clipId: ClipId,
+  patch: TransformPatch,
+): EditResult {
+  const found = findClip(timeline, clipId);
+  if (!found) return reject(timeline, `找不到片段 ${clipId}`);
+  if (found.track.locked) return reject(timeline, "轨道已锁定");
+
+  const result = applyTransformPatch(found.clip.transform, patch);
+  if (!result.ok) return reject(timeline, result.reason);
+  if (sameTransform(result.transform, found.clip.transform)) return unchanged(timeline);
+
+  return ok(
+    replaceClip(timeline, found.track.id, setOptional(found.clip, "transform", result.transform)),
+  );
+}
+
+/** 把某个属性的关键帧序列换成新的；空序列会连通道一起删掉。 */
+function withChannel(
+  clip: Clip,
+  property: AnimatableProperty,
+  series: readonly Keyframe[],
+): Clip {
+  const channels: { -readonly [K in AnimatableProperty]?: readonly Keyframe[] } = {
+    ...clip.keyframes,
+  };
+  if (series.length === 0) delete channels[property];
+  else channels[property] = series;
+
+  const empty = ANIMATABLE_PROPERTIES.every((p) => channels[p] === undefined);
+  // 最后一条关键帧被删掉时要把 keyframes 字段整个去掉，而不是留个 `{}`：
+  // `resolveTransform` 只在 `!channels` 时才原样返回 base，留空对象会走进
+  // 遍历分支——结果虽然一样，但"这个片段有没有动画"就不能靠字段判断了
+  return setOptional(clip, "keyframes", empty ? undefined : channels);
+}
+
+/**
+ * 在片段的第 `offset` 帧打一个关键帧（已有则改值）。
+ *
+ * `offset` 是**片段内偏移**，不是时间轴帧号——调用方要减掉 `timelineIn`。
+ * 插入时维持"按 frame 升序"，那是 `valueAt` 的前提（见 keyframes.ts 文件头）。
+ *
+ * @param easing 省略表示沿用已有关键帧的缓动（新建则为默认线性）
+ */
+export function setKeyframe(
+  timeline: Timeline,
+  clipId: ClipId,
+  property: AnimatableProperty,
+  offset: number,
+  value: number,
+  easing?: Easing,
+): EditResult {
+  if (!Number.isInteger(offset)) return reject(timeline, "关键帧位置必须是整数帧");
+  if (!Number.isFinite(value)) return reject(timeline, `${PROPERTY_LABELS[property]}必须是有限数`);
+
+  const found = findClip(timeline, clipId);
+  if (!found) return reject(timeline, `找不到片段 ${clipId}`);
+  if (found.track.locked) return reject(timeline, "轨道已锁定");
+
+  const clamped = clampProperty(property, value);
+  const series = found.clip.keyframes?.[property] ?? [];
+  const existing = series.find((k) => k.frame === offset);
+  if (existing && existing.value === clamped && (easing === undefined || existing.easing === easing)) {
+    return unchanged(timeline);
+  }
+
+  const kept = easing ?? existing?.easing;
+  const next: Keyframe = { frame: offset, value: clamped, ...(kept ? { easing: kept } : {}) };
+  const merged = [...series.filter((k) => k.frame !== offset), next].sort((a, b) => a.frame - b.frame);
+
+  return ok(replaceClip(timeline, found.track.id, withChannel(found.clip, property, merged)));
+}
+
+export function removeKeyframe(
+  timeline: Timeline,
+  clipId: ClipId,
+  property: AnimatableProperty,
+  offset: number,
+): EditResult {
+  const found = findClip(timeline, clipId);
+  if (!found) return reject(timeline, `找不到片段 ${clipId}`);
+  if (found.track.locked) return reject(timeline, "轨道已锁定");
+
+  const series = found.clip.keyframes?.[property];
+  if (!series?.some((k) => k.frame === offset)) return reject(timeline, "这一帧上没有关键帧");
+
+  const kept = series.filter((k) => k.frame !== offset);
+  return ok(replaceClip(timeline, found.track.id, withChannel(found.clip, property, kept)));
+}
+
+/**
+ * 关掉某个属性的动画：删光它的关键帧。
+ *
+ * `bakeValue` 是"关掉动画时停在哪个值"——不传的话属性会跳回静态变换里那个
+ * 可能很久以前的旧值，用户看到的是画面突然弹走。UI 传的是播放头当前的求值结果，
+ * 于是"关掉动画"只是停住，不移动。两件事合成一步撤销，因为它们是一次操作。
+ */
+export function clearKeyframes(
+  timeline: Timeline,
+  clipId: ClipId,
+  property: AnimatableProperty,
+  bakeValue?: number,
+): EditResult {
+  const found = findClip(timeline, clipId);
+  if (!found) return reject(timeline, `找不到片段 ${clipId}`);
+  if (found.track.locked) return reject(timeline, "轨道已锁定");
+  if (!found.clip.keyframes?.[property]) return reject(timeline, "这个属性没有关键帧");
+
+  let next = withChannel(found.clip, property, []);
+  if (bakeValue !== undefined) {
+    const baked = applyTransformPatch(next.transform, { [property]: bakeValue });
+    if (!baked.ok) return reject(timeline, baked.reason);
+    next = setOptional(next, "transform", baked.transform);
+  }
+  return ok(replaceClip(timeline, found.track.id, next));
+}
+
+// ---- 文字 ----
+
+/** 文字样式补丁：显式给 `undefined` 表示恢复该项的默认值。 */
+export type TextStylePatch = {
+  readonly [K in keyof TextStyle]?: TextStyle[K] | undefined;
+};
+
+/** 样式里数值项的取值范围。字符串项（颜色、字体族、对齐）不夹。 */
+const STYLE_RANGES: Record<string, { readonly min: number; readonly max: number }> = {
+  fontSizeRatio: { min: 0.01, max: 1 },
+  fontWeight: { min: 100, max: 900 },
+  strokeRatio: { min: 0, max: 0.05 },
+  shadowRatio: { min: 0, max: 0.1 },
+  lineHeight: { min: 0.5, max: 3 },
+  maxWidthRatio: { min: 0.05, max: 1 },
+};
+
+function requireText(
+  timeline: Timeline,
+  clipId: ClipId,
+): { readonly track: Track; readonly clip: TextClip } | EditResult {
+  const found = findClip(timeline, clipId);
+  if (!found) return reject(timeline, `找不到片段 ${clipId}`);
+  if (found.track.locked) return reject(timeline, "轨道已锁定");
+  if (found.clip.kind !== "text") return reject(timeline, "这不是文字片段");
+  return { track: found.track, clip: found.clip };
+}
+
+function isEditResult(v: { readonly clip: TextClip } | EditResult): v is EditResult {
+  return "changed" in v;
+}
+
+export function setTextContent(timeline: Timeline, clipId: ClipId, text: string): EditResult {
+  const found = requireText(timeline, clipId);
+  if (isEditResult(found)) return found;
+  if (found.clip.text === text) return unchanged(timeline);
+  return ok(replaceClip(timeline, found.track.id, { ...found.clip, text }));
+}
+
+export function setTextStyle(
+  timeline: Timeline,
+  clipId: ClipId,
+  patch: TextStylePatch,
+): EditResult {
+  const found = requireText(timeline, clipId);
+  if (isEditResult(found)) return found;
+
+  const merged: Record<string, unknown> = { ...found.clip.style };
+  for (const [key, raw] of Object.entries(patch)) {
+    if (raw === undefined) {
+      delete merged[key];
+      continue;
+    }
+    if (typeof raw === "number") {
+      if (!Number.isFinite(raw)) return reject(timeline, `样式项 ${key} 必须是有限数`);
+      const range = STYLE_RANGES[key];
+      merged[key] = range ? Math.min(range.max, Math.max(range.min, raw)) : raw;
+    } else {
+      merged[key] = raw;
+    }
+  }
+
+  // 样式全被清空时把 style 字段整个去掉，和变换归一化同一个理由：
+  // "这个片段改过样式没有"要能在数据层直接看出来
+  const style = Object.keys(merged).length > 0 ? (merged as TextStyle) : undefined;
+  const before = JSON.stringify(found.clip.style ?? null);
+  if (before === JSON.stringify(style ?? null)) return unchanged(timeline);
+
+  return ok(replaceClip(timeline, found.track.id, setOptional(found.clip, "style", style)));
+}
+
+let textSeq = 0;
+
+export interface AddTextOptions {
+  readonly timelineIn: number;
+  readonly durationFrames: number;
+  readonly text: string;
+  /** 不传则自上而下挑第一条放得下的画面轨（T1 在最上，正是「字幕 / 标题」轨）。 */
+  readonly trackId?: TrackId;
+}
+
+/** 新建片段要把 id 交回给调用方，UI 才能选中它。 */
+export interface AddClipResult extends EditResult {
+  readonly clipId?: ClipId;
+}
+
+/**
+ * 新建一个文字片段。
+ *
+ * 文字只能落在**画面轨**——音频轨上的文字层没有任何含义，而 `moveClip` 的
+ * 同类轨检查也会立刻把它锁死在那儿，等于造一个搬不走的片段。
+ */
+export function addTextClip(timeline: Timeline, options: AddTextOptions): AddClipResult {
+  const { timelineIn, durationFrames, text } = options;
+  if (!Number.isInteger(timelineIn) || timelineIn < 0) {
+    return reject(timeline, "起点必须是非负整数帧");
+  }
+  if (!Number.isInteger(durationFrames) || durationFrames < 1) {
+    return reject(timeline, "文字片段至少要有 1 帧");
+  }
+
+  const clipId = `text-${++textSeq}`;
+  const clip: TextClip = {
+    id: clipId,
+    kind: "text",
+    text,
+    timelineIn,
+    timelineOut: timelineIn + durationFrames,
+  };
+
+  const candidates = options.trackId
+    ? timeline.tracks.filter((t) => t.id === options.trackId)
+    : timeline.tracks.filter((t) => t.kind === "video");
+  if (candidates.length === 0) {
+    return reject(timeline, options.trackId ? `找不到轨道 ${options.trackId}` : "没有画面轨");
+  }
+
+  let lastReason = "";
+  for (const track of candidates) {
+    if (track.kind !== "video") {
+      lastReason = "文字片段只能放在画面轨";
+      continue;
+    }
+    if (track.locked) {
+      lastReason = `${track.label ?? track.id} 已锁定`;
+      continue;
+    }
+    const hits = collisionsIn(track, clip);
+    if (hits.length > 0) {
+      lastReason = `与「${hits[0]!.name ?? hits[0]!.id}」重叠`;
+      continue;
+    }
+    return {
+      ...ok(mapTrack(timeline, track.id, (t) => withClips(t, [...t.clips, clip]))),
+      clipId,
+    };
+  }
+  return reject(timeline, options.trackId ? lastReason : `所有画面轨在这个位置都放不下：${lastReason}`);
 }
 
 // ---------------------------------------------------------------------------

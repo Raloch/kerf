@@ -11,6 +11,7 @@
  */
 
 import { create } from "zustand";
+import type { AnimatableProperty, Easing } from "../anim/keyframes";
 import type { Clip, ClipId, MediaSource, Timeline, TrackId } from "../edl/types";
 import { singleClipTimeline } from "../edl/types";
 import { FPS } from "../time/rational";
@@ -27,16 +28,26 @@ import {
   type History,
 } from "./history";
 import {
+  addTextClip,
+  clearKeyframes,
   findClip,
   moveClip,
   removeClip,
+  removeKeyframe,
   rippleDeleteClip,
+  setClipTransform,
+  setKeyframe,
+  setTextContent,
+  setTextStyle,
   snapDrag,
   snapTargets,
   splitClipAt,
   trimClip,
+  type AddTextOptions,
   type EditResult,
   type MoveOptions,
+  type TextStylePatch,
+  type TransformPatch,
   type TrimEdge,
 } from "./operations";
 
@@ -90,6 +101,22 @@ export interface TimelineState {
   trimClip: (clipId: ClipId, edge: TrimEdge, deltaFrames: number) => void;
   splitAtPlayhead: () => void;
   removeSelected: (ripple?: boolean) => void;
+  /** 改静态变换。连续拖滑块按"片段 + 改的是哪几个属性"合并成一步撤销。 */
+  setClipTransform: (clipId: ClipId, patch: TransformPatch) => void;
+  /** 在**时间轴帧号** `frame` 处打关键帧；内部换算成片段内偏移。 */
+  setKeyframeAt: (
+    clipId: ClipId,
+    property: AnimatableProperty,
+    frame: number,
+    value: number,
+    easing?: Easing,
+  ) => void;
+  removeKeyframeAt: (clipId: ClipId, property: AnimatableProperty, frame: number) => void;
+  clearKeyframes: (clipId: ClipId, property: AnimatableProperty, bakeValue?: number) => void;
+  setTextContent: (clipId: ClipId, text: string) => void;
+  setTextStyle: (clipId: ClipId, patch: TextStylePatch) => void;
+  /** 新建文字片段；成功后自动选中它，用户接着就能在检查器里改。 */
+  addTextClip: (options: AddTextOptions) => void;
 
   // ---- 不进撤销栈 ----
   setPlayhead: (frame: number) => void;
@@ -108,7 +135,9 @@ export const useTimeline = create<TimelineState>((set, get) => {
   /** 所有 Timeline 变更的唯一入口。 */
   function apply(result: EditResult, label: string, coalesceKey: string | null = null): void {
     if (!result.changed) {
-      set({ lastRejection: result.reason ?? "操作未生效" });
+      // 没给 reason 表示"值没变"，不是失败——见 EditResult.reason。
+      // 一律当失败提示的话，滑块拖到边界后会一直闪红字
+      if (result.reason !== undefined) set({ lastRejection: result.reason });
       return;
     }
     set((state) => ({
@@ -256,6 +285,66 @@ export const useTimeline = create<TimelineState>((set, get) => {
         : removeClip(timeline, selectedClipId);
       if (result.changed) set({ selectedClipId: null });
       apply(result, ripple ? "波纹删除" : "删除片段");
+    },
+
+    setClipTransform(clipId, patch) {
+      // 合并键带上"改的是哪几个属性"：拖 X 滑块和紧接着拖 Y 滑块是两次编辑，
+      // 只按 clipId 合并会把它们并成一步，⌘Z 一下退回去两个属性
+      const keys = Object.keys(patch).sort().join(",");
+      apply(
+        setClipTransform(get().timeline(), clipId, patch),
+        "调整变换",
+        `transform:${clipId}:${keys}`,
+      );
+    },
+
+    setKeyframeAt(clipId, property, frame, value, easing) {
+      const found = findClip(get().timeline(), clipId);
+      if (!found) {
+        set({ lastRejection: `找不到片段 ${clipId}` });
+        return;
+      }
+      // 关键帧偏移相对片段起点（D10）。换算只在这一处做，纯函数层只认偏移
+      const offset = frame - found.clip.timelineIn;
+      apply(
+        setKeyframe(get().timeline(), clipId, property, offset, value, easing),
+        `关键帧 ${property}`,
+        // 偏移进合并键：在同一个位置拖值要合并，换个位置再打就是新的一步
+        `keyframe:${clipId}:${property}:${offset}`,
+      );
+    },
+
+    removeKeyframeAt(clipId, property, frame) {
+      const found = findClip(get().timeline(), clipId);
+      if (!found) {
+        set({ lastRejection: `找不到片段 ${clipId}` });
+        return;
+      }
+      apply(
+        removeKeyframe(get().timeline(), clipId, property, frame - found.clip.timelineIn),
+        "删除关键帧",
+      );
+    },
+
+    clearKeyframes(clipId, property, bakeValue) {
+      apply(clearKeyframes(get().timeline(), clipId, property, bakeValue), "关闭动画");
+    },
+
+    setTextContent(clipId, text) {
+      // 逐次按键都会进来，靠合并窗口把连续输入并成一步撤销
+      apply(setTextContent(get().timeline(), clipId, text), "修改文字", `text:${clipId}`);
+    },
+
+    setTextStyle(clipId, patch) {
+      const keys = Object.keys(patch).sort().join(",");
+      apply(setTextStyle(get().timeline(), clipId, patch), "文字样式", `style:${clipId}:${keys}`);
+    },
+
+    addTextClip(options) {
+      const result = addTextClip(get().timeline(), options);
+      apply(result, "新建文字");
+      // 选中新片段，用户接着就能改内容；失败时 clipId 为空，不动选中
+      if (result.changed && result.clipId) set({ selectedClipId: result.clipId });
     },
 
     setPlayhead(frame) {

@@ -2,11 +2,18 @@ import { describe, expect, it } from "vitest";
 import { FPS } from "../time/rational";
 import type { Clip, MediaClip, MediaSource, TextClip, Timeline, Track } from "../edl/types";
 import {
+  addTextClip,
+  clearKeyframes,
   computeDuration,
   findClip,
   moveClip,
   removeClip,
+  removeKeyframe,
   rippleDeleteClip,
+  setClipTransform,
+  setKeyframe,
+  setTextContent,
+  setTextStyle,
   snapDrag,
   snapFrame,
   snapTargets,
@@ -403,5 +410,287 @@ describe("不变量：编辑后同轨道永不重叠且有序", () => {
         }
       }
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 变换 / 关键帧 / 文字
+// ---------------------------------------------------------------------------
+
+/** 在 x 通道上按给定偏移打一串关键帧，值取 0/10/20…（只用来看偏移动没动）。 */
+function animated(base: MediaClip, offsets: number[]): MediaClip {
+  return { ...base, keyframes: { x: offsets.map((frame, i) => ({ frame, value: i * 10 })) } };
+}
+
+/** 取某片段 x 通道的关键帧偏移列表。 */
+function offsetsOf(t: Timeline, id: string): number[] {
+  return (findClip(t, id)?.clip.keyframes?.x ?? []).map((k) => k.frame);
+}
+
+describe("裁切与切分要平移关键帧（D10 的债）", () => {
+  it("入点右移 10 帧，关键帧偏移减 10——动画贴住内容不滑走", () => {
+    const t = timeline([
+      { id: "V1", kind: "video", clips: [animated(clip("a", 0, 100, 20), [0, 30, 60])] },
+    ]);
+    const r = trimClip(t, "a", "in", 10);
+    expect(r.changed).toBe(true);
+    // 原本挂在"片段第 30 帧"上的动作，现在是这个片段的第 20 帧
+    expect(offsetsOf(r.timeline, "a")).toEqual([-10, 20, 50]);
+  });
+
+  it("入点左移（拉长）反向平移", () => {
+    const t = timeline([
+      { id: "V1", kind: "video", clips: [animated(clip("a", 50, 150, 20), [0, 30])] },
+    ]);
+    expect(offsetsOf(trimClip(t, "a", "in", -5).timeline, "a")).toEqual([5, 35]);
+  });
+
+  it("平移出边界的关键帧保留不删——把入点拖回去动画要能原样回来", () => {
+    const t = timeline([
+      { id: "V1", kind: "video", clips: [animated(clip("a", 0, 100, 20), [0, 10])] },
+    ]);
+    const trimmed = trimClip(t, "a", "in", 40).timeline;
+    expect(offsetsOf(trimmed, "a")).toEqual([-40, -30]);
+    // 再拖回来，偏移完全复原
+    expect(offsetsOf(trimClip(trimmed, "a", "in", -40).timeline, "a")).toEqual([0, 10]);
+  });
+
+  it("出点裁切不动关键帧——起点没变", () => {
+    const t = timeline([
+      { id: "V1", kind: "video", clips: [animated(clip("a", 0, 100, 20), [0, 30])] },
+    ]);
+    expect(offsetsOf(trimClip(t, "a", "out", -20).timeline, "a")).toEqual([0, 30]);
+  });
+
+  it("在时间轴上平移片段不动关键帧——偏移是相对的，这正是选相对偏移的理由", () => {
+    const t = timeline([
+      { id: "V1", kind: "video", clips: [animated(clip("a", 0, 100, 20), [0, 30])] },
+    ]);
+    expect(offsetsOf(moveClip(t, "a", 500).timeline, "a")).toEqual([0, 30]);
+  });
+
+  it("文字片段同样平移——这不是 media 分支专属", () => {
+    const text: TextClip = {
+      ...textClip("tt", 0, 100),
+      keyframes: { opacity: [{ frame: 0, value: 0 }, { frame: 40, value: 1 }] },
+    };
+    const t = timeline([{ id: "T1", kind: "video", clips: [text] }]);
+    const r = trimClip(t, "tt", "in", 15);
+    expect((findClip(r.timeline, "tt")!.clip.keyframes?.opacity ?? []).map((k) => k.frame)).toEqual([
+      -15, 25,
+    ]);
+  });
+
+  it("切分：左半段原样，右半段减掉切掉的长度", () => {
+    const t = timeline([
+      { id: "V1", kind: "video", clips: [animated(clip("a", 0, 100, 0), [0, 40, 80])] },
+    ]);
+    const r = splitClipAt(t, "a", 30);
+    expect(r.changed).toBe(true);
+    const right = findClip(r.timeline, "a")!.track.clips.find((c) => c.id !== "a")!;
+    expect(offsetsOf(r.timeline, "a")).toEqual([0, 40, 80]);
+    expect((right.keyframes?.x ?? []).map((k) => k.frame)).toEqual([-30, 10, 50]);
+  });
+
+  it("没有关键帧的片段裁切后仍然没有 keyframes 字段", () => {
+    const t = timeline([{ id: "V1", kind: "video", clips: [clip("a", 0, 100, 20)] }]);
+    const trimmed = findClip(trimClip(t, "a", "in", 10).timeline, "a")!.clip;
+    expect("keyframes" in trimmed).toBe(false);
+  });
+});
+
+describe("静态变换", () => {
+  const one = () => timeline([{ id: "V1", kind: "video", clips: [clip("a", 0, 100)] }]);
+
+  it("设值后写进 transform", () => {
+    const r = setClipTransform(one(), "a", { x: 40, scaleX: 1.5 });
+    expect(r.changed).toBe(true);
+    expect(findClip(r.timeline, "a")!.clip.transform).toEqual({ x: 40, scaleX: 1.5 });
+  });
+
+  it("超范围的值被夹住，不是报错", () => {
+    const r = setClipTransform(one(), "a", { opacity: 3, scaleY: -2 });
+    expect(findClip(r.timeline, "a")!.clip.transform).toEqual({ scaleY: 0 });
+    // opacity 夹回 1 就是缺省值，于是被归一化掉了
+  });
+
+  it("拒绝 NaN——它会一路传到 drawImage 把整层画没，且不报错", () => {
+    const r = setClipTransform(one(), "a", { x: Number.NaN });
+    expect(r.changed).toBe(false);
+    expect(r.reason).toContain("有限数");
+  });
+
+  it("调回缺省值时把 transform 字段整个删掉，不留 { x: 0 }", () => {
+    const set = setClipTransform(one(), "a", { x: 40 }).timeline;
+    const back = setClipTransform(set, "a", { x: 0 }).timeline;
+    expect("transform" in findClip(back, "a")!.clip).toBe(false);
+  });
+
+  it("显式传 undefined 表示清除这一项", () => {
+    const set = setClipTransform(one(), "a", { x: 40, y: 20 }).timeline;
+    const r = setClipTransform(set, "a", { x: undefined });
+    expect(findClip(r.timeline, "a")!.clip.transform).toEqual({ y: 20 });
+  });
+
+  it("值没变时 changed:false 且**不给 reason**——那不是失败，不该弹提示", () => {
+    const set = setClipTransform(one(), "a", { x: 40 }).timeline;
+    const again = setClipTransform(set, "a", { x: 40 });
+    expect(again.changed).toBe(false);
+    expect(again.reason).toBeUndefined();
+  });
+
+  it("锁定轨道上改不动", () => {
+    const t = timeline([{ id: "V1", kind: "video", locked: true, clips: [clip("a", 0, 100)] }]);
+    expect(setClipTransform(t, "a", { x: 10 }).reason).toContain("锁定");
+  });
+});
+
+describe("关键帧编辑", () => {
+  const one = () => timeline([{ id: "V1", kind: "video", clips: [clip("a", 0, 100)] }]);
+
+  it("乱序插入后仍按 frame 升序——valueAt 的前提", () => {
+    let t = one();
+    for (const frame of [50, 10, 30, 0]) {
+      t = setKeyframe(t, "a", "x", frame, frame).timeline;
+    }
+    expect(offsetsOf(t, "a")).toEqual([0, 10, 30, 50]);
+  });
+
+  it("同一帧上再打一次是改值，不是插入第二个", () => {
+    let t = setKeyframe(one(), "a", "x", 10, 5).timeline;
+    t = setKeyframe(t, "a", "x", 10, 99).timeline;
+    expect(findClip(t, "a")!.clip.keyframes?.x).toEqual([{ frame: 10, value: 99 }]);
+  });
+
+  it("改值时沿用已有缓动，显式传才覆盖", () => {
+    let t = setKeyframe(one(), "a", "x", 0, 0, "ease-in").timeline;
+    t = setKeyframe(t, "a", "x", 0, 20).timeline;
+    expect(findClip(t, "a")!.clip.keyframes?.x?.[0]?.easing).toBe("ease-in");
+    t = setKeyframe(t, "a", "x", 0, 20, "linear").timeline;
+    expect(findClip(t, "a")!.clip.keyframes?.x?.[0]?.easing).toBe("linear");
+  });
+
+  it("关键帧上的值同样被夹住", () => {
+    const t = setKeyframe(one(), "a", "opacity", 0, 5).timeline;
+    expect(findClip(t, "a")!.clip.keyframes?.opacity?.[0]?.value).toBe(1);
+  });
+
+  it("拒绝非整数偏移", () => {
+    expect(setKeyframe(one(), "a", "x", 1.5, 0).reason).toContain("整数帧");
+  });
+
+  it("删掉最后一个关键帧时 keyframes 字段整个消失", () => {
+    // 留着 {} 的话，"这个片段有没有动画"就不能靠字段判断了
+    const t = setKeyframe(one(), "a", "x", 10, 5).timeline;
+    const r = removeKeyframe(t, "a", "x", 10);
+    expect("keyframes" in findClip(r.timeline, "a")!.clip).toBe(false);
+  });
+
+  it("删不存在的关键帧要给出原因，不静默", () => {
+    expect(removeKeyframe(one(), "a", "x", 10).reason).toContain("没有关键帧");
+  });
+
+  it("关闭动画时把当前值烘进静态变换，画面不跳走", () => {
+    let t = setKeyframe(one(), "a", "x", 0, 0).timeline;
+    t = setKeyframe(t, "a", "x", 50, 200).timeline;
+    const r = clearKeyframes(t, "a", "x", 120);
+    const after = findClip(r.timeline, "a")!.clip;
+    expect("keyframes" in after).toBe(false);
+    expect(after.transform).toEqual({ x: 120 });
+  });
+
+  it("不传烘焙值就只删关键帧", () => {
+    const t = setKeyframe(one(), "a", "x", 0, 77).timeline;
+    const after = findClip(clearKeyframes(t, "a", "x").timeline, "a")!.clip;
+    expect("keyframes" in after).toBe(false);
+    expect("transform" in after).toBe(false);
+  });
+});
+
+describe("文字片段", () => {
+  const one = () => timeline([{ id: "T1", kind: "video", clips: [textClip("tt", 0, 100)] }]);
+
+  it("改内容", () => {
+    const r = setTextContent(one(), "tt", "你好");
+    expect(r.changed).toBe(true);
+    const c = findClip(r.timeline, "tt")!.clip;
+    expect(c.kind === "text" && c.text).toBe("你好");
+  });
+
+  it("素材片段上改文字要被拒", () => {
+    const t = timeline([{ id: "V1", kind: "video", clips: [clip("a", 0, 100)] }]);
+    expect(setTextContent(t, "a", "x").reason).toContain("不是文字片段");
+  });
+
+  it("样式比例被夹在合理范围内", () => {
+    const r = setTextStyle(one(), "tt", { fontSizeRatio: 9 });
+    const c = findClip(r.timeline, "tt")!.clip;
+    expect(c.kind === "text" && c.style?.fontSizeRatio).toBe(1);
+  });
+
+  it("清空最后一项样式时 style 字段整个消失", () => {
+    const t = setTextStyle(one(), "tt", { color: "#ff0000" }).timeline;
+    const r = setTextStyle(t, "tt", { color: undefined });
+    expect("style" in findClip(r.timeline, "tt")!.clip).toBe(false);
+  });
+
+  it("同值重设不产生变更", () => {
+    const t = setTextStyle(one(), "tt", { color: "#ff0000" }).timeline;
+    const again = setTextStyle(t, "tt", { color: "#ff0000" });
+    expect(again.changed).toBe(false);
+    expect(again.reason).toBeUndefined();
+  });
+});
+
+describe("新建文字片段", () => {
+  const layout = (): Timeline =>
+    timeline([
+      { id: "T1", kind: "video", clips: [] },
+      { id: "V1", kind: "video", clips: [] },
+      { id: "A1", kind: "audio", clips: [] },
+    ]);
+
+  it("默认落在最上面那条画面轨，并交回 id", () => {
+    const r = addTextClip(layout(), { timelineIn: 30, durationFrames: 90, text: "标题" });
+    expect(r.changed).toBe(true);
+    expect(r.clipId).toBeTruthy();
+    expect(findClip(r.timeline, r.clipId!)!.track.id).toBe("T1");
+    expect(findClip(r.timeline, r.clipId!)!.clip.timelineOut).toBe(120);
+  });
+
+  it("最上面那条被占用时顺延到下一条画面轨", () => {
+    const t = timeline([
+      { id: "T1", kind: "video", clips: [textClip("old", 0, 100)] },
+      { id: "V1", kind: "video", clips: [] },
+      { id: "A1", kind: "audio", clips: [] },
+    ]);
+    const r = addTextClip(t, { timelineIn: 50, durationFrames: 30, text: "标题" });
+    expect(findClip(r.timeline, r.clipId!)!.track.id).toBe("V1");
+  });
+
+  it("所有画面轨都放不下时给出原因，不静默", () => {
+    const t = timeline([
+      { id: "T1", kind: "video", clips: [textClip("x", 0, 100)] },
+      { id: "V1", kind: "video", clips: [clip("y", 0, 100)] },
+    ]);
+    const r = addTextClip(t, { timelineIn: 50, durationFrames: 30, text: "标题" });
+    expect(r.changed).toBe(false);
+    expect(r.reason).toContain("重叠");
+    expect(r.clipId).toBeUndefined();
+  });
+
+  it("指定音频轨要被拒——那儿的文字层没有含义，而且搬不走", () => {
+    const r = addTextClip(layout(), {
+      timelineIn: 0,
+      durationFrames: 30,
+      text: "x",
+      trackId: "A1",
+    });
+    expect(r.reason).toContain("画面轨");
+  });
+
+  it("时长至少 1 帧", () => {
+    const r = addTextClip(layout(), { timelineIn: 0, durationFrames: 0, text: "x" });
+    expect(r.reason).toContain("1 帧");
   });
 });

@@ -278,3 +278,95 @@ describe("撤销的连带处理", () => {
     expect(s().lastRejection).toBeNull();
   });
 });
+
+describe("变换与关键帧的 store 动作", () => {
+  beforeEach(() => {
+    reset();
+    useTimeline.getState().loadSource(source(300));
+  });
+
+  it("改变换会进撤销栈", () => {
+    useTimeline.getState().setClipTransform("src1-v", { x: 60 });
+    expect(findClip(useTimeline.getState().timeline(), "src1-v")!.clip.transform).toEqual({ x: 60 });
+    useTimeline.getState().undo();
+    expect("transform" in findClip(useTimeline.getState().timeline(), "src1-v")!.clip).toBe(false);
+  });
+
+  it("连续拖同一个滑块合并成一步撤销", () => {
+    const before = useTimeline.getState().history.past.length;
+    for (const x of [10, 20, 30, 40]) useTimeline.getState().setClipTransform("src1-v", { x });
+    expect(useTimeline.getState().history.past.length).toBe(before + 1);
+  });
+
+  it("换一个属性拖就是新的一步——合并键带属性名", () => {
+    const before = useTimeline.getState().history.past.length;
+    useTimeline.getState().setClipTransform("src1-v", { x: 10 });
+    useTimeline.getState().setClipTransform("src1-v", { y: 10 });
+    expect(useTimeline.getState().history.past.length).toBe(before + 2);
+  });
+
+  it("值没变时不产生历史条目，也不弹提示", () => {
+    useTimeline.getState().setClipTransform("src1-v", { x: 10 });
+    useTimeline.setState({ lastRejection: null });
+    const before = useTimeline.getState().history.past.length;
+    useTimeline.getState().setClipTransform("src1-v", { x: 10 });
+    expect(useTimeline.getState().history.past.length).toBe(before);
+    expect(useTimeline.getState().lastRejection).toBeNull();
+  });
+
+  it("打关键帧用的是**时间轴帧号**，内部换算成片段内偏移", () => {
+    // 先把片段挪到 100 帧处，偏移与时间轴帧号就不再相等
+    useTimeline.getState().moveClip("src1-v", 100);
+    useTimeline.getState().setKeyframeAt("src1-v", "opacity", 150, 0.5);
+    const kfs = findClip(useTimeline.getState().timeline(), "src1-v")!.clip.keyframes?.opacity;
+    expect(kfs).toEqual([{ frame: 50, value: 0.5 }]);
+  });
+
+  it("删关键帧同样按时间轴帧号定位", () => {
+    useTimeline.getState().moveClip("src1-v", 100);
+    useTimeline.getState().setKeyframeAt("src1-v", "opacity", 150, 0.5);
+    useTimeline.getState().removeKeyframeAt("src1-v", "opacity", 150);
+    expect("keyframes" in findClip(useTimeline.getState().timeline(), "src1-v")!.clip).toBe(false);
+  });
+
+  it("在不同位置打关键帧不会被合并成一步", () => {
+    const before = useTimeline.getState().history.past.length;
+    useTimeline.getState().setKeyframeAt("src1-v", "x", 0, 0);
+    useTimeline.getState().setKeyframeAt("src1-v", "x", 50, 100);
+    expect(useTimeline.getState().history.past.length).toBe(before + 2);
+  });
+});
+
+describe("新建文字片段", () => {
+  beforeEach(() => {
+    reset();
+    useTimeline.getState().loadSource(source(300));
+  });
+
+  it("落在 T1 并自动选中，接着就能改内容", () => {
+    useTimeline.getState().addTextClip({ timelineIn: 0, durationFrames: 60, text: "标题" });
+    const s = useTimeline.getState();
+    const created = s.selectedClipId!;
+    expect(findClip(s.timeline(), created)!.track.id).toBe("T1");
+
+    useTimeline.getState().setTextContent(created, "改过的标题");
+    const clip = findClip(useTimeline.getState().timeline(), created)!.clip;
+    expect(clip.kind === "text" && clip.text).toBe("改过的标题");
+  });
+
+  it("失败时不改选中", () => {
+    useTimeline.getState().select("src1-v");
+    useTimeline.getState().addTextClip({ timelineIn: 0, durationFrames: 0, text: "x" });
+    expect(useTimeline.getState().selectedClipId).toBe("src1-v");
+    expect(useTimeline.getState().lastRejection).toContain("1 帧");
+  });
+
+  it("撤销能把新建的文字片段收回去", () => {
+    useTimeline.getState().addTextClip({ timelineIn: 0, durationFrames: 60, text: "标题" });
+    const created = useTimeline.getState().selectedClipId!;
+    useTimeline.getState().undo();
+    expect(findClip(useTimeline.getState().timeline(), created)).toBeUndefined();
+    // 撤销后选中不能指向已经不存在的片段
+    expect(useTimeline.getState().selectedClipId).toBeNull();
+  });
+});
