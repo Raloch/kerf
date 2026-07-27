@@ -125,6 +125,24 @@ export async function verifyM0(options: VerifyOptions = {}): Promise<VerifyResul
   checks.push(check("导出帧数", expectedFrames, exported.encodedFrames));
   checks.push(check("导出含音频", true, exported.audioIncluded));
 
+  // **补偿量本身要印出来。** 下面那条"导出没有移动音频"红的时候，光知道偏了多少
+  // 没法往下查——真正要看的是"测出来的延迟是多少、可不可信"。iOS 18.7 上那条红了
+  // 9.3ms，而残留 9.3ms 与"完全没补偿"（约 44ms）是两个完全不同的结论：前者说明
+  // 测量偏了几百个样本，后者说明测量整个失败了。不印这个数就分不出来
+  {
+    const d = exported.audioEncoderDelay;
+    const ms = d.sampleRate > 0 ? (d.samples / d.sampleRate) * 1000 : 0;
+    checks.push(
+      check(
+        "编码延迟测出来了（补偿量与可信度）",
+        "reason 为空",
+        `${d.samples} 样本 = ${ms.toFixed(1)}ms @ ${d.sampleRate}Hz · 相关性 ${d.correlation.toFixed(2)}` +
+          (d.reason ? ` · 未测成：${d.reason}` : ""),
+        d.reason === undefined,
+      ),
+    );
+  }
+
   const realtimeFactor =
     frameToSeconds(exported.encodedFrames, probe.source.fps) / (exported.elapsedMs / 1000);
   checks.push(
@@ -209,8 +227,11 @@ export async function verifyM0(options: VerifyOptions = {}): Promise<VerifyResul
       const sourceInput = new Input({ formats: ALL_FORMATS, source: new BlobSource(sample.file) });
       try {
         const sourceAudio = await sourceInput.getPrimaryAudioTrack();
-        const srcOnset = sourceAudio ? await firstOnsetAfter(sourceAudio, inSeconds + 0.5) : null;
-        const outOnset = await firstOnsetAfter(audioTrack, 0.5);
+        // 两边都整轨从 0 解，不 seek——见 `decodeTrackToPcm` 的注释
+        const srcAudio = sourceAudio ? await decodeTrackToPcm(sourceAudio, inSeconds + 3) : null;
+        const outAudio = await decodeTrackToPcm(audioTrack, expectedSeconds + 1);
+        const srcOnset = srcAudio ? firstOnsetAfter(srcAudio, inSeconds + 0.5) : null;
+        const outOnset = firstOnsetAfter(outAudio, 0.5);
         const expectedOnset = srcOnset === null ? null : srcOnset - inSeconds;
         const drift =
           outOnset === null || expectedOnset === null ? null : outOnset - expectedOnset;
@@ -220,6 +241,21 @@ export async function verifyM0(options: VerifyOptions = {}): Promise<VerifyResul
             "|Δ| < 5ms",
             drift === null ? "量不到提示音" : `${(drift * 1000).toFixed(1)}ms`,
             drift !== null && Math.abs(drift) < 0.005,
+          ),
+        );
+        // **把两个操作数都印出来。** 只报差值时，"素材那边量歪了"和"成片真的被
+        // 挪了"长得一模一样，而这两个的处置完全不同。Safari 上这条红 9.3ms 而
+        // 编码/封装/解封装三条路各自量出来都是 2112 样本、残留 0，所以偏移一定
+        // 出在这两个读数之一，不在补偿上
+        checks.push(
+          check(
+            "音画同步的两个操作数（诊断用）",
+            "素材与成片的提示音位置",
+            `素材 ${srcOnset === null ? "?" : (srcOnset * 1000).toFixed(1)}ms` +
+              ` − 入点 ${(inSeconds * 1000).toFixed(1)}ms` +
+              ` = 期望 ${expectedOnset === null ? "?" : (expectedOnset * 1000).toFixed(1)}ms` +
+              ` · 成片 ${outOnset === null ? "?" : (outOnset * 1000).toFixed(1)}ms`,
+            srcOnset !== null && outOnset !== null,
           ),
         );
       } finally {
@@ -274,6 +310,14 @@ const XFADE_PROBES = [0.25, 0.5, 0.75] as const;
  * 密集扫描是把两者分开的唯一办法，见 `rmsAround` 的注释。
  *
  * 取 0.03：离健康值 3.75×，离最轻的破坏 2.5×。
+ *
+ * **Safari / iOS 上曾经红过一次（淡出 t=0.75 实测 0.420，偏差 0.037），但根因不在
+ * 这个数上，也不在产品里。** 当时六个取样点拟合出一致的"包络偏晚"，同一次运行里
+ * "导出没有移动音频"也独立报了 9.3ms，于是两条红被判成同一个产品 bug。真正的原因是
+ * **测量函数 seek 之后读到的时间戳在 Safari 上偏 9.3ms**——成片本身三个提示音位置
+ * 偏移全是 0。改成整轨从 0 解（`decodeTrackToPcm`）之后两条都绿了。
+ *
+ * 所以这个容差没动过，也**不该**为了让某个浏览器变绿而动它。
  */
 const XFADE_TOLERANCE = 0.03;
 
@@ -385,9 +429,11 @@ async function verifyCrossfade(): Promise<Check[]> {
     const track = await input.getPrimaryAudioTrack();
     if (!track) throw new Error("交叉淡化自检的成片里没有音轨");
     const at = (frames: number) => frameToSeconds(frames, tone.fps);
+    // 整轨解一次，后面所有取样都是纯数组索引（不 seek，见 `decodeTrackToPcm`）
+    const audio = await decodeTrackToPcm(track, at(total) + 1);
 
     // 参照值取 A 段正中间，那里没有任何包络
-    const reference = await rmsAround(track, at(SEG / 2), RMS_WINDOW);
+    const reference = rmsAround(audio, at(SEG / 2), RMS_WINDOW);
     checks.push(
       check(
         "淡化自检：参照段有声音",
@@ -405,7 +451,7 @@ async function verifyCrossfade(): Promise<Check[]> {
 
       for (const t of XFADE_PROBES) {
         const centre = at(windowStart + XFADE_FRAMES * t);
-        const measured = await rmsAround(track, centre, RMS_WINDOW);
+        const measured = rmsAround(audio, centre, RMS_WINDOW);
         const ratio = measured / reference;
         ratios.push(ratio);
         const expected = crossfadeGain("xfade-power", role, t);
@@ -440,41 +486,70 @@ async function verifyCrossfade(): Promise<Check[]> {
 }
 
 /**
- * `centre` 前后各半个 `window` 的 RMS。
+ * 把整条音轨**从 0 解一次**，摆进按绝对样本位置索引的缓冲区。
  *
- * 用 RMS 而不是峰值：AAC 是有损的，单个样本的幅度会抖，而 40ms 上的能量很稳。
+ * ## 为什么必须从 0 解，不能 seek 到关心的那一段
+ *
+ * 这不是性能取舍，是正确性。原来两个测量函数都 `sink.samples(from, …)` 直接
+ * seek 进去，再用 `audioSample.timestamp` 定位——**在 Safari 上那个时间戳偏
+ * 9.3ms**（实测：同一个文件、只改"从 0 读"还是"seek 到 0.5 秒再读"这一个变量，
+ * 前者 1041.0ms、后者 1050.4ms；Chrome 两种都是 1041.0ms）。
+ *
+ * 那 9.3ms 一度被当成**产品的音画同步 bug**：M0 第 17 项在 Safari / iOS 上红，
+ * 而交叉淡化的包络断言也跟着红，六个取样点还拟合出了一致的"包络偏晚"。两条红
+ * 确实是同一个根因，但根因在**读法**里——真实成片的三个提示音位置逐个量下来
+ * 偏移都是 **0**（1041 / 2041 / 3041ms），编解码、封装、解封装三条路各自的
+ * priming 都是 2112 样本，Chrome 与 Safari 一模一样。
+ *
+ * 教训：**跨浏览器的红，先把"量法"从"被测对象"里剥出来**。做法就是只改一个
+ * 变量重测一次——这里是"要不要 seek"。
+ *
+ * 自检的素材只有几秒，整轨解一次的代价可以忽略；换来的是所有测量都变成纯数组
+ * 索引，彻底不依赖 seek 语义。
  */
-async function rmsAround(
+async function decodeTrackToPcm(
   track: InputAudioTrack,
-  centre: number,
-  window: number,
-): Promise<number> {
-  const from = Math.max(0, centre - window / 2);
-  const to = centre + window / 2;
+  maxSeconds: number,
+): Promise<{ readonly pcm: Float32Array; readonly rate: number }> {
+  const rate = await track.getSampleRate();
+  const pcm = new Float32Array(Math.ceil(maxSeconds * rate));
   const sink = new AudioSampleSink(track);
-  let sum = 0;
-  let count = 0;
-  // **向解码器多要 100ms**，再靠下面的时间戳过滤裁回精确窗口。
-  // 直接问 [from,to) 只会拿到起点落在窗口内的那些包，跨过 `from` 的那一个整包
-  // 被漏掉——于是实际量到的区间偏后。包络正在下降时这表现为"量到的值偏低"，
-  // 而且**看起来完全像一个真实的偏差**：实测差 0.033，密集采样验证真实包络只差
-  // 0.010，也就是说三分之二的"误差"来自量法而不是被测对象
-  for await (const audioSample of sink.samples(Math.max(0, from - 0.1), to + 0.1)) {
+  for await (const audioSample of sink.samples(0, maxSeconds)) {
     try {
       const buffer = audioSample.toAudioBuffer();
       const data = buffer.getChannelData(0);
-      const rate = buffer.sampleRate;
+      const offset = Math.round(audioSample.timestamp * rate);
       for (let i = 0; i < data.length; i++) {
-        // 包按整块解出来，两端会伸到取样窗口之外——按时间戳筛掉，
-        // 否则窗口实际宽度会随包边界浮动，而包络正在变化，那就成了系统误差
-        const t = audioSample.timestamp + i / rate;
-        if (t < from || t >= to) continue;
-        sum += data[i]! * data[i]!;
-        count++;
+        const j = offset + i;
+        if (j >= 0 && j < pcm.length) pcm[j] = data[i]!;
       }
     } finally {
       audioSample.close();
     }
+  }
+  return { pcm, rate };
+}
+
+/**
+ * `centre` 前后各半个 `window` 的 RMS。
+ *
+ * 用 RMS 而不是峰值：AAC 是有损的，单个样本的幅度会抖，而 40ms 上的能量很稳。
+ * 窗口边界按样本精确切，不受解码包边界影响——包络正在变化时，窗口宽度浮动
+ * 就成了系统误差。
+ */
+function rmsAround(
+  audio: { readonly pcm: Float32Array; readonly rate: number },
+  centre: number,
+  window: number,
+): number {
+  const half = (window * audio.rate) / 2;
+  const from = Math.max(0, Math.round(centre * audio.rate - half));
+  const to = Math.min(audio.pcm.length, Math.round(centre * audio.rate + half));
+  let sum = 0;
+  let count = 0;
+  for (let i = from; i < to; i++) {
+    sum += audio.pcm[i]! * audio.pcm[i]!;
+    count++;
   }
   return count === 0 ? 0 : Math.sqrt(sum / count);
 }
@@ -489,23 +564,12 @@ const ONSET_THRESHOLD = 0.05;
  * 所以"第一个超过阈值的样本"就是那一声的起点。改配音的占空比或幅度要回来看这里，
  * 和 `sampleHueAt` 依赖背景色相是同一类耦合。
  */
-async function firstOnsetAfter(
-  track: InputAudioTrack,
+function firstOnsetAfter(
+  audio: { readonly pcm: Float32Array; readonly rate: number },
   from: number,
-): Promise<number | null> {
-  const sink = new AudioSampleSink(track);
-  for await (const audioSample of sink.samples(from, from + 2)) {
-    try {
-      const buffer = audioSample.toAudioBuffer();
-      const data = buffer.getChannelData(0);
-      for (let i = 0; i < data.length; i++) {
-        if (Math.abs(data[i]!) > ONSET_THRESHOLD) {
-          return audioSample.timestamp + i / buffer.sampleRate;
-        }
-      }
-    } finally {
-      audioSample.close();
-    }
+): number | null {
+  for (let i = Math.max(0, Math.round(from * audio.rate)); i < audio.pcm.length; i++) {
+    if (Math.abs(audio.pcm[i]!) > ONSET_THRESHOLD) return i / audio.rate;
   }
   return null;
 }

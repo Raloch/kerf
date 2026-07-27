@@ -20,6 +20,7 @@ import type { VerifyResult } from "../dev/verify-m0";
 import type { PreviewVerifyResult } from "../dev/verify-preview";
 import type { TimelineVerifyResult } from "../dev/verify-timeline";
 import type { PixiVerifyResult } from "../dev/verify-pixi";
+import type { DeviceReport } from "../dev/verify-device";
 
 type Status =
   | { kind: "idle" }
@@ -39,9 +40,17 @@ export function M0Panel({ onBack }: { readonly onBack: () => void }) {
   const [pv, setPv] = useState<PreviewVerifyResult | null>(null);
   const [tv, setTv] = useState<TimelineVerifyResult | null>(null);
   const [px, setPx] = useState<PixiVerifyResult | null>(null);
+  const [dev, setDev] = useState<DeviceReport | null>(null);
+  const [devStep, setDevStep] = useState<string>("");
+  const [devCrash, setDevCrash] = useState<string | null>(null);
   const handleRef = useRef<ExportHandle | null>(null);
   const firstFrameRef = useRef<HTMLCanvasElement>(null);
   const lastFrameRef = useRef<HTMLCanvasElement>(null);
+
+  // 上一次运行有没有被系统杀掉。**必须在开跑之前读**，新的一轮会把证据覆盖掉
+  useEffect(() => {
+    void import("../dev/verify-device").then((m) => setDevCrash(m.previousCrash()));
+  }, []);
 
   useEffect(() => {
     if (!probe) return;
@@ -152,6 +161,39 @@ export function M0Panel({ onBack }: { readonly onBack: () => void }) {
       setStatus({ kind: "error", text: error instanceof Error ? error.message : String(error) });
     }
   }, []);
+
+  const runDevice = useCallback(async () => {
+    setDev(null);
+    setDevStep("");
+    setStatus({ kind: "busy", label: "真机自检：逐级往上试，最后几档可能很慢…" });
+    try {
+      const { runDeviceReport } = await import("../dev/verify-device");
+      const report = await runDeviceReport(setDevStep);
+      setDev(report);
+      setDevCrash(report.diedAt);
+      setStatus({
+        kind: "done",
+        text: `真机自检跑完：后端 ${report.backend} · 最高跑通 ${report.maxResolution ?? "无"}`,
+      });
+    } catch (error) {
+      setStatus({ kind: "error", text: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setDevStep("");
+    }
+  }, []);
+
+  const copyDevice = useCallback(async () => {
+    if (!dev) return;
+    const { formatDeviceReport } = await import("../dev/verify-device");
+    const text = formatDeviceReport(dev);
+    try {
+      await navigator.clipboard.writeText(text);
+      setStatus({ kind: "done", text: "报告已复制到剪贴板" });
+    } catch {
+      // iOS 上剪贴板可能要用户手势，退回选中让人自己复制
+      setStatus({ kind: "done", text: "复制失败，请长按下面的文本自行复制" });
+    }
+  }, [dev]);
 
   const doExport = useCallback(async () => {
     if (!probe) return;
@@ -507,6 +549,81 @@ export function M0Panel({ onBack }: { readonly onBack: () => void }) {
             <p className="hint">
               导出 {tv.encodedFrames} 帧 · {(tv.bytesWritten / 1e6).toFixed(2)} MB ·
               自检总耗时 {(tv.elapsedMs / 1000).toFixed(1)} 秒
+            </p>
+          </>
+        )}
+      </section>
+
+      <section>
+        <h2>真机自检（这台设备能跑到哪儿）</h2>
+        <p className="hint" style={{ margin: "0 0 12px" }}>
+          和上面四个不同：那四个问"代码对不对"，答案在所有机器上都该一样；这一个问
+          <b>这台设备的上限在哪</b>，答案本来就因机而异。它<b>不进回归门禁</b>，
+          只在需要一台新设备的数字时手跑——存在的理由是 PLAN.md §8 那两条一直没验的风险
+          （iOS Safari 全未验、移动端导出分辨率要单独限制，而后者至今没有任何实测依据）。
+          最后一步是<b>故意往死里逼</b>的：逐级升高输出分辨率直到扛不住。移动端"扛不住"
+          往往不是抛异常而是整个标签页被系统杀掉，所以每一档动手之前先把"正在试 X"
+          写进 localStorage——<b>崩溃也是一种测量结果，得留下痕迹</b>。真被杀了就重新
+          打开这个页面，下面会显示死在哪一档。
+        </p>
+        {devCrash && (
+          <p className="hint bad" style={{ margin: "0 0 12px" }}>
+            ⚠️ 上一次运行死在 <b>{devCrash}</b>——标签页被系统杀掉，没留下结论。
+            这台设备的导出上限就在这一档之下。
+          </p>
+        )}
+        <button
+          type="button"
+          onClick={() => void runDevice()}
+          disabled={exporting || status.kind === "busy"}
+        >
+          运行真机自检
+        </button>
+        {devStep && <p className="hint mono" style={{ margin: "8px 0 0" }}>{devStep}</p>}
+
+        {dev && (
+          <>
+            <table className="checks">
+              <tbody>
+                <tr className={dev.env.secureContext ? "ok" : "bad"}>
+                  <td>{dev.env.secureContext ? "✓" : "✕"}</td>
+                  <td>安全上下文</td>
+                  <td className="mono">{dev.env.secureContext ? "是" : "否——WebCodecs / OPFS 都没有，用 pnpm dev:device 走 HTTPS"}</td>
+                </tr>
+                <tr className={dev.supportsEffects ? "ok" : "bad"}>
+                  <td>{dev.supportsEffects ? "✓" : "✕"}</td>
+                  <td>合成后端</td>
+                  <td className="mono">{dev.backend} — {dev.backendNote}</td>
+                </tr>
+                <tr>
+                  <td>·</td>
+                  <td>WebGL 上下文预算</td>
+                  <td className="mono">{dev.contextBudget ?? "未触顶"} — {dev.contextNote}</td>
+                </tr>
+                {dev.ladder.map((r) => (
+                  <tr key={r.label} className={r.ok ? "ok" : "bad"}>
+                    <td>{r.ok ? "✓" : "✕"}</td>
+                    <td>导出 {r.label}（{r.width}×{r.height}）</td>
+                    <td className="mono">
+                      {r.elapsedMs}ms · {r.decoded} · 管道报 {(r.bytes / 1024).toFixed(0)}KB /
+                      重读 {r.rereadBytes === null ? "?" : (r.rereadBytes / 1024).toFixed(0)}KB · {r.note}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <p className="hint" style={{ margin: "8px 0 0" }}>
+              最高跑通 <b>{dev.maxResolution ?? "一档都没过"}</b>。源片固定 640×360、只放大输出，
+              所以这里扫的是<b>输出侧</b>的上限；"能不能解 4K 素材"是另一根轴，没测。
+              判据是<b>把成片解回来量宽高和帧数</b>，不是看字节数——iOS 上字节数五档全报
+              16MB（正好是 mediabunny 的攒批阈值），拿它当代理会让"4K 导出成功"这个结论
+              毫无证据。输出侧的内存没有 API 可问，<b>唯一的读数就是标签页活没活下来</b>。
+            </p>
+            <button type="button" onClick={() => void copyDevice()} style={{ marginTop: 8 }}>
+              复制报告
+            </button>
+            <p className="mono dim" style={{ whiteSpace: "pre-wrap", fontSize: 11, marginTop: 8 }}>
+              {dev.env.userAgent}
             </p>
           </>
         )}
