@@ -46,7 +46,8 @@
 import { ALL_FORMATS, BlobSource, Input } from "mediabunny";
 import { createCompositor } from "../compose/backend";
 import type { Compositor } from "../compose/compositor";
-import { startExport } from "../export/client";
+import { startExport, type ExportHandle } from "../export/client";
+import type { ExportDone } from "../export/protocol";
 import { probeFile } from "../media/probe";
 import { readExportFile, removeExportFile } from "../export/write-target";
 import { singleClipTimeline, type MediaSource, type Timeline } from "../edl/types";
@@ -608,19 +609,39 @@ export async function runLengthReport(
     try {
       await removeExportFile(name);
       const timeline = buildLongTimeline(source, clips);
-      const done = await startExport(
-        {
-          timeline,
-          range: { inFrame: 0, outFrame: frames },
-          container: "mp4",
-          videoBitrate: Math.round(LENGTH_WIDTH * LENGTH_HEIGHT * 0.1),
-          audioBitrate: 128e3,
-          includeAudio: true,
-          target: { kind: "opfs", name },
-          autoDownload: false,
-        },
-        () => undefined,
-      ).done;
+      // **进度不能丢。** 第一版这里传的是 `() => undefined`，于是 Safari 死等时
+      // 连"停在第几帧"都拿不到——只知道"不动了"。现在每条进度都记下来，死等的
+      // 那一刻它就是唯一的证据
+      let lastAt = performance.now();
+      let lastText = "还没有任何进度";
+      // 判"卡住了"看的是**推进**，不是"有没有收到消息"：心跳每秒一条，拿消息
+      // 到达当判据的话永远不会超时。同时心跳带来的 `marker` 要留下——它才是
+      // "此刻停在哪一步"，而循环里那条进度的 marker 恒为 `audio`
+      let seen = "";
+      const done = await watchForStall(
+        startExport(
+          {
+            timeline,
+            range: { inFrame: 0, outFrame: frames },
+            container: "mp4",
+            videoBitrate: Math.round(LENGTH_WIDTH * LENGTH_HEIGHT * 0.1),
+            audioBitrate: 128e3,
+            includeAudio: true,
+            target: { kind: "opfs", name },
+            autoDownload: false,
+          },
+          (p) => {
+            const now = `${p.stage}/${p.marker ?? "?"}/${p.encodedFrames}`;
+            lastText =
+              `${p.stage}/${p.marker ?? "?"} 第 ${p.encodedFrames}/${p.totalFrames} 帧` +
+              (p.heartbeat ? "（心跳）" : "");
+            if (now === seen) return;
+            seen = now;
+            lastAt = performance.now();
+          },
+        ),
+        () => ({ at: lastAt, text: lastText }),
+      );
       if (!done) throw new Error("导出被取消");
       const verified = await verifyLongOutput(name, frames);
       const elapsedMs = Math.round(performance.now() - started);
@@ -638,9 +659,17 @@ export async function runLengthReport(
         decoded: verified.detail,
         note:
           `${done.encodedFrames} 帧 · ${done.backend ?? "?"}` +
+          // 管道报的字节数和上面重读到的**两个都印**：iOS 上前者曾恒为 16MiB
+          // （mediabunny 的攒批阈值），只印一个时"管道报错了"和"文件真的不对"
+          // 分不开。同 M0 那条"两个操作数都要印在断言旁边"
+          ` · 管道报 ${(done.bytesWritten / 1e6).toFixed(1)}MB` +
           ` · 泄漏 ${done.residency ? `${done.residency.leakedSamples}/${done.residency.leakedCursors}/${done.residency.leakedInputs}` : "?"}`,
       };
-      await removeExportFile(name);
+      // **验不过就把成片留着。** 第一版无论成败都删，于是"解回来没有视频轨"这条
+      // 报错一出现，唯一能查下去的东西当场就没了——和"跑之前先清 `.reports/`"是
+      // 同一类错误：为了看着干净，把失败那次的证据毁掉。阶梯在失败后就停，所以
+      // 最多留一个文件，`?autorun=clear` 清。
+      if (verified.ok) await removeExportFile(name);
     } catch (error) {
       result = {
         label: step.label,
@@ -661,6 +690,9 @@ export async function runLengthReport(
     rungs.push(result);
     journal.attempting = null;
     writeJournal(journal);
+    // 一档没过就停。**死等那条路上这不是"省时间"而是必需的**：被判死等的那次导出
+    // 只是被放弃，常驻 Worker 很可能还占着，接着往下跑只会收获一串
+    // "已有导出任务在进行中"，把真正的诊断埋在噪声里（见 `watchForStall`）
     if (!result.ok) break;
   }
 
@@ -677,6 +709,68 @@ export async function runLengthReport(
       withMix.length >= 2 && first && last ? last.mixPeakBytes! / first.mixPeakBytes! : null,
     diedAt,
   };
+}
+
+/**
+ * 多久没有任何进度就判成死等（毫秒）。
+ *
+ * 要大到不会把"这台机器慢"误判成死等：Safari 上 10 分钟档实测 178 秒、3.37× 实时，
+ * 而收尾那几步（写 mp4 索引、把几百 MB 落进 OPFS）现在都各自上报一次，所以单步
+ * 静默期远小于这个数。也要小到别真等十几分钟——Safari 那次实测干等了 18.5 分钟
+ * 才被我手动杀掉，而那 18 分钟里一个字节的新信息都没有。
+ *
+ * 比 `mixdown.ts` 的渲染看门狗（60 秒）大一档是**刻意的**：混音卡在
+ * `startRendering()` 上时该由那道更具体的看门狗先开火、报出段号；这里兜的是
+ * 其余所有位置。
+ */
+const STALL_TIMEOUT_MS = 90_000;
+
+/**
+ * 把"死等"变成一条读数。
+ *
+ * 长片这根轴上最坏的失败形态不是崩溃而是**死等**：0% CPU、几百 MB 常驻、不抛错、
+ * 不崩溃、进度条永远不动（Safari 导 30 分钟实测，PLAN.md §8 风险 1）。崩溃至少
+ * 还能靠 localStorage 那条前置记录留痕，死等连那都取不出来——页面还活着，只是
+ * 永远不返回，于是 autorun 那条 POST 通道也永远不触发。
+ *
+ * 做法是盯**进度停了多久**，而不是给整次导出设一个总时限：后者会把"30 分钟的片子
+ * 本来就要跑十分钟"误判成故障，而前者能把"慢"和"停"分开。超时就把最后进到的那
+ * 一步连同帧号抛出来，那条错误会被记进这一档的 `note` 里，随报告一路 POST 回本地。
+ *
+ * **前提是主线程的事件循环还活着**——实测正是如此（0% CPU 说明卡在一个永不 resolve
+ * 的 await 上，不是同步死循环）。真要是同步卡死，这个定时器同样不会跑，那时只能
+ * 回到 localStorage 那条路。
+ *
+ * 超时之后那次导出**只是被放弃，不保证真的停下**（`cancel()` 发过去也可能没人收）。
+ * 常驻 Worker 的 `running` 标志因此可能一直是 true，下一档会直接被"已有导出任务在
+ * 进行中"顶掉——所以调用方在这一档失败后必须**中断整条阶梯**，不能接着往下跑。
+ */
+function watchForStall(
+  handle: ExportHandle,
+  probe: () => { readonly at: number; readonly text: string },
+): Promise<ExportDone | null> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (run: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(timer);
+      run();
+    };
+    const timer = setInterval(() => {
+      const { at, text } = probe();
+      const idleMs = performance.now() - at;
+      if (idleMs < STALL_TIMEOUT_MS) return;
+      finish(() => {
+        handle.cancel();
+        reject(new Error(`死等：${Math.round(idleMs / 1000)} 秒没有任何进度，最后停在 ${text}`));
+      });
+    }, 1000);
+    handle.done.then(
+      (value) => finish(() => resolve(value)),
+      (error: unknown) => finish(() => reject(error)),
+    );
+  });
 }
 
 /** 把同一个源片接成 `clips` 个首尾相连的片段，画面轨和音频轨各一条。 */
@@ -716,10 +810,24 @@ async function verifyLongOutput(
 ): Promise<{ ok: boolean; detail: string }> {
   try {
     const file = await readExportFile(name);
+    // **重读到的字节数要印出来，成功失败都印。** 没有它，"没有视频轨"分不开两种
+    // 完全不同的病：文件被截断（写盘没落全），还是文件完整但索引解不动。Safari 上
+    // 导 30 分钟实测撞到过这条报错，当时报告里没有字节数，等于只知道"坏了"
+    const size = `${(file.size / 1e6).toFixed(1)}MB`;
     const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(file) });
     try {
       const track = await input.getPrimaryVideoTrack();
-      if (!track) return { ok: false, detail: "解回来没有视频轨" };
+      if (!track) {
+        // 音轨在不在能再切一刀：两条都没有 = 整个容器没解析出来；只缺视频轨 =
+        // 视频那条轨自己写坏了
+        let audioNote = "音轨也问不到";
+        try {
+          audioNote = (await input.getPrimaryAudioTrack()) ? "但有音轨" : "音轨也没有";
+        } catch {
+          /* 容器整个解不动时这里也会抛，那本身就是诊断 */
+        }
+        return { ok: false, detail: `解回来没有视频轨（${size}，${audioNote}）` };
+      }
       const stats = await track.computePacketStats();
       const audio = await input.getPrimaryAudioTrack();
       const audioSeconds = audio ? await audio.computeDuration() : null;
@@ -730,7 +838,7 @@ async function verifyLongOutput(
       return {
         ok: framed && synced,
         detail:
-          `解回 ${stats.packetCount} 帧 / ${videoSeconds.toFixed(1)}s` +
+          `解回 ${stats.packetCount} 帧 / ${videoSeconds.toFixed(1)}s · ${size}` +
           ` · 音轨 ${audioSeconds === null ? "无" : `${audioSeconds.toFixed(1)}s`}` +
           (framed ? "" : ` ← 期望 ${wantFrames} 帧`) +
           (synced ? "" : " ← 音画时长对不上"),

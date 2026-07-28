@@ -16,7 +16,7 @@
 
 const ENDPOINT = "/__report";
 
-type RunnerName = "m0" | "pixi" | "timeline" | "preview" | "device" | "length";
+type RunnerName = "m0" | "pixi" | "timeline" | "preview" | "device" | "length" | "clear";
 
 interface CheckLike {
   readonly name: string;
@@ -51,6 +51,15 @@ const RUNNERS: Record<RunnerName, (params: URLSearchParams) => Promise<unknown>>
       Number.isFinite(max) && max > 0 ? { maxSeconds: max } : undefined,
     );
   },
+  /**
+   * 不是自检，是**清场**：把 OPFS 导出目录里的残留删掉。
+   *
+   * 长片自检被中断（标签页被杀 / 判死等之后放弃那次导出）会留下半写的成品，
+   * 一个几百 MB。攒几次之后下一轮自检会在 `createWritable()` 上直接失败，而
+   * Safari 把它报成"unknown transient reason (e.g. out of memory)"——完全看不出
+   * 是存储满了。踩过一次，于是留一条能从命令行调的口子。
+   */
+  clear: async () => (await import("../export/write-target")).clearExportStorage(),
 };
 
 function isRunnerName(value: string): value is RunnerName {

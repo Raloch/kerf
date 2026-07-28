@@ -86,6 +86,55 @@ export async function removeExportFile(name: string): Promise<void> {
   }
 }
 
+/**
+ * 把导出目录整个清空，返回删掉的文件名和字节数。
+ *
+ * **存在的理由是"被中断的导出会留下大文件"。** 正常失败路径会自己删
+ * （`pipeline.ts` 的 catch），但标签页被系统杀掉、或者自检判死等之后放弃那次导出时，
+ * 半写的成品就留在 OPFS 里了——长片一个就是几百 MB。攒几次之后新的导出会在
+ * `createWritable()` 上直接失败，**而 Safari 报的是
+ * "The operation failed for an unknown transient reason (e.g. out of memory)"**，
+ * 看起来完全不像"存储满了"，实测被它坑过一次。
+ *
+ * 逐个删而不是 `removeEntry(EXPORT_DIR, {recursive:true})`，而且**逐个报大小**：
+ * 残留文件的大小本身就是证据——"那次死等的导出写到了 280MB"和"只写了 2MB"是两个
+ * 完全不同的结论（前者说明卡在收尾，后者说明卡在循环里）。第一版只报了总字节，
+ * 清场的时候顺手就把这条线索毁了，实测吃过一次亏。
+ */
+export async function clearExportStorage(): Promise<{
+  readonly removed: readonly { readonly name: string; readonly bytes: number }[];
+  readonly bytes: number;
+  readonly failed: readonly string[];
+}> {
+  const removed: { name: string; bytes: number }[] = [];
+  const failed: string[] = [];
+  let bytes = 0;
+  const root = await navigator.storage.getDirectory();
+  const dir = await root.getDirectoryHandle(EXPORT_DIR, { create: true });
+  const names: string[] = [];
+  for await (const name of (dir as unknown as { keys(): AsyncIterable<string> }).keys()) {
+    names.push(name);
+  }
+  for (const name of names) {
+    // 先量大小再删：删完就问不到了
+    let size = -1;
+    try {
+      size = (await (await dir.getFileHandle(name)).getFile()).size;
+      bytes += size;
+    } catch {
+      // 量不到就报 -1，别报 0——"空文件"和"问不出来"是两回事
+    }
+    try {
+      await dir.removeEntry(name);
+      removed.push({ name, bytes: size });
+    } catch {
+      // 删不掉多半是还有 writable 攥着它——那本身就是要报出来的诊断
+      failed.push(name);
+    }
+  }
+  return { removed, bytes, failed };
+}
+
 /** 主线程侧：把 OPFS 里的成品读出来触发下载，然后删掉临时文件。 */
 export async function downloadFromOpfs(name: string, mimeType: string): Promise<void> {
   const root = await navigator.storage.getDirectory();

@@ -214,6 +214,19 @@ export class ResidencyTracker {
     return snapshot;
   }
 
+  /**
+   * 读一眼当前值，但**不记进首尾和峰值**。
+   *
+   * 给收尾阶段那几次纯诊断的进度上报用（`pipeline.ts` 的 `step`）：那些上报是为了
+   * 让"卡在哪一步"看得见，不是测量点。混进去会毁掉 `last` 的语义——收尾要关编码器、
+   * 还解码帧、dispose reader，采在那之后读到的是**拆干净以后**的量，于是
+   * `last − first` 这个"峰值还在涨吗"的判据会被永远压成 0，
+   * 同"峰值要采在峰值发生的那一刻"（混音那条 `onSample`）的反面。
+   */
+  peek(): ResidencySnapshot {
+    return residency.snapshot();
+  }
+
   report(): ResidencyReport {
     return {
       peak: this.peak ?? residency.snapshot(),

@@ -105,6 +105,18 @@ export async function runExport(
   // 这一项从"随片长线性增长"变成"有上界"，正是分段要证明的事
   residency.setAudioPcmBytes(0);
 
+  /**
+   * 最后进入的那一步。**只赋常量字符串，不做任何分配**——逐帧循环里一帧要赋四次。
+   *
+   * 存在的理由是死等：Safari 上导 30 分钟会停在 0% CPU、不抛错、不崩溃、进度条
+   * 永远不动，那时"卡住了"是唯一的读数。有了它，读数变成"卡在第 N 帧的哪一步"。
+   * 见 `ExportProgress.marker`。
+   */
+  let mark = "start";
+  const at = (step: string): void => {
+    mark = step;
+  };
+
   const report = (stage: ExportProgress["stage"], encodedFrames: number) => {
     hooks.onProgress({
       stage,
@@ -112,12 +124,33 @@ export async function runExport(
       totalFrames,
       elapsedMs: performance.now() - startedAt,
       residency: tracker.sample(encodedFrames),
+      marker: mark,
+    });
+  };
+
+  /**
+   * 标记一步并上报，但**不记测量点**（`peek` 而不是 `sample`）。
+   *
+   * 这些上报是为了让"卡在哪一步"看得见，不是采样点。收尾那几步发生在关编码器、
+   * 还解码帧、dispose reader **之后**，记进去会把 `last` 变成"拆干净以后的量"，
+   * 于是导出面板上 `last − first` 那个"峰值还在涨吗"的判据永远读成 0。
+   */
+  const step = (name: string, stage: ExportProgress["stage"], frames: number): void => {
+    at(name);
+    hooks.onProgress({
+      stage,
+      encodedFrames: frames,
+      totalFrames,
+      elapsedMs: performance.now() - startedAt,
+      residency: tracker.peek(),
+      marker: mark,
     });
   };
 
   report("prepare", 0);
 
   // 能力探测放在建 Output 之前：编码器不可用要在写出任何字节之前就失败
+  step("probe-capabilities", "prepare", 0);
   const caps = await probeCapabilities(timeline.width, timeline.height);
   const decision = decideFormat(caps, request.container, audio !== null);
   if (decision.mp4BlockedByAudio) {
@@ -129,18 +162,42 @@ export async function runExport(
   const drawOrder = videoTracksInDrawOrder(timeline);
   if (drawOrder.length === 0) throw new Error("时间轴上没有可见的视频轨");
 
+  // 标记串在这里预先拼好：逐帧循环里只允许赋常量，不允许每帧拼一次字符串
   const readers = drawOrder.map((track) => ({
     reader: new VideoTrackReader(timeline, track, range),
+    mark: `decode:${track.id}`,
   }));
+  step("acquire-compositor", "prepare", 0);
   const compositor = await acquireCompositor(timeline.width, timeline.height);
 
+  step("open-target", "prepare", 0);
   const handle = await resolveHandle(request.target);
   const writable = await handle.createWritable();
 
   const output = new Output({
     format: request.container === "mp4" ? new Mp4OutputFormat() : new WebMOutputFormat(),
-    // chunked：攒到 16MiB 再落盘，减少写次数。峰值内存仍与片长无关
-    target: new StreamTarget(writable, { chunked: true }),
+    /**
+     * **`chunked` 必须是 false。** 它不是性能开关，开着会在 Safari 上写出坏文件。
+     *
+     * 攒批模式（攒到 16MiB 再落盘）在 Safari 上实测：成片大小恒为 **16MiB 的整数倍**
+     * ——0.5MB 的片子报 16.8MB，32.1MB 的片子报 33.6MB。小片子还解得开（moov 落在
+     * 已写区域里，尾部那堆填充被解析器忽略），而 **30 分钟那一档解回来连音轨都问
+     * 不到**：容器整个坏了，而导出侧一切正常——54000 帧全编完、泄漏 0、不抛错。
+     * 这是最坏的一类失败：用户拿到一个放不出来的文件，而软件说成功了。
+     *
+     * 注意**不是"最后一块没落盘"**那么简单：坏掉那个文件 33.6MB 比真实内容 32.1MB
+     * 还大，所以是补到 chunk 边界之后某块的内容或偏移写错了。具体机制在 mediabunny
+     * 与 Safari 的 `FileSystemWritableFileStream` 之间，没有再往下挖——外部事实已经
+     * 够硬，而且换掉它没有代价。
+     *
+     * 关掉之后：Safari 四档全过（30 分钟 4.4× 实时），**Chrome 反而更快**
+     * （12.4× → 13.5×，写次数多了但少了一层缓冲和拷贝），两边字节数都变成真实大小。
+     * 所以这里不按浏览器分岔——同一条路，两边都更好。
+     *
+     * 仍然满足硬规则 9：每次 write 直接进 `FileSystemWritableFileStream`，
+     * 不攒 Blob。攒批省的只是写次数，而实测它连这个都没省到。
+     */
+    target: new StreamTarget(writable, { chunked: false }),
   });
 
   const videoSource = new CanvasSource(compositor.canvas, {
@@ -163,6 +220,7 @@ export async function runExport(
   // 补偿不了——见 audio/encoder-delay.ts 的文件头。这里测出来，喂 PCM 时从头部丢掉
   // 同样多，让成片里的音频落回正确的绝对位置
   const probeCodec = decision.audioCodec ? audioCodecString(decision.audioCodec) : null;
+  step("measure-encoder-delay", "prepare", 0);
   const encoderDelay: EncoderDelay =
     audio && audioSource && probeCodec
       ? await measureEncoderDelay({
@@ -175,13 +233,37 @@ export async function runExport(
 
   let encodedFrames = 0;
 
+  /**
+   * 心跳：每秒报一次"此刻进到哪一步"，与逐帧循环无关。
+   *
+   * 逐帧循环里的进度上报固定在 `await pumpAudio()` 之后，那一刻 `mark` 恒为
+   * `audio`，所以光靠它定位不到卡在哪（实测踩过）。心跳由事件循环驱动，卡在
+   * 任何一个 await 上时它照样跑，报出来的就是真正停住的那一步；连心跳都停了
+   * 则说明是同步卡死——那也是一条结论。
+   */
+  const heartbeat = setInterval(() => {
+    hooks.onProgress({
+      stage: "video",
+      encodedFrames,
+      totalFrames,
+      elapsedMs: performance.now() - startedAt,
+      marker: mark,
+      heartbeat: true,
+    });
+  }, 1000);
+
   try {
+    step("output-start", "prepare", 0);
     await output.start();
     checkCancel();
 
     const frameDurationSeconds = frameDurationMicros(timeline.fps) / MICROS_PER_SECOND;
-    const pumpAudio = makeAudioPump(audio, audioSource, encoderDelay.samples, (index) =>
-      hooks.pullAudio(index),
+    const pumpAudio = makeAudioPump(
+      audio,
+      audioSource,
+      encoderDelay.samples,
+      (index) => hooks.pullAudio(index),
+      at,
     );
 
     let lastReportedAt = 0;
@@ -195,8 +277,9 @@ export async function runExport(
       // sample 归 reader 所有，这里不能 close（硬规则 4）。
       // **按 clipId 索引而不是按轨**：转场窗口里一条轨会同时吐出两个片段的帧
       const samples = new Map<string, VideoSample>();
-      for (const { reader } of readers) {
-        for (const [clipId, sample] of await reader.samplesAt(outputFrame)) {
+      for (const entry of readers) {
+        at(entry.mark);
+        for (const [clipId, sample] of await entry.reader.samplesAt(outputFrame)) {
           samples.set(clipId, sample);
         }
       }
@@ -257,10 +340,12 @@ export async function runExport(
       // 渲染上下文可能在导出中途被浏览器收走（切标签页、休眠、驱动重置），
       // 那时 composeFrame 会抛错而不是静默出黑帧——救一次，救不回来就整次失败。
       // **绝不能吞掉继续跑**：那会写出几百帧黑画面而用户以为导出成功了
+      at("compose");
       try {
         compositor.composeFrame(layers);
       } catch (error) {
         if (!compositor.isContextLost()) throw error;
+        at("recover-context");
         if (!(await compositor.recover())) {
           throw new Error(
             `第 ${outputFrame} 帧时渲染上下文丢失且无法恢复，导出中止（成品不完整，已撤销）`,
@@ -270,6 +355,7 @@ export async function runExport(
       }
 
       // await = 背压：编码队列满时这里会等，不会无限堆积帧
+      at("encode");
       await videoSource.add(
         frameToSeconds(i, timeline.fps),
         frameDurationSeconds,
@@ -278,6 +364,7 @@ export async function runExport(
       encodedFrames++;
 
       // 音频跟着视频往前喂，保持封装器里两条轨的时间戳接近
+      at("audio");
       await pumpAudio(frameToSeconds(i, timeline.fps));
 
       const now = performance.now();
@@ -289,19 +376,29 @@ export async function runExport(
 
     checkCancel();
     // 视频比音频短时把剩下的音频补完（例如末尾有一段只有音轨的片段）
+    step("audio-flush", "video", encodedFrames);
     await pumpAudio(Infinity);
 
-    report("finalize", encodedFrames);
-
+    // **收尾这一串每步都上报。** 它原本是一段完全静默的路：`finalize()` 要把 mp4
+    // 的样本索引写出来、`getFile()` 要等 OPFS 把几百 MB 落完盘，两者都随片长增长。
+    // 30 分钟的片子在这里停十几秒是正常的，停住不动也是这个形态——不逐步上报就
+    // 分不开，而这正是 Safari 死等最可疑的落点（PLAN.md §8 风险 1）
+    step("close-encoders", "finalize", encodedFrames);
     videoSource.close();
     audioSource?.close();
+
+    step("mime", "finalize", encodedFrames);
     const mimeType = await output.getMimeType();
+
+    step("mux-finalize", "finalize", encodedFrames);
     await output.finalize();
 
+    step("stat-output", "finalize", encodedFrames);
     const written = await handle.getFile();
 
     // 收尾前先把 reader 关掉，这样下面的"归零了没有"问的是**这一次导出**有没有
     // 泄漏，而不是"finally 还没跑"。finally 里再关一次是幂等的
+    step("dispose-readers", "finalize", encodedFrames);
     await Promise.all(readers.map(({ reader }) => reader.dispose()));
     const after = residency.snapshot();
 
@@ -338,6 +435,7 @@ export async function runExport(
     }
     throw error;
   } finally {
+    clearInterval(heartbeat);
     // **刻意不 dispose 合成器**——它是常驻的，跨导出复用，见 `acquireCompositor`
     await Promise.all(readers.map(({ reader }) => reader.dispose()));
   }
@@ -445,6 +543,7 @@ function makeAudioPump(
   audioSource: AudioSampleSource | null,
   delayFrames: number,
   pull: (index: number) => Promise<MixChunk | null>,
+  mark: (step: string) => void,
 ): (untilSeconds: number) => Promise<void> {
   if (!audio || !audioSource) return async () => undefined;
 
@@ -515,6 +614,10 @@ function makeAudioPump(
         return false;
       }
       inflight.delete(currentIndex);
+      // **这一步等的是主线程**（混音在那边，硬规则 6）。标出来是为了把"Worker 卡住"
+      // 和"Worker 在等主线程混完"分开——两者在进度条上完全一样，而混音那侧只有
+      // `startRendering()` 有看门狗，解码那一段没有
+      mark(`audio-pull:${currentIndex}`);
       currentIndex++;
       const chunk = await pending;
       if (!chunk) {
@@ -574,6 +677,7 @@ function makeAudioPump(
       timestamp: written / sampleRate,
       data,
     });
+    mark("audio-encode");
     try {
       await audioSource.add(sample);
     } finally {
