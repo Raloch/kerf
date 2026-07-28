@@ -27,7 +27,12 @@ import {
 import type { EncoderDelay } from "../audio/encoder-delay";
 import type { ExportDone, ExportProgress, ExportResidency } from "../export/protocol";
 import { formatBytes } from "../export/residency";
-import { canPickSaveFile, pickWriteTarget } from "../export/write-target";
+import {
+  canPickSaveFile,
+  clearExportStorage,
+  measureExportStorage,
+  pickWriteTarget,
+} from "../export/write-target";
 import type { ExportCapabilities } from "../media/capability";
 import type { ContainerChoice } from "../media/capability";
 import { clipsUsingEffects, type RenderRange, type Timeline } from "../edl/types";
@@ -57,6 +62,42 @@ export function ExportDialog({ timeline, caps, selectedRange, onClose }: ExportD
   const [baseName, setBaseName] = useState(() => defaultName(timeline));
   const [phase, setPhase] = useState<Phase>({ kind: "settings" });
   const handleRef = useRef<ExportHandle | null>(null);
+  /**
+   * OPFS 里上次没清掉的残留。
+   *
+   * 正常是 0——成功导出下载完就删、失败路径由管道 catch 收拾。非 0 说明有一次导出
+   * **没走完任何一条收尾路径**（标签页被系统杀掉，或者浏览器把它掐了）。不给出口的
+   * 话，用户攒几次之后只会收到一条 `unknown transient reason (e.g. out of memory)`
+   * ——那句话完全看不出是存储满了（实测被它坑过一次）。
+   */
+  const [leftover, setLeftover] = useState<{ count: number; bytes: number } | null>(null);
+  const [tidying, setTidying] = useState(false);
+
+  // 只在设置态量：跑起来之后目录里那个文件**正是这次导出**在写的，
+  // 报出来会变成"你有残留要清"——而清掉它就是毁掉正在写的成品
+  useEffect(() => {
+    if (phase.kind !== "settings") return;
+    let alive = true;
+    void measureExportStorage().then((r) => {
+      if (alive) setLeftover(r.count > 0 ? r : null);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [phase.kind]);
+
+  const tidy = useCallback(async () => {
+    setTidying(true);
+    try {
+      const result = await clearExportStorage();
+      // 删不掉的（还有 writable 攥着）要留在界面上，别报"已清理"了事
+      setLeftover(
+        result.failed.length > 0 ? { count: result.failed.length, bytes: 0 } : null,
+      );
+    } finally {
+      setTidying(false);
+    }
+  }, []);
 
   const hasAudio = timeline.tracks.some(
     (t) => t.kind === "audio" && !t.muted && t.clips.length > 0,
@@ -357,6 +398,34 @@ export function ExportDialog({ timeline, caps, selectedRange, onClose }: ExportD
                     {gpuCaps?.reason ? `（起不来的原因：${gpuCaps.reason}）` : ""}
                   </span>
                 </div>
+              </div>
+            )}
+
+            {/* 残留清理：**不阻断导出**，所以不用 `.dlg-warn`。它是一条家务提示——
+                有东西可清才出现，清完就消失 */}
+            {leftover && (
+              <div className="dlg-tidy">
+                <span className="wi">
+                  <IconWarn />
+                </span>
+                <div>
+                  <b>
+                    有 {leftover.count} 个没清掉的导出临时文件
+                    {leftover.bytes > 0 ? `（${formatBytes(leftover.bytes)}）` : ""}
+                  </b>
+                  <span>
+                    上次导出被中断时留下的。占着浏览器存储，攒多了会让新的导出直接失败，
+                    而那条报错读起来跟存储没关系。
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  className="btn-ghost"
+                  disabled={tidying}
+                  onClick={() => void tidy()}
+                >
+                  {tidying ? "清理中…" : "清理"}
+                </button>
               </div>
             )}
 

@@ -86,6 +86,52 @@ export async function removeExportFile(name: string): Promise<void> {
   }
 }
 
+/** 列出导出目录里的条目名。目录不存在时当空的。 */
+async function listExportEntries(
+  dir: FileSystemDirectoryHandle,
+): Promise<readonly string[]> {
+  const names: string[] = [];
+  for await (const name of (dir as unknown as { keys(): AsyncIterable<string> }).keys()) {
+    names.push(name);
+  }
+  return names;
+}
+
+/**
+ * 量一下导出目录里还剩多少东西，**不删**。
+ *
+ * 正常情况下是 0：成功导出的临时文件在 `downloadFromOpfs` 之后就删了，失败路径由
+ * `pipeline.ts` 的 catch 收拾。非 0 就意味着有一次导出**没有走完任何一条收尾路径**
+ * ——标签页被系统杀掉、或者浏览器把它掐了。长片一个就是几百 MB，攒几次之后新的
+ * 导出会在 `createWritable()` 上失败，而 Safari 报的是
+ * "unknown transient reason (e.g. out of memory)"，**完全看不出是存储满了**。
+ *
+ * 所以界面上要能看见这个数并且能清掉，否则用户只会收到一条看不懂的报错。
+ */
+export async function measureExportStorage(): Promise<{
+  readonly count: number;
+  readonly bytes: number;
+}> {
+  try {
+    const root = await navigator.storage.getDirectory();
+    const dir = await root.getDirectoryHandle(EXPORT_DIR, { create: true });
+    let bytes = 0;
+    let count = 0;
+    for (const name of await listExportEntries(dir)) {
+      count++;
+      try {
+        bytes += (await (await dir.getFileHandle(name)).getFile()).size;
+      } catch {
+        // 量不到就只计个数——"有东西但问不出多大"仍然值得报出来
+      }
+    }
+    return { count, bytes };
+  } catch {
+    // 没有 OPFS（或者被隐私设置挡了）时当作没有残留，不要让界面因此报错
+    return { count: 0, bytes: 0 };
+  }
+}
+
 /**
  * 把导出目录整个清空，返回删掉的文件名和字节数。
  *
@@ -111,11 +157,7 @@ export async function clearExportStorage(): Promise<{
   let bytes = 0;
   const root = await navigator.storage.getDirectory();
   const dir = await root.getDirectoryHandle(EXPORT_DIR, { create: true });
-  const names: string[] = [];
-  for await (const name of (dir as unknown as { keys(): AsyncIterable<string> }).keys()) {
-    names.push(name);
-  }
-  for (const name of names) {
+  for (const name of await listExportEntries(dir)) {
     // 先量大小再删：删完就问不到了
     let size = -1;
     try {
