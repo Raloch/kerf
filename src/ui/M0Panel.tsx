@@ -13,6 +13,7 @@ import { singleClipTimeline } from "../edl/types";
 import { startExport, type ExportHandle } from "../export/client";
 import { pickWriteTarget } from "../export/write-target";
 import type { ExportProgress } from "../export/protocol";
+import { formatBytes } from "../export/residency";
 import { framesToTimecode, formatDuration, frameToSeconds } from "../time/timebase";
 import { formatFps, toNumber } from "../time/rational";
 // dev 工具走动态 import：只在点击时加载，不进主包
@@ -20,7 +21,7 @@ import type { VerifyResult } from "../dev/verify-m0";
 import type { PreviewVerifyResult } from "../dev/verify-preview";
 import type { TimelineVerifyResult } from "../dev/verify-timeline";
 import type { PixiVerifyResult } from "../dev/verify-pixi";
-import type { DeviceReport } from "../dev/verify-device";
+import type { DeviceReport, LengthReport } from "../dev/verify-device";
 
 type Status =
   | { kind: "idle" }
@@ -41,6 +42,7 @@ export function M0Panel({ onBack }: { readonly onBack: () => void }) {
   const [tv, setTv] = useState<TimelineVerifyResult | null>(null);
   const [px, setPx] = useState<PixiVerifyResult | null>(null);
   const [dev, setDev] = useState<DeviceReport | null>(null);
+  const [len, setLen] = useState<LengthReport | null>(null);
   const [devStep, setDevStep] = useState<string>("");
   const [devCrash, setDevCrash] = useState<string | null>(null);
   const handleRef = useRef<ExportHandle | null>(null);
@@ -181,6 +183,37 @@ export function M0Panel({ onBack }: { readonly onBack: () => void }) {
       setDevStep("");
     }
   }, []);
+
+  const runLength = useCallback(async () => {
+    setLen(null);
+    setDevStep("");
+    setStatus({ kind: "busy", label: "长片自检：最后一档 30 分钟，整轮可能十几分钟…" });
+    try {
+      const { runLengthReport } = await import("../dev/verify-device");
+      const report = await runLengthReport(setDevStep);
+      setLen(report);
+      setDevCrash(report.diedAt);
+      setStatus({
+        kind: "done",
+        text: `长片自检跑完：最长跑通 ${report.maxLength ?? "无"} · 混音峰值倍率 ${report.mixPeakRatio?.toFixed(2) ?? "?"}`,
+      });
+    } catch (error) {
+      setStatus({ kind: "error", text: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setDevStep("");
+    }
+  }, []);
+
+  const copyLength = useCallback(async () => {
+    if (!len) return;
+    const { formatLengthReport } = await import("../dev/verify-device");
+    try {
+      await navigator.clipboard.writeText(formatLengthReport(len));
+      setStatus({ kind: "done", text: "报告已复制到剪贴板" });
+    } catch {
+      setStatus({ kind: "done", text: "复制失败，请长按下面的文本自行复制" });
+    }
+  }, [len]);
 
   const copyDevice = useCallback(async () => {
     if (!dev) return;
@@ -579,7 +612,54 @@ export function M0Panel({ onBack }: { readonly onBack: () => void }) {
         >
           运行真机自检
         </button>
+        <button
+          type="button"
+          onClick={() => void runLength()}
+          disabled={exporting || status.kind === "busy"}
+          style={{ marginLeft: 8 }}
+        >
+          运行长片自检（十几分钟）
+        </button>
         {devStep && <p className="hint mono" style={{ margin: "8px 0 0" }}>{devStep}</p>}
+
+        {len && (
+          <>
+            <p className="hint" style={{ margin: "12px 0 4px" }}>
+              长片自检：输出固定 1280×720，<b>只变片长</b>。它和上面那条阶梯是两根不同的轴
+              ——那条扫"一帧有多大"（顶的是画布和编码器缓冲，一帧就到峰值），这条扫
+              "有多少帧、多少音频"（顶的是随片长累积的东西）。两根一起扫的话，崩了都说
+              不清是被哪一头顶掉的。<b>混音峰值倍率</b>是这根轴要的那个数：分段混流（D22）
+              之后它应当接近 1，之前会跟片长同比例涨。
+            </p>
+            <table className="checks">
+              <tbody>
+                {len.rungs.map((r) => (
+                  <tr key={r.label} className={r.ok ? "ok" : "bad"}>
+                    <td>{r.ok ? "✓" : "✕"}</td>
+                    <td>{r.label}（{r.clips} 片段）</td>
+                    <td className="mono">
+                      {(r.elapsedMs / 1000).toFixed(1)}s · {r.realtime.toFixed(2)}× 实时 ·
+                      混音峰值 {r.mixPeakBytes === null ? "?" : formatBytes(r.mixPeakBytes)} ·
+                      循环峰值 {r.loopPeakBytes === null ? "?" : formatBytes(r.loopPeakBytes)}@{r.loopPeakAtFrame ?? "?"} ·
+                      {r.decoded} · {r.note}
+                    </td>
+                  </tr>
+                ))}
+                <tr className={len.mixPeakRatio !== null && len.mixPeakRatio < 1.5 ? "ok" : "bad"}>
+                  <td>·</td>
+                  <td>混音峰值倍率</td>
+                  <td className="mono">
+                    {len.mixPeakRatio === null ? "档数不够，画不出趋势" : `${len.mixPeakRatio.toFixed(2)}×（最短 → 最长）`}
+                    {" · 最长跑通 "}{len.maxLength ?? "无"}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <button type="button" onClick={() => void copyLength()} style={{ marginTop: 8 }}>
+              复制长片报告
+            </button>
+          </>
+        )}
 
         {dev && (
           <>

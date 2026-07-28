@@ -49,7 +49,7 @@ import type { Compositor } from "../compose/compositor";
 import { startExport } from "../export/client";
 import { probeFile } from "../media/probe";
 import { readExportFile, removeExportFile } from "../export/write-target";
-import { singleClipTimeline, type Timeline } from "../edl/types";
+import { singleClipTimeline, type MediaSource, type Timeline } from "../edl/types";
 import { makeSampleVideo } from "./make-sample";
 
 const JOURNAL_KEY = "kerf.device-report.v1";
@@ -479,6 +479,295 @@ export async function runDeviceReport(
     maxResolution: passed.length > 0 ? passed[passed.length - 1]!.label : null,
     diedAt,
   };
+}
+
+// ---------------------------------------------------------------------------
+// 长度轴
+// ---------------------------------------------------------------------------
+
+/**
+ * 逐级加长片长。**这和上面那条阶梯是两根不同的轴**，不能混着扫。
+ *
+ * 分辨率那条扫的是"一帧有多大"，长度这条扫的是"有多少帧、多少音频"。会炸的机制
+ * 完全不同：前者顶的是画布、渲染目标、编码器缓冲（全在输出侧，一帧就到峰值）；
+ * 后者顶的是**随片长累积**的东西——分段之前那就是混音的整条 PCM（30 分钟 989MB、
+ * 一小时 2GB，全在主线程）。两根轴一起扫的话，崩了都说不清是被哪一头顶掉的。
+ *
+ * 分段混流（D22）之后混音峰值理论上与片长无关，但那个结论是**4 倍片长外推**出来的
+ * （M0 自检里 10 秒 vs 40 秒），不等于"30 分钟真的跑得完"。这条阶梯就是来把外推
+ * 换成实测的。
+ */
+const LENGTH_LADDER: readonly { readonly label: string; readonly seconds: number }[] = [
+  { label: "30 秒", seconds: 30 },
+  { label: "2 分钟", seconds: 120 },
+  { label: "10 分钟", seconds: 600 },
+  { label: "30 分钟", seconds: 1800 },
+];
+
+/** 长度轴上分辨率固定，否则量到的上限说不清是被哪一头顶掉的。 */
+const LENGTH_WIDTH = 1280;
+const LENGTH_HEIGHT = 720;
+
+/**
+ * 每个片段多长（帧）。300 帧 ≈ 10 秒，于是 30 分钟 = 180 个片段。
+ *
+ * **接成很多片段而不是一条长素材**，两个理由：生成 30 分钟的测试素材本身要跑很久
+ * 且占几百 MB；而"上百个片段"恰恰是长项目的真实形态，顺带压到解码游标池
+ * （池深必须由"同时活着的片段数"限住，不能随片段总数增长）。
+ */
+const LENGTH_CLIP_FRAMES = 300;
+
+export interface LengthResult {
+  readonly label: string;
+  readonly seconds: number;
+  readonly clips: number;
+  readonly frames: number;
+  readonly ok: boolean;
+  readonly elapsedMs: number;
+  /** 相对实时的倍数。低于 1 就是"导一分钟片子要等一分钟以上"。 */
+  readonly realtime: number;
+  /**
+   * **混音段**的常驻量峰值。这一条是这根轴的主角——分段之前它随片长线性涨。
+   *
+   * 由主线程填（`ExportDone.mixResidency`）：混音跑在主线程，而计量器每个 JS
+   * 上下文一份，Worker 那份看不到这一段。
+   */
+  readonly mixPeakBytes: number | null;
+  /** 导出循环的常驻量峰值（Worker 侧）。实测第 9 帧就压平，这里是对照。 */
+  readonly loopPeakBytes: number | null;
+  readonly loopPeakAtFrame: number | null;
+  /** 解回来的宽高和帧数。同分辨率轴那条教训：字节数是旁证，解回来才是证据。 */
+  readonly decoded: string;
+  readonly note: string;
+}
+
+export interface LengthReport {
+  readonly env: DeviceEnv;
+  readonly rungs: readonly LengthResult[];
+  /** 最长跑通的那一档；一档都没过是 null。 */
+  readonly maxLength: string | null;
+  /**
+   * 混音峰值随片长涨了多少倍。**这是这根轴要的那个数。**
+   *
+   * 分段之后应当接近 1；分段之前它会跟片长同比例涨。跑通不足两档时是 null
+   * ——一个点画不出趋势。
+   */
+  readonly mixPeakRatio: number | null;
+  readonly diedAt: string | null;
+}
+
+/**
+ * 逐级加长片长，量混音峰值涨不涨、以及这台设备扛不扛得住。
+ *
+ * 和 `runDeviceReport` 共用那本 localStorage 日志（**崩溃是读数**），所以真被系统
+ * 杀掉时重新打开页面能看到死在哪一档。两者串不到一起跑：这条要十几分钟，混进去
+ * 会让"看一眼这台设备的分辨率上限"这件事也变成十几分钟。
+ */
+export async function runLengthReport(
+  onStep?: (message: string) => void,
+  options?: { readonly maxSeconds?: number },
+): Promise<LengthReport> {
+  const env = collectEnv();
+  const diedAt = previousCrash();
+  const journal: Journal = {
+    startedAt: new Date().toISOString(),
+    ua: env.userAgent,
+    attempting: null,
+    done: [],
+    contextAttempt: null,
+  };
+  writeJournal(journal);
+
+  if (!env.secureContext) {
+    return { env, rungs: [], maxLength: null, mixPeakRatio: null, diedAt };
+  }
+
+  onStep?.("生成测试素材…");
+  const sample = await makeSampleVideo({
+    durationFrames: LENGTH_CLIP_FRAMES,
+    withAudio: true,
+  });
+  const probe = await probeFile(sample.file);
+  const source = probe.source;
+  const fps = source.fps.num / source.fps.den;
+  const cap = options?.maxSeconds ?? Number.POSITIVE_INFINITY;
+
+  const rungs: LengthResult[] = [];
+  for (const step of LENGTH_LADDER) {
+    if (step.seconds > cap) break;
+    const clips = Math.max(1, Math.round((step.seconds * fps) / LENGTH_CLIP_FRAMES));
+    const frames = clips * LENGTH_CLIP_FRAMES;
+    onStep?.(`导出 ${step.label}（${clips} 个片段 · ${frames} 帧）…`);
+    // **动手之前先写**。这一行就是崩溃时唯一会留下的东西
+    journal.attempting = `长片 ${step.label}`;
+    writeJournal(journal);
+
+    const name = `kerf-length-${step.seconds}.mp4`;
+    const started = performance.now();
+    let result: LengthResult;
+    try {
+      await removeExportFile(name);
+      const timeline = buildLongTimeline(source, clips);
+      const done = await startExport(
+        {
+          timeline,
+          range: { inFrame: 0, outFrame: frames },
+          container: "mp4",
+          videoBitrate: Math.round(LENGTH_WIDTH * LENGTH_HEIGHT * 0.1),
+          audioBitrate: 128e3,
+          includeAudio: true,
+          target: { kind: "opfs", name },
+          autoDownload: false,
+        },
+        () => undefined,
+      ).done;
+      if (!done) throw new Error("导出被取消");
+      const verified = await verifyLongOutput(name, frames);
+      const elapsedMs = Math.round(performance.now() - started);
+      result = {
+        label: step.label,
+        seconds: step.seconds,
+        clips,
+        frames,
+        ok: verified.ok,
+        elapsedMs,
+        realtime: frames / fps / (elapsedMs / 1000),
+        mixPeakBytes: done.mixResidency?.peak.estimatedBytes ?? null,
+        loopPeakBytes: done.residency?.peak.estimatedBytes ?? null,
+        loopPeakAtFrame: done.residency?.peakAtFrame ?? null,
+        decoded: verified.detail,
+        note:
+          `${done.encodedFrames} 帧 · ${done.backend ?? "?"}` +
+          ` · 泄漏 ${done.residency ? `${done.residency.leakedSamples}/${done.residency.leakedCursors}/${done.residency.leakedInputs}` : "?"}`,
+      };
+      await removeExportFile(name);
+    } catch (error) {
+      result = {
+        label: step.label,
+        seconds: step.seconds,
+        clips,
+        frames,
+        ok: false,
+        elapsedMs: Math.round(performance.now() - started),
+        realtime: 0,
+        mixPeakBytes: null,
+        loopPeakBytes: null,
+        loopPeakAtFrame: null,
+        decoded: "没跑到",
+        note: describe(error),
+      };
+    }
+
+    rungs.push(result);
+    journal.attempting = null;
+    writeJournal(journal);
+    if (!result.ok) break;
+  }
+
+  const passed = rungs.filter((r) => r.ok);
+  const withMix = passed.filter((r) => r.mixPeakBytes !== null && r.mixPeakBytes > 0);
+  const first = withMix[0];
+  const last = withMix[withMix.length - 1];
+  return {
+    env,
+    rungs,
+    maxLength: passed.length > 0 ? passed[passed.length - 1]!.label : null,
+    // 一个点画不出趋势——不足两档时明确报 null，别拿 1.00 冒充"证明了不涨"
+    mixPeakRatio:
+      withMix.length >= 2 && first && last ? last.mixPeakBytes! / first.mixPeakBytes! : null,
+    diedAt,
+  };
+}
+
+/** 把同一个源片接成 `clips` 个首尾相连的片段，画面轨和音频轨各一条。 */
+function buildLongTimeline(source: MediaSource, clips: number): Timeline {
+  const make = (prefix: string) =>
+    Array.from({ length: clips }, (_, i) => ({
+      id: `${prefix}${i}`,
+      kind: "media" as const,
+      sourceId: source.id,
+      timelineIn: i * LENGTH_CLIP_FRAMES,
+      timelineOut: (i + 1) * LENGTH_CLIP_FRAMES,
+      sourceIn: 0,
+    }));
+  return {
+    fps: source.fps,
+    width: LENGTH_WIDTH,
+    height: LENGTH_HEIGHT,
+    durationFrames: clips * LENGTH_CLIP_FRAMES,
+    sources: [source],
+    tracks: [
+      { id: "V1", kind: "video", clips: make("v") },
+      { id: "A1", kind: "audio", clips: make("a") },
+    ],
+  };
+}
+
+/**
+ * 解回来确认帧数对得上。
+ *
+ * 长片这根轴上最像"成功"的失败形态是**音频或画面被悄悄截短**——导出不报错、文件
+ * 能播、只是短了一截。帧数是唯一能一眼看出来的判据，所以哪怕解一条 30 分钟的片子
+ * 要花几秒也得解。顺带把音轨时长也量出来：**音画哪一条短了要分得清**。
+ */
+async function verifyLongOutput(
+  name: string,
+  wantFrames: number,
+): Promise<{ ok: boolean; detail: string }> {
+  try {
+    const file = await readExportFile(name);
+    const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(file) });
+    try {
+      const track = await input.getPrimaryVideoTrack();
+      if (!track) return { ok: false, detail: "解回来没有视频轨" };
+      const stats = await track.computePacketStats();
+      const audio = await input.getPrimaryAudioTrack();
+      const audioSeconds = audio ? await audio.computeDuration() : null;
+      const videoSeconds = await track.computeDuration();
+      const framed = stats.packetCount === wantFrames;
+      // 音画时长差半秒以内算齐；再大就是有一条被截短了
+      const synced = audioSeconds !== null && Math.abs(audioSeconds - videoSeconds) < 0.5;
+      return {
+        ok: framed && synced,
+        detail:
+          `解回 ${stats.packetCount} 帧 / ${videoSeconds.toFixed(1)}s` +
+          ` · 音轨 ${audioSeconds === null ? "无" : `${audioSeconds.toFixed(1)}s`}` +
+          (framed ? "" : ` ← 期望 ${wantFrames} 帧`) +
+          (synced ? "" : " ← 音画时长对不上"),
+      };
+    } finally {
+      input.dispose();
+    }
+  } catch (error) {
+    return { ok: false, detail: `解不回来：${describe(error)}` };
+  }
+}
+
+export function formatLengthReport(report: LengthReport): string {
+  const mb = (bytes: number | null) =>
+    bytes === null ? "?" : `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+  const lines: string[] = [];
+  lines.push("=== Kerf 长片自检 ===");
+  lines.push(`UA: ${report.env.userAgent}`);
+  lines.push(`输出固定 ${LENGTH_WIDTH}×${LENGTH_HEIGHT}，只变片长`);
+  lines.push("");
+  for (const r of report.rungs) {
+    lines.push(
+      `  ${r.ok ? "✓" : "✗"} ${r.label} · ${r.clips} 片段 / ${r.frames} 帧` +
+        ` · ${(r.elapsedMs / 1000).toFixed(1)}s（${r.realtime.toFixed(2)}× 实时）` +
+        ` · 混音峰值 ${mb(r.mixPeakBytes)} · 循环峰值 ${mb(r.loopPeakBytes)}@${r.loopPeakAtFrame ?? "?"}` +
+        ` · ${r.decoded} · ${r.note}`,
+    );
+  }
+  lines.push(`最长跑通: ${report.maxLength ?? "一档都没过"}`);
+  lines.push(
+    `混音峰值随片长的倍率: ${report.mixPeakRatio === null ? "档数不够，画不出趋势" : report.mixPeakRatio.toFixed(2)}`,
+  );
+  if (report.diedAt) {
+    lines.push("");
+    lines.push(`⚠️ 上一次运行死在 ${report.diedAt}（标签页被杀，没留下结论）`);
+  }
+  return lines.join("\n");
 }
 
 /**

@@ -503,7 +503,7 @@ async function renderSegment(
     residency.retainMixBytes(bufferBytes(pcm));
   }
 
-  const rendered = await ctx.startRendering();
+  const rendered = await withRenderWatchdog(ctx.startRendering(), segment.index);
   releaseContext(ctx);
   const renderedBytes = bufferBytes(rendered);
   residency.retainMixBytes(renderedBytes);
@@ -532,6 +532,50 @@ async function renderSegment(
     frameCount: segment.takeLengthSamples,
     channels,
   };
+}
+
+/**
+ * 一段渲染最多等多久（毫秒）。一段是 10 秒音频，正常远不到一秒。
+ *
+ * 取 60 秒不是为了卡性能，是为了把**永远不回来**和"这台机器慢"分开。
+ */
+const RENDER_TIMEOUT_MS = 60_000;
+
+/**
+ * 给 `startRendering()` 加一道看门狗。**这不是防御式编程，是实测撞到的形态。**
+ *
+ * Safari 上导 30 分钟（180 段）时整个页面**死等**：主线程停在这个 promise 上、
+ * Worker 停在等下一段上，**0% CPU、不抛错、不崩溃、进度条永远不动**。同一份代码
+ * 在 Chrome 上四档全过。10 分钟（60 段）能过，所以是攒到一定段数之后 Safari 的
+ * `OfflineAudioContext` 不再 resolve——显式 `close()` 只推迟了它，没有消除。
+ *
+ * 死等是所有失败形态里最坏的一种：用户既拿不到成品，也拿不到"为什么"，只能自己
+ * 判断要等到什么时候。超时至少把它变成一条能读、能报、能查的错误（同硬规则 10
+ * 那条"不静默降级"的精神）。**这不是修复**，真正的上限仍在，见 PLAN.md §8 风险 1。
+ */
+async function withRenderWatchdog(
+  rendering: Promise<AudioBuffer>,
+  segmentIndex: number,
+): Promise<AudioBuffer> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      rendering,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(
+            new Error(
+              `混音第 ${segmentIndex} 段渲染超过 ${RENDER_TIMEOUT_MS / 1000} 秒没有返回。` +
+                `浏览器的音频上下文很可能已经不再工作（Safari 上导长片实测会这样），` +
+                `请把导出范围缩短后重试。`,
+            ),
+          );
+        }, RENDER_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**

@@ -16,7 +16,7 @@
 
 const ENDPOINT = "/__report";
 
-type RunnerName = "m0" | "pixi" | "timeline" | "preview" | "device";
+type RunnerName = "m0" | "pixi" | "timeline" | "preview" | "device" | "length";
 
 interface CheckLike {
   readonly name: string;
@@ -30,12 +30,27 @@ interface CheckLike {
  * / `verifyPreviewMatchesExport` / `verifyPixiBackend`），所以这里显式列一张表，
  * 而不是靠拼字符串猜函数名——猜错的表现是"跑了但什么也没发生"。
  */
-const RUNNERS: Record<RunnerName, () => Promise<unknown>> = {
+const RUNNERS: Record<RunnerName, (params: URLSearchParams) => Promise<unknown>> = {
   m0: async () => (await import("./verify-m0")).verifyM0(),
   pixi: async () => (await import("./verify-pixi")).verifyPixiBackend(),
   timeline: async () => (await import("./verify-timeline")).verifyTimelineConsistency(),
   preview: async () => (await import("./verify-preview")).verifyPreviewMatchesExport(),
   device: async () => (await import("./verify-device")).runDeviceReport(),
+  /**
+   * `&max=<秒>` 只跑到那一档为止。
+   *
+   * 不只是图快：长片这根轴上最坏的形态是**整个页面死等**（主线程停在一个永不
+   * resolve 的 promise 上，0% CPU、没有报错、没有崩溃）。那时唯一能把
+   * "上一次死在哪一档"取出来的办法，就是跑一轮**短到一定能跑完**的，
+   * 让它把 localStorage 里那条记录读出来带回报告。
+   */
+  length: async (params) => {
+    const max = Number(params.get("max"));
+    return (await import("./verify-device")).runLengthReport(
+      undefined,
+      Number.isFinite(max) && max > 0 ? { maxSeconds: max } : undefined,
+    );
+  },
 };
 
 function isRunnerName(value: string): value is RunnerName {
@@ -84,7 +99,7 @@ export async function maybeAutorun(): Promise<void> {
 
   const startedAt = performance.now();
   try {
-    const result = await RUNNERS[name]();
+    const result = await RUNNERS[name](params);
     await post({
       name,
       userAgent: navigator.userAgent,
