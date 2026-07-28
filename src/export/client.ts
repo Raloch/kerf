@@ -55,6 +55,8 @@ export function startExport(
   const totalFrames = options.range.outFrame - options.range.inFrame;
   let canceled = false;
   let worker: Worker | null = null;
+  /** 由 `runInWorker` 装上：发取消 + 宽限期内没反应就把 Worker 掐掉。 */
+  let requestCancel: (() => void) | null = null;
 
   const done = (async (): Promise<ExportDone | null> => {
     // ---- 阶段 1：建混音器，拿到元信息 ----
@@ -105,11 +107,19 @@ export function startExport(
 
     let result: ExportDone | null;
     try {
-      result = await runInWorker(request, mixer, mixChunkTransferables, sampleMix, onProgress, (w) => {
-        worker = w;
-        // 混音期间用户就点了取消
-        if (canceled) w.postMessage({ type: "cancel" } satisfies WorkerRequest);
-      });
+      result = await runInWorker(
+        request,
+        mixer,
+        mixChunkTransferables,
+        sampleMix,
+        onProgress,
+        (w, cancelIt) => {
+          worker = w;
+          requestCancel = cancelIt;
+          // 混音期间用户就点了取消
+          if (canceled) cancelIt();
+        },
+      );
     } finally {
       mixer?.dispose();
       residency.setAudioPcmBytes(0);
@@ -131,10 +141,28 @@ export function startExport(
     done,
     cancel() {
       canceled = true;
-      worker?.postMessage({ type: "cancel" } satisfies WorkerRequest);
+      requestCancel?.();
     },
   };
 }
+
+/**
+ * 多久没有推进就在界面上说一句（毫秒）。
+ *
+ * **只是提示，不会让导出失败**，理由见 `ExportProgress.stalledMs`：Safari 后台
+ * 标签的节流会让长片正常地停住好几分钟，自动判死会把"导出期间切去干别的"变成
+ * 导出失败。所以这个数只要"大于任何一步的正常耗时"就够——最长的一步是收尾时
+ * 写 mp4 索引（`mux-finalize`），30 分钟的片子在那里停十几秒是正常的。
+ */
+const STALL_HINT_MS = 60_000;
+
+/**
+ * 点了取消之后，等 Worker 认账多久（毫秒）。
+ *
+ * 正常情况下逐帧循环每帧都查一次取消标志，一帧之内就回话，5 秒是极宽的余量。
+ * 到点还没回话说明它卡在一个看不到那个标志的 await 上，只能掐掉——见 `requestCancel`。
+ */
+const CANCEL_GRACE_MS = 5_000;
 
 /**
  * 常驻导出 Worker。**跨导出复用，不再一次一个。**
@@ -180,7 +208,7 @@ function runInWorker(
   transferablesOf: (chunk: MixChunk) => Transferable[],
   sampleMix: () => void,
   onProgress: (progress: ExportProgress) => void,
-  onReady: (worker: Worker) => void,
+  onReady: (worker: Worker, requestCancel: () => void) => void,
 ): Promise<ExportDone | null> {
   const worker = getWorker();
   let settled = false;
@@ -222,14 +250,77 @@ function runInWorker(
     });
   };
 
+  /**
+   * 盯"有没有推进"，不盯"有没有收到消息"。
+   *
+   * Worker 每秒一条心跳（`ExportProgress.heartbeat`），拿消息到达当判据的话永远
+   * 不会超时。推进的定义是 `encodedFrames` 或 `marker` 变了——两者都不变就是
+   * 真的停在同一步上。
+   *
+   * **页面不可见时不计**：那时停住是 Safari 节流的正常结果，不是故障。
+   */
+  let lastAdvanceAt = performance.now();
+  let lastKey = "";
+  let lastProgress: ExportProgress | null = null;
+
+  const noteProgress = (progress: ExportProgress): void => {
+    const key = `${progress.stage}/${progress.marker ?? ""}/${progress.encodedFrames}`;
+    if (key !== lastKey) {
+      lastKey = key;
+      lastAdvanceAt = performance.now();
+    }
+    lastProgress = progress;
+    const hidden = typeof document !== "undefined" && document.visibilityState !== "visible";
+    const stalledMs = performance.now() - lastAdvanceAt;
+    onProgress(
+      !hidden && stalledMs >= STALL_HINT_MS ? { ...progress, stalledMs } : progress,
+    );
+  };
+
+  // 心跳停了就再也没有消息能带上提示了（同步卡死，或者页面刚从后台回来），
+  // 所以主线程自己也定时看一眼，拿最后那条进度补一发
+  const stallTimer = setInterval(() => {
+    if (!lastProgress) return;
+    if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+    const stalledMs = performance.now() - lastAdvanceAt;
+    if (stalledMs >= STALL_HINT_MS) onProgress({ ...lastProgress, stalledMs });
+  }, 5_000);
+
+  let cancelGrace: ReturnType<typeof setTimeout> | undefined;
+  let rejectRun: ((error: Error) => void) | null = null;
+
+  /**
+   * 发取消，并且**给它一个宽限期**；到点还没回话就把 Worker 掐掉。
+   *
+   * 不这么做的后果是实测撞出来的：Worker 卡在一个不看取消标志的 await 上时
+   * （注入一个永不 resolve 的 await 就是这个形态）它永远不会回话，而
+   * `export.worker.ts` 里的 `running` 还是 true——于是**这一页之后每一次导出都会被
+   * "已有导出任务在进行中"顶掉**。那是常驻 Worker 的代价：一次卡死污染整个会话。
+   *
+   * 直接的后果是界面上那句"取消掉再试"会是假话。掐掉换新的（`discardWorker`），
+   * 那句话才成立。原本只有 `onerror` 会换 Worker，而死等根本不抛错。
+   */
+  const requestCancel = (): void => {
+    if (settled) return;
+    worker.postMessage({ type: "cancel" } satisfies WorkerRequest);
+    if (cancelGrace !== undefined) return;
+    cancelGrace = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      discardWorker(worker);
+      rejectRun?.(new Error("导出没有响应取消，已强制结束。再导一次会用一个新的后台线程。"));
+    }, CANCEL_GRACE_MS);
+  };
+
   const promise = new Promise<ExportDone | null>((resolve, reject) => {
+    rejectRun = reject;
     // 每次导出重挂 handler：Worker 是复用的，上一次的闭包还挂着就会
     // 把这一次的进度报给上一次的调用方
     worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
       const message = event.data;
       switch (message.type) {
         case "progress":
-          onProgress(message.progress);
+          noteProgress(message.progress);
           break;
         case "audio-pull":
           answerPull(message.index);
@@ -263,9 +354,17 @@ function runInWorker(
     };
   });
 
+  // Worker 跨导出存活，这两个定时器不能跟着活下去
+  promise
+    .finally(() => {
+      clearInterval(stallTimer);
+      clearTimeout(cancelGrace);
+    })
+    .catch(() => undefined);
+
   const startMessage: WorkerRequest = { type: "start", request };
   worker.postMessage(startMessage);
-  onReady(worker);
+  onReady(worker, requestCancel);
 
   return promise;
 }

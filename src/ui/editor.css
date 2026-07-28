@@ -1470,31 +1470,48 @@
   font-weight: 600;
 }
 /* 阻断性提示：贴在页脚上方，和「开始导出」禁用是同一件事的两面。
-   不做成 toast——它不会自己消失，因为用户必须处理它才能继续 */
-.ed .dlg-warn {
+   不做成 toast——它不会自己消失，因为用户必须处理它才能继续。
+
+   `.dlg-stall`（导出好久没推进）**共用这套视觉但语义相反**：它不阻断任何东西，
+   而且推进恢复之后自己就没了。所以分成两个类名而不是复用一个——将来有人按
+   "看到 dlg-warn 就说明用户被卡住了"去改，会把一条纯提示当成阻断条件。
+   视觉留一份，避免两条告警长得不一样。 */
+.ed .dlg-warn,
+.ed .dlg-stall {
   display: flex;
   gap: 9px;
   padding: 10px 16px;
   border-top: 1px solid var(--line);
   background: color-mix(in srgb, var(--warn) 12%, var(--panel-2));
 }
-.ed .dlg-warn .wi {
+/* 阻断提示贴在页脚上方，所以只要一条上边框；卡住提示是**嵌在进度区里**的一张卡，
+   跟同一区域的数字卡片一样得是圆角全边框，否则方角 + 只有上边框会显得像画错了 */
+.ed .dlg-stall {
+  margin: 9px 0 0;
+  border: 1px solid color-mix(in srgb, var(--warn) 35%, var(--line));
+  border-radius: var(--r);
+}
+.ed .dlg-warn .wi,
+.ed .dlg-stall .wi {
   flex: 0 0 auto;
   color: var(--warn);
   display: flex;
   padding-top: 1px;
 }
-.ed .dlg-warn .wi svg {
+.ed .dlg-warn .wi svg,
+.ed .dlg-stall .wi svg {
   width: 13px;
   height: 13px;
 }
-.ed .dlg-warn b {
+.ed .dlg-warn b,
+.ed .dlg-stall b {
   display: block;
   font-size: 11.5px;
   font-weight: 600;
   color: var(--tx);
 }
-.ed .dlg-warn span {
+.ed .dlg-warn span,
+.ed .dlg-stall span {
   display: block;
   font-size: 10.5px;
   line-height: 1.5;

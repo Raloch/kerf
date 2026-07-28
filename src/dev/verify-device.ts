@@ -49,7 +49,7 @@ import type { Compositor } from "../compose/compositor";
 import { startExport, type ExportHandle } from "../export/client";
 import type { ExportDone } from "../export/protocol";
 import { probeFile } from "../media/probe";
-import { readExportFile, removeExportFile } from "../export/write-target";
+import { canPickSaveFile, readExportFile, removeExportFile } from "../export/write-target";
 import { singleClipTimeline, type MediaSource, type Timeline } from "../edl/types";
 import { makeSampleVideo } from "./make-sample";
 
@@ -85,6 +85,15 @@ export interface DeviceEnv {
   readonly cores: number | null;
   /** 不是安全上下文的话 WebCodecs / OPFS 直接没有，后面全部测不了。 */
   readonly secureContext: boolean;
+  /**
+   * 这台浏览器有没有"选保存位置"（`showSaveFilePicker`）。
+   *
+   * 它决定成品**走哪条写盘路径**：有 picker 就直接写用户选的文件，没有就流式写
+   * OPFS 再触发下载（硬规则 9）。自检永远走 OPFS——picker 必须在用户手势里同步
+   * 调起，脚本调不动——所以**凡是"写盘路径上的结论"，都只对这个值为 false 的
+   * 浏览器有实测依据**。记进环境里，免得把 OPFS 上量到的结论当成两条路都验过。
+   */
+  readonly canPickSaveFile: boolean;
 }
 
 export interface LadderResult {
@@ -200,6 +209,7 @@ function collectEnv(): DeviceEnv {
     deviceMemoryGb: typeof nav.deviceMemory === "number" ? nav.deviceMemory : null,
     cores: typeof navigator.hardwareConcurrency === "number" ? navigator.hardwareConcurrency : null,
     secureContext: isSecureContext,
+    canPickSaveFile: canPickSaveFile(),
   };
 }
 

@@ -553,6 +553,27 @@ function RunningView({
             </div>
           ))}
         </div>
+        {/* 卡住只提示、不判失败：后台标签被浏览器节流时停住是正常的（Safari 上
+            实测同一条 30 分钟片子，前台 4.4× 跑完、后台看着像死等），自动判死会
+            让"导出期间切去干别的"变成导出失败。所以把"多久没动、停在哪一步"说清楚，
+            去留交给用户——同"看得见的降级要标注，不必禁止" */}
+        {progress.stalledMs !== undefined && (
+          <div className="dlg-stall">
+            <span className="wi">
+              <IconWarn />
+            </span>
+            <div>
+              <b>
+                已 {Math.round(progress.stalledMs / 1000)} 秒没有推进（停在{" "}
+                {progress.marker ?? "未知步骤"}，第 {progress.encodedFrames} 帧）
+              </b>
+              <span>
+                切到别的标签页或别的应用会让浏览器暂缓导出，回到这个页面通常就会接着跑。
+                一直不动的话取消掉、把导出范围缩短些再试。
+              </span>
+            </div>
+          </div>
+        )}
         <div className="run-nums">
           <div className="rn">
             <div className="k">已编码</div>
