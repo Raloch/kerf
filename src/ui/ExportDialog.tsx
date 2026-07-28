@@ -35,6 +35,13 @@ import {
 } from "../export/write-target";
 import type { ExportCapabilities } from "../media/capability";
 import type { ContainerChoice } from "../media/capability";
+// 静态 import 没问题：`preflight.ts` 只查 `typeof x` 和存储配额，不碰 mediabunny
+import {
+  estimateOutputBytes,
+  findBlockers,
+  readEnvironment,
+  type EnvironmentFacts,
+} from "../media/preflight";
 import { clipsUsingEffects, type RenderRange, type Timeline } from "../edl/types";
 import { observedCapabilities } from "../compose/backend";
 import { formatDuration, frameToSeconds } from "../time/timebase";
@@ -114,6 +121,22 @@ export function ExportDialog({ timeline, caps, selectedRange, onClose }: ExportD
   const gpuCaps = observedCapabilities();
   const colorBlocked = colorClips.length > 0 && gpuCaps !== null && !gpuCaps.supportsEffects;
 
+  /**
+   * 环境体检。`caps` 回答"能编哪个编码"，这一层回答"为什么一个都不能编"——
+   * 非安全上下文时四个编码会集体报不可用，而那串读数指不出真正该做的事
+   * （换 HTTPS / localhost）。见 `media/preflight.ts`。
+   */
+  const [env, setEnv] = useState<EnvironmentFacts | null>(null);
+  useEffect(() => {
+    let stale = false;
+    void readEnvironment().then((facts) => {
+      if (!stale) setEnv(facts);
+    });
+    return () => {
+      stale = true;
+    };
+  }, []);
+
   // MP4 被挡住时自动落到 WebM，但**不是静默降级**：MP4 选项就地写着原因，
   // 用户看到的是"MP4 不可用 + 已经帮你选了 WebM"，而不是点了 MP4 拿到 WebM
   useEffect(() => {
@@ -139,6 +162,24 @@ export function ExportDialog({ timeline, caps, selectedRange, onClose }: ExportD
   const seconds = frameToSeconds(totalFrames, timeline.fps);
   const ext = container === "mp4" ? "mp4" : "webm";
   const filename = `${baseName || "kerf-export"}.${ext}`;
+
+  // 体检结论要跟着预设和区间走：改成 4K 或者拉长区间，预计成品大小会变，
+  // 而"空间够不够"正是按它算的
+  const blockers = useMemo(
+    () =>
+      env === null
+        ? []
+        : findBlockers(env, {
+            audio: hasAudio,
+            estimatedBytes: estimateOutputBytes(
+              seconds,
+              resolved.videoBitrate,
+              resolved.audioBitrate,
+            ),
+          }),
+    [env, hasAudio, resolved.audioBitrate, resolved.videoBitrate, seconds],
+  );
+  const envBlocked = blockers.some((b) => b.severity === "block");
 
   const start = useCallback(async () => {
     // picker 要在手势里同步调起：这里是 onClick 的第一个 await 之前
@@ -385,6 +426,26 @@ export function ExportDialog({ timeline, caps, selectedRange, onClose }: ExportD
               </div>
             </div>
 
+            {/*
+              环境体检。**排在编码能力那张表之后、其余提示之前**：它给出的是根因，
+              而"MP4 视频编码：不可用"那几行很可能只是它的派生现象。
+              阻断用 `.dlg-warn`（会禁掉导出），提醒用 `.dlg-tidy`（中性，不禁）。
+            */}
+            {blockers.map((b) => (
+              <div
+                key={b.what}
+                className={b.severity === "block" ? "dlg-warn" : "dlg-tidy"}
+              >
+                <span className="wi">
+                  <IconWarn />
+                </span>
+                <div>
+                  <b>{b.what}</b>
+                  <span>出路：{b.wayOut}</span>
+                </div>
+              </div>
+            ))}
+
             {colorBlocked && (
               <div className="dlg-warn">
                 <span className="wi">
@@ -437,7 +498,9 @@ export function ExportDialog({ timeline, caps, selectedRange, onClose }: ExportD
               <button
                 type="button"
                 className="btn-primary"
-                disabled={totalFrames <= 0 || (mp4Blocked && webmBlocked) || colorBlocked}
+                disabled={
+                  totalFrames <= 0 || (mp4Blocked && webmBlocked) || colorBlocked || envBlocked
+                }
                 onClick={() => void start()}
               >
                 开始导出
