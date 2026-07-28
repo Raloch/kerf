@@ -216,6 +216,29 @@
   width: 14px;
   height: 14px;
 }
+/* ---------- 崩溃恢复条 ----------
+   横在顶栏和三栏之间，flex 里不参与伸缩（`flex: 0 0 auto`）——不写会被
+   `.ed-body` 的 `flex: 1 1 auto` 挤没，而它恰恰是要挡住视线的那一条。 */
+.ed .ed-recover {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--line);
+  background: color-mix(in oklab, var(--accent) 14%, var(--panel));
+  font-size: 12px;
+}
+.ed .ed-recover > span {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+/* 恢复结果里"丢了什么"用警示色，和"要不要恢复"这条中性提示分开——
+   前者是已经发生的损失，后者只是一个待办的选择 */
+.ed .ed-recover.warn {
+  background: color-mix(in oklab, var(--warn, #d08a2a) 16%, var(--panel));
+}
+
 /* ---------- 主体三栏 ---------- */
 .ed-body {
   flex: 1 1 auto;

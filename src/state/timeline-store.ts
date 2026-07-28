@@ -109,6 +109,15 @@ export interface TimelineState {
 
   // ---- 编辑（都会进撤销栈）----
   loadSource: (source: MediaSource) => void;
+  /**
+   * 用崩溃恢复读回来的项目替掉当前状态。**历史从这里重新开始。**
+   *
+   * 不接着旧历史往下走，也不恢复存下来的历史——快照里刻意没有撤销栈
+   * （见 `project-snapshot.ts`）。所以撤销回不到"恢复之前"，那正是想要的：
+   * "恢复之前"是一个空项目，让用户能一键撤销回空白毫无价值，而把一个引用了
+   * 可能已经不在的素材的栈恢复出来，比没有撤销更坏。
+   */
+  restoreProject: (timeline: Timeline, playhead: number) => void;
   moveClip: (clipId: ClipId, deltaFrames: number, options?: MoveOptions) => void;
   /** 拖拽落点：先算磁吸再移动，中间态按 clipId 合并成一步撤销。 */
   dragClipTo: (clipId: ClipId, desiredIn: number, toTrack?: TrackId) => void;
@@ -221,6 +230,16 @@ export const useTimeline = create<TimelineState>((set, get) => {
         selectedClipId: videoClip ? `${source.id}-v` : null,
         lastRejection: null,
       }));
+    },
+
+    restoreProject(timeline, playhead) {
+      set({
+        history: initHistory(timeline, "恢复上次编辑"),
+        playhead,
+        selectedClipId: null,
+        lastRejection: null,
+        dragHint: null,
+      });
     },
 
     moveClip(clipId, deltaFrames, options) {

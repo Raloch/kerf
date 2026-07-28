@@ -513,7 +513,16 @@ function LutRow({
     try {
       const parsed = parseCubeLut(await file.text());
       const id = `lut-${file.name}-${parsed.size}-${Date.now()}`;
-      addLut({ id, name: parsed.title || file.name.replace(/\.cube$/i, ""), size: parsed.size, rgb: parsed.rgb });
+      const lut = {
+        id,
+        name: parsed.title || file.name.replace(/\.cube$/i, ""),
+        size: parsed.size,
+        rgb: parsed.rgb,
+      };
+      addLut(lut);
+      // 查表数据单独收进资产库（快照里只留元信息，见 `project-snapshot.ts`）。
+      // 这一份没存上，崩溃恢复时片段会保留、只是退回不上表
+      void import("../state/project-store").then(({ putLutAsset }) => putLutAsset(lut));
       setClipLut(clip.id, id);
       setError(null);
     } catch (e) {

@@ -109,6 +109,24 @@ function replaceTracks(timeline: Timeline, tracks: readonly Track[]): Timeline {
   return { ...timeline, tracks, durationFrames: computeDuration(tracks) };
 }
 
+/**
+ * 换掉整组轨道，并把每一条都**过一遍归一化**（排序 + 丢孤儿转场 + 重算总长）。
+ *
+ * 给"不是普通编辑但同样改了片段列表"的入口用——目前只有崩溃恢复（素材找不回来时
+ * 要移除片段，见 `project-snapshot.ts`）。它必须走这里而不是自己拼一个 `Timeline`：
+ * 删掉一个片段会让后继片段的转场指向一个不存在的交界，而那是"界面显示有转场、
+ * 画面上没有"的状态，两边都不报错（见 `dropOrphanTransitions`）。
+ */
+export function withNormalizedTracks(
+  timeline: Timeline,
+  tracks: readonly Track[],
+): Timeline {
+  return replaceTracks(
+    timeline,
+    tracks.map((t) => withClips(t, t.clips)),
+  );
+}
+
 /** 时间轴长度 = 所有片段的最大 timelineOut。空时间轴长度为 0。 */
 export function computeDuration(tracks: readonly Track[]): number {
   let max = 0;

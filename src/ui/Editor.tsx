@@ -10,6 +10,8 @@ import type { ExportCapabilities } from "../media/capability";
 import { proxyManager } from "../media/proxy-client";
 import type { ProxyInfo } from "../media/proxy";
 import { useTimeline } from "../state/timeline-store";
+// 只要类型：`project-store` 本身走动态 import，别把 IndexedDB 那一层拖进首屏
+import type { StoredProject } from "../state/project-store";
 import { findClip } from "../state/operations";
 import { clipDuration } from "../edl/types";
 import { formatDuration, framesToTimecode } from "../time/timebase";
@@ -38,6 +40,7 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
   const lastRejection = useTimeline((s) => s.lastRejection);
   const dragHint = useTimeline((s) => s.dragHint);
   const loadSource = useTimeline((s) => s.loadSource);
+  const restoreProject = useTimeline((s) => s.restoreProject);
   const setPlayhead = useTimeline((s) => s.setPlayhead);
   const undo = useTimeline((s) => s.undo);
   const redo = useTimeline((s) => s.redo);
@@ -53,6 +56,16 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [exportOpen, setExportOpen] = useState(false);
+  /**
+   * 崩溃恢复的三个状态：还在问 IndexedDB（`undefined`）、没有可恢复的（`null`）、
+   * 有一份待用户表态（`StoredProject`）。
+   *
+   * 三态而不是"有/没有"：自动存盘**必须等这个决定做完**才能开工，而"还没问出来"
+   * 和"问出来没有"在那件事上是两种处理。搞混的后果是空时间轴当场把待恢复的快照
+   * 覆盖掉——用户看着提示，按下去已经什么都没有了。见 `autosave.ts` 文件头。
+   */
+  const [recover, setRecover] = useState<StoredProject | null | undefined>(undefined);
+  const [recoverNote, setRecoverNote] = useState<string | null>(null);
 
   // 能力探测和素材探针都动态 import：它们各自拖着 mediabunny 的运行时，
   // 静态 import 会把约 500KB 塞进首屏 chunk，而两者都是"页面出来之后"才需要的。
@@ -71,6 +84,39 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
     };
   }, [timeline.width, timeline.height]);
 
+  // 挂载时先问一次"上次崩了吗"。**在这之前一个字节都不能往回写**，理由见 `recover`
+  useEffect(() => {
+    let stale = false;
+    void import("../state/project-store")
+      .then(({ loadProject }) => loadProject())
+      .then((found) => {
+        if (!stale) setRecover(found);
+      })
+      .catch(() => {
+        // 读不出来就当没存过：崩溃恢复失效不该拦住用户开始编辑
+        if (!stale) setRecover(null);
+      });
+    return () => {
+      stale = true;
+    };
+  }, []);
+
+  /**
+   * **只有 `recover === null` 才开自动存盘**，也就是"没有待决定的恢复"。
+   *
+   * 另两个状态都不能开，而且理由是同一个：`undefined`（还在问）和一份待表态的快照，
+   * 这两个时刻 store 里都是那个空时间轴，存下去就把待恢复的快照冲成空的。
+   * 用户点了恢复或不恢复之后，两条路都把它置成 null，自动存盘随之开工。
+   */
+  useEffect(() => {
+    if (recover !== null) return;
+    let stop: (() => void) | undefined;
+    void import("../state/autosave").then(({ startAutosave }) => {
+      stop = startAutosave();
+    });
+    return () => stop?.();
+  }, [recover]);
+
   // 代理状态：素材库要显示进度，预览要在就绪时切过去
   useEffect(
     () =>
@@ -85,6 +131,43 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
     for (const source of timeline.sources) void proxyManager.request(source);
   }, [timeline.sources]);
 
+  /**
+   * 真正救回来了几个片段，以及丢了哪些素材。
+   *
+   * **不能拿快照里的片段数当这个数**：素材读不回来的片段已经被 `fromSnapshot`
+   * 移除了（留着会让预览崩，见 `project-snapshot.ts`），所以"存的时候有 12 个"
+   * 和"现在能给你 12 个"是两件事。为 0 时连问都不该问。
+   */
+  const recoverable = recover
+    ? recover.timeline.tracks.reduce((n, t) => n + t.clips.length, 0)
+    : 0;
+  const lostNames = recover
+    ? recover.droppedSources.filter((d) => d.clips > 0).map((d) => d.name)
+    : [];
+
+  /** 接受恢复。素材已经在 `loadProject()` 里验过读得动了，这里只是装回 store。 */
+  const acceptRecover = useCallback(() => {
+    if (!recover) return;
+    restoreProject(recover.timeline, recover.playhead);
+    // **丢了什么必须说出来。** 素材找不回来会连带移除片段，静默处理就是让用户
+    // 在导出时才发现少了东西（同硬规则 10 那类"选了 A 拿到 B"）
+    const lost = recover.droppedSources.filter((d) => d.clips > 0);
+    const notes = [
+      ...lost.map((d) => `${d.name} 找不到了，用到它的 ${d.clips} 个片段已移除`),
+      ...(recover.droppedLuts.length > 0
+        ? [`${recover.droppedLuts.join("、")} 这几张 LUT 没读回来，相关片段的调色已退回不上表`]
+        : []),
+    ];
+    setRecoverNote(notes.length > 0 ? notes.join("；") : null);
+    setRecover(null);
+  }, [recover, restoreProject]);
+
+  const discardRecover = useCallback(() => {
+    // **真删。** 只是不用它的话，下次打开又会问一遍同一个已经被拒绝过的项目
+    void import("../state/project-store").then(({ clearProject }) => clearProject());
+    setRecover(null);
+  }, []);
+
   const importFile = useCallback(
     async (file: File) => {
       setBusy("读取素材…");
@@ -93,6 +176,11 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
         const { probeFile, wasFpsSnapped } = await import("../media/probe");
         const result = await probeFile(file);
         loadSource(result.source);
+        // 素材文件单独收进资产库，**导入时一次**——快照每次编辑都重写，把几百 MB
+        // 的 File 混在里面会让自动存盘变成最慢的那一步（见 `project-store.ts`）
+        void import("../state/project-store").then(({ putSourceAsset }) =>
+          putSourceAsset(result.source),
+        );
         void proxyManager.request(result.source);
         if (wasFpsSnapped(result)) {
           // 帧率被吸附过要告知：它决定了后续所有帧运算
@@ -206,6 +294,56 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
           导出
         </button>
       </div>
+
+      {/*
+        崩溃恢复。**问而不是直接恢复**：Kerf 只有一个隐含项目、没有项目列表，
+        静默替换会让"打开就是上次的样子"和"恢复错了一份陈旧项目"分不开，而且素材
+        找不回来时必须有个地方说这件事。同硬规则 10 的做法——降级要标注，不必禁止。
+      */}
+      {recover && (
+        <div className={`ed-recover${recoverable === 0 ? " warn" : ""}`}>
+          {recoverable === 0 ? (
+            /*
+              一个片段都救不回来时**不能还问"要不要恢复"**：按下去得到一个空时间轴，
+              而提示刚说过"上次的编辑没有正常结束"，读起来像恢复失败了。这一支照样
+              要说清楚原因——静默丢掉才是最坏的，用户既失去了项目也不知道为什么。
+            */
+            <>
+              <span>
+                上次的编辑（{new Date(recover.savedAt).toLocaleString()}）恢复不了：
+                {lostNames.length > 0
+                  ? `用到的素材已经找不到了（${lostNames.join("、")}）`
+                  : "里面已经没有片段了"}
+              </span>
+              <button type="button" className="chip-btn" onClick={discardRecover}>
+                知道了
+              </button>
+            </>
+          ) : (
+            <>
+              <span>
+                上次的编辑没有正常结束（{new Date(recover.savedAt).toLocaleString()}，
+                {recoverable} 个片段）
+                {lostNames.length > 0 && ` · 其中有素材找不回来了，恢复时会说明`}
+              </span>
+              <button type="button" className="btn-primary" onClick={acceptRecover}>
+                恢复
+              </button>
+              <button type="button" className="chip-btn" onClick={discardRecover}>
+                不恢复
+              </button>
+            </>
+          )}
+        </div>
+      )}
+      {recoverNote && (
+        <div className="ed-recover warn">
+          <span>{recoverNote}</span>
+          <button type="button" className="chip-btn" onClick={() => setRecoverNote(null)}>
+            知道了
+          </button>
+        </div>
+      )}
 
       {/* ---------- 三栏 ---------- */}
       <div className="ed-body">
