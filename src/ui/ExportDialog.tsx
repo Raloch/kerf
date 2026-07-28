@@ -42,6 +42,7 @@ import {
   readEnvironment,
   type EnvironmentFacts,
 } from "../media/preflight";
+import { loadSample, predict, sampleFromExport, saveSample } from "../export/throughput";
 import { clipsUsingEffects, type RenderRange, type Timeline } from "../edl/types";
 import { observedCapabilities } from "../compose/backend";
 import { formatDuration, frameToSeconds } from "../time/timebase";
@@ -181,6 +182,27 @@ export function ExportDialog({ timeline, caps, selectedRange, onClose }: ExportD
   );
   const envBlocked = blockers.some((b) => b.severity === "block");
 
+  /**
+   * 照这台机器上次的速度，这次要跑多久。
+   *
+   * 没有样本（第一次导出）/ 后端不同 / 样本过期 → `null`，那时**什么都不说**：
+   * 没有依据时的沉默比一个编出来的数字好。**只提醒不封顶**，理由见
+   * `export/throughput.ts` 文件头——静默把 4K 换成 1080p 就是硬规则 10 那件事，
+   * 而按一个预测去禁止，预测错时挡掉的是一次本来能成的导出（同 D24）。
+   */
+  const speedSample = useMemo(() => loadSample(), []);
+  const prediction = useMemo(
+    () =>
+      predict(speedSample, {
+        pixels: resolved.width * resolved.height,
+        frames: totalFrames,
+        durationSeconds: seconds,
+        backend: gpuCaps?.backend ?? "pixi",
+        now: Date.now(),
+      }),
+    [gpuCaps?.backend, resolved.height, resolved.width, seconds, speedSample, totalFrames],
+  );
+
   const start = useCallback(async () => {
     // picker 要在手势里同步调起：这里是 onClick 的第一个 await 之前
     let target;
@@ -225,6 +247,18 @@ export function ExportDialog({ timeline, caps, selectedRange, onClose }: ExportD
         return;
       }
       setPhase({ kind: "done", result });
+      // 记下这台机器的真实速度，给下一次导出做预测。**量出来的比按 UA 猜的可靠**
+      // ——真正的变量是吞吐，而"移动端"这个标签下既有 iPad Pro 也有千元机。
+      // 帧数太少的样本会被 `sampleFromExport` 自己挡掉（固定开销占大头）
+      const sample = sampleFromExport({
+        encodedFrames: result.encodedFrames,
+        elapsedMs: result.elapsedMs,
+        backend: result.backend,
+        width: resolved.width,
+        height: resolved.height,
+        at: Date.now(),
+      });
+      if (sample) saveSample(sample);
     } catch (error) {
       setPhase({ kind: "error", message: error instanceof Error ? error.message : String(error) });
     } finally {
@@ -417,6 +451,19 @@ export function ExportDialog({ timeline, caps, selectedRange, onClose }: ExportD
                       <span>预计体积</span>
                       <b>~{(estimateBytes(resolved, seconds, hasAudio) / 1e6).toFixed(0)} MB</b>
                     </div>
+                    {/* 有过一次够长的导出才有这一格：没有依据时**不显示**，
+                        编一个数字比不说更坏。见 `export/throughput.ts` */}
+                    {prediction && (
+                      <div>
+                        <span>预计耗时</span>
+                        <b className={prediction.slow ? "slow" : undefined}>
+                          ~{formatDuration(
+                            Math.round(prediction.seconds * (timeline.fps.num / timeline.fps.den)),
+                            timeline.fps,
+                          )}
+                        </b>
+                      </div>
+                    )}
                     <div>
                       <span>音频</span>
                       <b>{hasAudio ? "混流后写入" : "无音轨"}</b>
@@ -457,6 +504,32 @@ export function ExportDialog({ timeline, caps, selectedRange, onClose }: ExportD
                     有 {colorClips.length} 个片段用了调色，现在导出会得到一个没有调色的片子。
                     出路：把这些片段的调色重置掉再导，或换一个支持 WebGL2 的浏览器 / 机器。
                     {gpuCaps?.reason ? `（起不来的原因：${gpuCaps.reason}）` : ""}
+                  </span>
+                </div>
+              </div>
+            )}
+
+            {/*
+              这台机器上这一档慢于实时。**只提醒，不封顶**——静默把 4K 换成 1080p
+              就是硬规则 10 那件事，而按一个预测去禁止，预测错时挡掉的是一次本来
+              能成的导出（同 D24）。所以用中性的 `.dlg-tidy` 而不是 `.dlg-warn`。
+              依据要写出来（上次在哪一档量的），不然这个数字没法判断可不可信。
+            */}
+            {prediction?.slow && (
+              <div className="dlg-tidy">
+                <span className="wi">
+                  <IconWarn />
+                </span>
+                <div>
+                  <b>
+                    这一档在这台机器上慢于实时：预计跑 {(prediction.seconds / 60).toFixed(0)} 分钟，
+                    而片长 {formatDuration(totalFrames, timeline.fps)}。
+                  </b>
+                  <span>
+                    照上次导出量到的速度推算（那次是{" "}
+                    {Math.round(Math.sqrt(prediction.basisPixels * (9 / 16)))}p 那一档）。
+                    期间别切走标签——浏览器会节流后台页面，长片会停住好几分钟。
+                    降一档预设可以按像素量成比例地缩短。
                   </span>
                 </div>
               </div>
