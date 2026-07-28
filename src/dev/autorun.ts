@@ -46,10 +46,18 @@ const RUNNERS: Record<RunnerName, (params: URLSearchParams) => Promise<unknown>>
    */
   length: async (params) => {
     const max = Number(params.get("max"));
-    return (await import("./verify-device")).runLengthReport(
-      undefined,
-      Number.isFinite(max) && max > 0 ? { maxSeconds: max } : undefined,
-    );
+    const only = Number(params.get("only"));
+    const repeat = Number(params.get("repeat"));
+    return (await import("./verify-device")).runLengthReport(undefined, {
+      ...(Number.isFinite(max) && max > 0 ? { maxSeconds: max } : {}),
+      // `&only=<秒>` 只跑那一档。配合刷新页面用，是把"跨档累积"和"这一档太长"
+      // 分开的唯一办法——从头跑起时，跑到第 N 档已经背着前 N−1 档的资源账
+      ...(Number.isFinite(only) && only > 0 ? { onlySeconds: only } : {}),
+      // `&repeat=<n>` 把同一档在**同一个页面里**连着导 n 次，量"一个页面能导几次"。
+      // 答案已经量出来了：iPhone 上 30 秒档 24 次连导全过、吞吐死平，**次数不是墙**
+      // （在此之前"第 2、3 次就挂"看着像铁证，实为并发污染）。配 `&only=30` 最省时间
+      ...(Number.isFinite(repeat) && repeat > 1 ? { repeat } : {}),
+    });
   },
   /**
    * 不是自检，是**清场**：把 OPFS 导出目录里的残留删掉。
@@ -89,6 +97,28 @@ async function post(body: unknown): Promise<void> {
   } catch {
     // 发不回去不该让页面报错——屏幕上还有一份
   }
+}
+
+/**
+ * 把一份**手点出来的**结果也发回开发服务器。
+ *
+ * `?autorun=` 省掉的是"开浏览器 + 截图 + 人工转录"，但它在手机上有个致命缺点：
+ * 页面从头到尾没有反馈，人在手机前面看着就是"点了没反应"。于是长片轴实际是手点的，
+ * 而手点的结果只在屏幕上——**完整诊断字段照样要靠截图，而截图恰恰会截断它们**。
+ *
+ * 踩过一次而且代价不小：一轮阶梯失败的原因只有截图上那句"导出被取消"，而真正的
+ * 证据（同一时刻另一轮自检正在并行跑）是从**别的**报告文件的时间戳里挖出来的——
+ * 要是那一轮也留了报告，两份读数一对时间就完了。名字用 ASCII，服务器那头直接
+ * 拿它拼文件名。
+ */
+export async function postManualReport(name: string, result: unknown): Promise<void> {
+  await post({
+    name: `${name}-manual`,
+    userAgent: navigator.userAgent,
+    manual: true,
+    summary: summarize(result),
+    result,
+  });
 }
 
 /**

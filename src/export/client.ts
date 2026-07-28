@@ -18,6 +18,7 @@ import type {
   ExportDone,
   ExportProgress,
   ExportRequest,
+  RunId,
   WorkerRequest,
   WorkerResponse,
 } from "./protocol";
@@ -48,10 +49,46 @@ export interface ExportHandle {
   cancel(): void;
 }
 
+/**
+ * 这一页正在跑的那次导出的编号；null 表示空闲。
+ *
+ * **同页只许一次导出**，而且要在**入口就挡掉**、给出能读懂的错误。
+ *
+ * 理由是实测撞出来的一次假读数：同一页里两次长片自检并行跑（一个来自 `?autorun=`，
+ * 一个是手点的），于是
+ *
+ * - 后开那次把 `worker.onmessage` 覆盖掉，先开那次再也收不到进度，90 秒后把一次
+ *   **正在正常推进**的导出判成"死等，停在 decode:V1 第 600/900 帧"；
+ * - 紧接着它的看门狗发出 `cancel`，把**另一次**正在跑的导出掐了，那一档报
+ *   "导出被取消"——而它自己谁也没取消。
+ *
+ * 两份读数都是假的，两边都不抛错，而我据此把"iPhone 上一个页面导不了几次"当成了
+ * 设备的墙。挡住并发本身值这一道，让它**报错而不是串线**更值：串线的表现恰好长得
+ * 像被测对象出问题。同 CLAUDE.md 那条"先确认量法和被测对象分开了"。
+ *
+ * `RunId` 那道认号是第二道防线，兜的是"上一次被放弃、它的 cancel 迟到"这种跨时间的串线。
+ */
+let activeRun: RunId | null = null;
+let nextRunId = 1;
+
 export function startExport(
   options: ExportOptions,
   onProgress: (progress: ExportProgress) => void,
 ): ExportHandle {
+  if (activeRun !== null) {
+    return {
+      done: Promise.reject(
+        new Error(
+          `这一页已经有一次导出在跑（第 ${activeRun} 次）。同页并行导出会互相掐断、` +
+            `并把对方的进度判成死等，所以这里直接拒掉。等它跑完，或者刷新页面。`,
+        ),
+      ),
+      cancel: () => undefined,
+    };
+  }
+  const runId = nextRunId++;
+  activeRun = runId;
+
   const totalFrames = options.range.outFrame - options.range.inFrame;
   let canceled = false;
   let worker: Worker | null = null;
@@ -108,6 +145,7 @@ export function startExport(
     let result: ExportDone | null;
     try {
       result = await runInWorker(
+        runId,
         request,
         mixer,
         mixChunkTransferables,
@@ -137,8 +175,16 @@ export function startExport(
     return merged;
   })();
 
+  // **成功 / 失败 / 取消三条路都要放锁**，否则一次失败的导出会让这一页从此
+  // 全被上面那句"已经有一次导出在跑"顶掉——那正是常驻 Worker 那个坑的翻版
+  const released = done.finally(() => {
+    if (activeRun === runId) activeRun = null;
+  });
+  // `finally` 派生出来的这条链要是没人接就会成为 unhandled rejection
+  released.catch(() => undefined);
+
   return {
-    done,
+    done: released,
     cancel() {
       canceled = true;
       requestCancel?.();
@@ -203,6 +249,7 @@ export function releaseExportResources(): void {
 }
 
 function runInWorker(
+  runId: RunId,
   request: ExportRequest,
   mixer: Mixer | null,
   transferablesOf: (chunk: MixChunk) => Transferable[],
@@ -228,7 +275,13 @@ function runInWorker(
   const answerPull = (index: number): void => {
     mixQueue = mixQueue.then(async () => {
       if (mixError) {
-        worker.postMessage({ type: "audio-chunk", index, chunk: null, error: mixError.message });
+        worker.postMessage({
+          type: "audio-chunk",
+          runId,
+          index,
+          chunk: null,
+          error: mixError.message,
+        });
         return;
       }
       try {
@@ -237,7 +290,7 @@ function runInWorker(
           throw new Error(`音频分段乱序：要第 ${index} 段，混出来的是第 ${chunk.index} 段`);
         }
         sampleMix();
-        const message: WorkerRequest = { type: "audio-chunk", index, chunk };
+        const message: WorkerRequest = { type: "audio-chunk", runId, index, chunk };
         // PCM 每段几 MB，transfer 而不是结构化克隆——克隆会整份复制一遍。
         // post 之后 `chunk.channels` 在主线程这边就是零长数组了，不能再读
         worker.postMessage(message, chunk ? transferablesOf(chunk) : []);
@@ -245,7 +298,13 @@ function runInWorker(
         sampleMix();
       } catch (error) {
         mixError = error instanceof Error ? error : new Error(String(error));
-        worker.postMessage({ type: "audio-chunk", index, chunk: null, error: mixError.message });
+        worker.postMessage({
+          type: "audio-chunk",
+          runId,
+          index,
+          chunk: null,
+          error: mixError.message,
+        });
       }
     });
   };
@@ -278,11 +337,25 @@ function runInWorker(
   };
 
   // 心跳停了就再也没有消息能带上提示了（同步卡死，或者页面刚从后台回来），
-  // 所以主线程自己也定时看一眼，拿最后那条进度补一发
+  // 所以主线程自己也定时看一眼，拿最后那条进度补一发。
+  //
+  // 顺带它还是**唯一能自证"我们刚才根本没在看"的东西**：`visibilityState` 靠的是
+  // 收得到 `visibilitychange`，而被挂起的那一侧可能收不到（实测 iPhone 报出过
+  // "此刻可见、隐藏过 0 次"的死等，而那时页面确实不可见）。定时器的跳间隔不受这个
+  // 影响——被冻住时它不跳。所以一跳隔得太久就把"没推进"的计时重新起算，
+  // 别把挂起时长算成停滞。详见 `verify-device.ts` 的 `TICK_STARVED_MS`
+  let lastTick = performance.now();
   const stallTimer = setInterval(() => {
+    const now = performance.now();
+    const gap = now - lastTick;
+    lastTick = now;
+    if (gap > 15_000) {
+      lastAdvanceAt = now;
+      return;
+    }
     if (!lastProgress) return;
     if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
-    const stalledMs = performance.now() - lastAdvanceAt;
+    const stalledMs = now - lastAdvanceAt;
     if (stalledMs >= STALL_HINT_MS) onProgress({ ...lastProgress, stalledMs });
   }, 5_000);
 
@@ -302,7 +375,7 @@ function runInWorker(
    */
   const requestCancel = (): void => {
     if (settled) return;
-    worker.postMessage({ type: "cancel" } satisfies WorkerRequest);
+    worker.postMessage({ type: "cancel", runId } satisfies WorkerRequest);
     if (cancelGrace !== undefined) return;
     cancelGrace = setTimeout(() => {
       if (settled) return;
@@ -312,12 +385,23 @@ function runInWorker(
     }, CANCEL_GRACE_MS);
   };
 
+  /**
+   * 监听器**按次挂、按次摘**，不用 `worker.onmessage =`。
+   *
+   * 赋值式的单槽位在常驻 Worker 上是个静默陷阱：后开的一次会把先开那次的
+   * handler 顶掉，先开那次于是"再也收不到消息"，而它的判据是"多久没推进"——
+   * 结果把一次正在正常跑的导出报成死等。实测撞过（见 `activeRun` 的注释）。
+   * 现在同页并发已经在入口被拒，但监听器仍然按次隔离：那道锁靠的是我们自己
+   * 记的一个变量，而这一层不需要谁记对。
+   */
+  let detach = (): void => undefined;
+
   const promise = new Promise<ExportDone | null>((resolve, reject) => {
     rejectRun = reject;
-    // 每次导出重挂 handler：Worker 是复用的，上一次的闭包还挂着就会
-    // 把这一次的进度报给上一次的调用方
-    worker.onmessage = (event: MessageEvent<WorkerResponse>) => {
+    const onMessage = (event: MessageEvent<WorkerResponse>) => {
       const message = event.data;
+      // 不是这一次的消息一律丢掉，理由见 `protocol.ts` 的 `RunId`
+      if (message.runId !== runId) return;
       switch (message.type) {
         case "progress":
           noteProgress(message.progress);
@@ -345,24 +429,34 @@ function runInWorker(
       }
     };
 
-    worker.onerror = (event) => {
+    // 顶层错误没有 runId 可认（不是我们发的消息），但它意味着 Worker 整个不能再用，
+    // 所以归给此刻在跑的那一次就是对的
+    const onError = (event: ErrorEvent) => {
       if (settled) return;
       settled = true;
       // 这条是**没被捕获**的顶层错误，Worker 内部状态不可知，不能再用
       discardWorker(worker);
       reject(new Error(event.message || "导出 Worker 异常退出"));
     };
+
+    worker.addEventListener("message", onMessage);
+    worker.addEventListener("error", onError);
+    detach = () => {
+      worker.removeEventListener("message", onMessage);
+      worker.removeEventListener("error", onError);
+    };
   });
 
-  // Worker 跨导出存活，这两个定时器不能跟着活下去
+  // Worker 跨导出存活，这两个定时器和这对监听器都不能跟着活下去
   promise
     .finally(() => {
       clearInterval(stallTimer);
       clearTimeout(cancelGrace);
+      detach();
     })
     .catch(() => undefined);
 
-  const startMessage: WorkerRequest = { type: "start", request };
+  const startMessage: WorkerRequest = { type: "start", runId, request };
   worker.postMessage(startMessage);
   onReady(worker, requestCancel);
 

@@ -436,6 +436,32 @@ export async function runExport(
     throw error;
   } finally {
     clearInterval(heartbeat);
+    /**
+     * **编码器要在 finally 里关，不能只关成功那一路。**
+     *
+     * 原来 `videoSource.close()` / `audioSource.close()` 只在成功路径上；失败和取消
+     * 走的是 catch 里的 `output.cancel()`，而那个是否会关掉两个 source 内部的
+     * `VideoEncoder` / `AudioEncoder` 不在我们手里。这些是操作系统级资源，而 Worker
+     * **跨导出存活**——漏一次，下一次导出的余量就少一份。同"每个 `VideoFrame` 都必须
+     * `close()`"（硬规则 4）、`OfflineAudioContext` 要显式 `close()`（D22）、WebGL
+     * 上下文要复用（D15）：这类资源一律显式释放，不指望 GC。
+     *
+     * （查这条时曾拿"iPhone 上连着导第 2、3 次就 `Decoder failure`"当动机，**那个
+     * 读数已撤回**——它出自并行自检污染，见 PLAN.md §8 风险 4。这个 finally 仍然
+     * 该在：它修的是"失败路径上不释放"，而那与那批读数真不真无关。）
+     *
+     * `close()` 幂等：成功路径已经关过，这里再关一次是空操作。
+     */
+    try {
+      videoSource.close();
+    } catch {
+      // 已经关过 / 从没起来，都不该盖住真正的错误
+    }
+    try {
+      audioSource?.close();
+    } catch {
+      /* 同上 */
+    }
     // **刻意不 dispose 合成器**——它是常驻的，跨导出复用，见 `acquireCompositor`
     await Promise.all(readers.map(({ reader }) => reader.dispose()));
   }

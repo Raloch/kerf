@@ -508,7 +508,7 @@ export async function runDeviceReport(
  * （M0 自检里 10 秒 vs 40 秒），不等于"30 分钟真的跑得完"。这条阶梯就是来把外推
  * 换成实测的。
  */
-const LENGTH_LADDER: readonly { readonly label: string; readonly seconds: number }[] = [
+export const LENGTH_LADDER: readonly { readonly label: string; readonly seconds: number }[] = [
   { label: "30 秒", seconds: 30 },
   { label: "2 分钟", seconds: 120 },
   { label: "10 分钟", seconds: 600 },
@@ -576,7 +576,21 @@ export interface LengthReport {
  */
 export async function runLengthReport(
   onStep?: (message: string) => void,
-  options?: { readonly maxSeconds?: number },
+  options?: {
+    readonly maxSeconds?: number;
+    readonly onlySeconds?: number;
+    /** 同一档在同一个页面里连着导几次。量"一个页面能导几次"，见下面 `repeat`。 */
+    readonly repeat?: number;
+    /**
+     * 每跑完一档就回调一次，好让界面**边跑边显示**。
+     *
+     * 不然一整轮跑完才 `setLen` 一次：连导 8 次那种用法下，第 5 次卡住时前 4 次的
+     * 结果一个都看不到，人在手机前面只能盯着一行状态文字等 90 秒的空转超时。
+     * 更糟的是标签页真被系统杀掉时那些结果**全部丢掉**（只剩 localStorage 里那条
+     * "正在试第 N 次"）。
+     */
+    readonly onRung?: (result: LengthResult) => void;
+  },
 ): Promise<LengthReport> {
   const env = collectEnv();
   const diedAt = previousCrash();
@@ -602,10 +616,45 @@ export async function runLengthReport(
   const source = probe.source;
   const fps = source.fps.num / source.fps.den;
   const cap = options?.maxSeconds ?? Number.POSITIVE_INFINITY;
+  /**
+   * 只跑某一档。**这是为了把"跨档累积"和"这一档本身太长"分开。**
+   *
+   * 跑到第 N 档时，前 N−1 档的资源账已经背在身上了，所以"这一档本身超了"和
+   * "跨档累积"分不开。单档 + 新页面才是干净的那个变量。
+   *
+   * **别再拿"单档过、阶梯里同一档挂"当累积的证据**：那组对比里阶梯那次跑在被
+   * 并行自检污染的窗口里（同页两轮会互相掐断、并把对方判成死等，见 `client.ts`
+   * 的 `activeRun`）。两个仪器 bug 修掉之后这根轴还没有重跑过。
+   */
+  const only = options?.onlySeconds;
+  /**
+   * 把同一档**在同一个页面里连着导 N 次**。
+   *
+   * 这是为了把"次数"这个变量单独拎出来量，而**它已经给出答案了：次数不是墙。**
+   * iPhone 实测 30 秒档 8 次 × 3 轮 = **24 次连导全过**，吞吐 7.18–7.36× 死平
+   * （只有每轮第 1 次是冷启动的 6.0× 上下），混音 / 循环峰值恒定，一次劣化都没有。
+   *
+   * 这个按钮留着，因为它是**否掉一个假墙的那件仪器**：在此之前"整条阶梯第 2、3 次
+   * 就挂"看起来铁证如山，而那批读数其实出自并发污染（见 `client.ts` 的 `activeRun`）。
+   * 换新设备时先跑它，比跑整条阶梯便宜得多。
+   */
+  const repeat = Math.max(1, Math.floor(options?.repeat ?? 1));
+
+  // 先把要跑的档展开成一张平表（含重复），再单层循环。嵌一层内循环的话，
+  // "失败就中断整条阶梯"那个 break 只会跳出内层，接着往下跑——而那恰恰是不行的：
+  // 被判死等的那次导出只是被放弃、常驻 Worker 很可能还占着（见 `watchForStall`）
+  const plan = LENGTH_LADDER.filter(
+    (s) => (only === undefined || s.seconds === only) && s.seconds <= cap,
+  ).flatMap((s) =>
+    Array.from({ length: repeat }, (_, round) => ({
+      seconds: s.seconds,
+      // 重复时把轮次写进标签，否则结果表里几行一模一样，看不出是第几次挂的
+      label: repeat > 1 ? `${s.label} · 第 ${round + 1} 次` : s.label,
+    })),
+  );
 
   const rungs: LengthResult[] = [];
-  for (const step of LENGTH_LADDER) {
-    if (step.seconds > cap) break;
+  for (const step of plan) {
     const clips = Math.max(1, Math.round((step.seconds * fps) / LENGTH_CLIP_FRAMES));
     const frames = clips * LENGTH_CLIP_FRAMES;
     onStep?.(`导出 ${step.label}（${clips} 个片段 · ${frames} 帧）…`);
@@ -613,8 +662,9 @@ export async function runLengthReport(
     journal.attempting = `长片 ${step.label}`;
     writeJournal(journal);
 
-    const name = `kerf-length-${step.seconds}.mp4`;
+    const name = `kerf-length-${step.seconds}-${rungs.length}.mp4`;
     const started = performance.now();
+    let lastStepAt = 0;
     let result: LengthResult;
     try {
       await removeExportFile(name);
@@ -645,6 +695,20 @@ export async function runLengthReport(
             lastText =
               `${p.stage}/${p.marker ?? "?"} 第 ${p.encodedFrames}/${p.totalFrames} 帧` +
               (p.heartbeat ? "（心跳）" : "");
+            // **状态行必须跟着帧数走。** 第一版每档只在开跑前报一次，于是一个 4 分钟
+            // 的导出里那行字从头到尾一个样——人在手机前面看着就是"页面死了"，而它
+            // 明明在跑。节流 500ms，避免把 React 状态刷爆
+            const t = performance.now();
+            if (t - lastStepAt > 500) {
+              lastStepAt = t;
+              const pct = Math.round((p.encodedFrames / Math.max(1, p.totalFrames)) * 100);
+              const secs = (t - started) / 1000;
+              onStep?.(
+                `导出 ${step.label}：${p.encodedFrames}/${p.totalFrames} 帧（${pct}%）` +
+                  ` · 已 ${secs.toFixed(0)}s` +
+                  (secs > 1 ? ` · ${(p.encodedFrames / fps / secs).toFixed(1)}× 实时` : ""),
+              );
+            }
             if (now === seen) return;
             seen = now;
             lastAt = performance.now();
@@ -698,6 +762,7 @@ export async function runLengthReport(
     }
 
     rungs.push(result);
+    options?.onRung?.(result);
     journal.attempting = null;
     writeJournal(journal);
     // 一档没过就停。**死等那条路上这不是"省时间"而是必需的**：被判死等的那次导出
@@ -736,6 +801,28 @@ export async function runLengthReport(
 const STALL_TIMEOUT_MS = 90_000;
 
 /**
+ * 一跳之间隔了多久就认为**定时器自己没在跑**（毫秒，看门狗每 1000ms 一跳）。
+ *
+ * **这是把"量法"和"被测对象"分开的那一刀。** 看门狗的判据是"多久没有推进"，
+ * 算法是 `now − 最后一次进度的时刻`——而那个差值在**页面被挂起**时同样会涨，
+ * 涨的还是挂起的时长。于是"iOS 真的卡死"和"手机锁屏了 / 你切去了另一个标签"
+ * 算出来一模一样，两者都报"死等 90 秒"。
+ *
+ * 原来指望 `visibilitychange` 区分，但那个事件**在被挂起的那一侧根本可能收不到**：
+ * 实测 iPhone 上报出过"此刻页面可见、期间隐藏过 0 次"的死等，而同一时刻另一个
+ * 标签正在跑导出——页面显然是不可见的，只是那条事件在 JS 被冻住时没送达，回到
+ * 前台时也只补了个"变回可见"，而我的计数器只数"变成不可见"。
+ *
+ * 定时器的**跳间隔**不受这个影响：JS 被冻住时它不跳，而这个事实是自证的。所以
+ * 一跳超过这个阈值就判"刚才被挂起了"，把空闲计时**从此刻重新开始**，并把挂起
+ * 次数和总时长报出来。宁可漏报也不误报——真卡死是 0% CPU、定时器照跳。
+ *
+ * 3 秒：1 秒的定时器抖到 3 秒不是抖动。主线程混音时确实可能卡住一两秒，
+ * 那种情况下重置计时只会让看门狗更保守。
+ */
+const TICK_STARVED_MS = 3_000;
+
+/**
  * 把"死等"变成一条读数。
  *
  * 长片这根轴上最坏的失败形态不是崩溃而是**死等**：0% CPU、几百 MB 常驻、不抛错、
@@ -754,6 +841,20 @@ const STALL_TIMEOUT_MS = 90_000;
  * 超时之后那次导出**只是被放弃，不保证真的停下**（`cancel()` 发过去也可能没人收）。
  * 常驻 Worker 的 `running` 标志因此可能一直是 true，下一档会直接被"已有导出任务在
  * 进行中"顶掉——所以调用方在这一档失败后必须**中断整条阶梯**，不能接着往下跑。
+ *
+ * ## 必须同时报"页面当时可不可见"
+ *
+ * 浏览器把不可见的页面挂起时，表现和真卡死**一模一样**：进度不动、心跳也不来。
+ * 而这在手机上极其容易发生——自动锁屏就够了。iPhone 实测撞过一次：30 秒档连过两遍
+ * （各 22 秒，短到锁屏之前就结束），换成要跑两分钟的一轮立刻报"死等"。
+ *
+ * 产品侧那个提示会 gate 在 `visibilityState` 上（不可见时停住是正常的，见
+ * `client.ts` 的 `STALL_HINT_MS`）；自检这边**不 gate 而是照报**——"它在页面被挂起时
+ * 停住了"本身就是一条有用的读数，把它悄悄忽略掉会让阶梯一直卡在同一档而没有解释。
+ * 但**必须把可见性一起印出来**，否则"iOS 真的卡死"和"你把手机锁了"分不开。
+ *
+ * **而可见性这个判据本身不够**——它靠的是收得到 `visibilitychange`，而被挂起的那一侧
+ * 恰恰可能收不到。真正自证的是**定时器的跳间隔**，见 `TICK_STARVED_MS`。
  */
 function watchForStall(
   handle: ExportHandle,
@@ -761,19 +862,53 @@ function watchForStall(
 ): Promise<ExportDone | null> {
   return new Promise((resolve, reject) => {
     let settled = false;
+    // 期间隐藏过几次 + 此刻可不可见。两个都要：停住的那一刻可能已经切回来了，
+    // 只看"此刻"会把锁屏那一路判成"一直可见"
+    let hiddenCount = 0;
+    const onVisibility = () => {
+      if (document.visibilityState !== "visible") hiddenCount++;
+    };
+    document.addEventListener("visibilitychange", onVisibility);
     const finish = (run: () => void) => {
       if (settled) return;
       settled = true;
       clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
       run();
     };
+    // 定时器上一跳的时刻，以及"最近一次从挂起里恢复"的时刻。空闲时长从两者里
+    // 较晚的那个起算——挂起期间不算没有推进，理由见 `TICK_STARVED_MS`
+    let lastTick = performance.now();
+    let resumedAt = performance.now();
+    let starvedCount = 0;
+    let starvedMs = 0;
     const timer = setInterval(() => {
+      const now = performance.now();
+      const gap = now - lastTick;
+      lastTick = now;
+      if (gap > TICK_STARVED_MS) {
+        starvedCount++;
+        starvedMs += gap;
+        resumedAt = now;
+        return;
+      }
       const { at, text } = probe();
-      const idleMs = performance.now() - at;
+      const idleMs = now - Math.max(at, resumedAt);
       if (idleMs < STALL_TIMEOUT_MS) return;
+      const visible = document.visibilityState === "visible";
       finish(() => {
         handle.cancel();
-        reject(new Error(`死等：${Math.round(idleMs / 1000)} 秒没有任何进度，最后停在 ${text}`));
+        reject(
+          new Error(
+            `死等：${Math.round(idleMs / 1000)} 秒没有任何进度，最后停在 ${text}` +
+              `（此刻页面${visible ? "可见" : "不可见"}，期间隐藏过 ${hiddenCount} 次` +
+              `${hiddenCount > 0 ? "——锁屏/切走会让浏览器挂起页面，那和卡死长得一样" : ""}` +
+              // 这一段是"量法自证"：看门狗的定时器一共被冻住过几次、多久。
+              // 全是 0 才说明这 90 秒里我们一直在看着，读数才算干净
+              `；看门狗被冻住 ${starvedCount} 次、共 ${(starvedMs / 1000).toFixed(1)} 秒` +
+              `${starvedCount > 0 ? "——空闲计时已从最后一次恢复起重算" : ""}）`,
+          ),
+        );
       });
     }, 1000);
     handle.done.then(

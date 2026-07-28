@@ -159,27 +159,36 @@ async function runMeasurement(config: AudioEncoderConfig): Promise<EncoderDelay>
   });
   encoder.configure(config);
 
-  const STEP = 1024;
-  for (let offset = 0; offset < PROBE_FRAMES; offset += STEP) {
-    const length = Math.min(STEP, PROBE_FRAMES - offset);
-    // f32-planar：各声道依次排列，每个声道都喂同一份噪声
-    const data = new Float32Array(length * channels);
-    for (let ch = 0; ch < channels; ch++) {
-      data.set(reference.subarray(offset, offset + length), ch * length);
+  // **关在 finally 里，不能只关成功那一路。** `flush()` 正是异步编码错误的出口
+  // （上面的 `error` 回调刻意不吞），所以"抛了"是这里的常规路径之一；而 WebCodecs
+  // 的编码器是操作系统级资源，漏一个就少一份预算。这个探针**每次导出都跑一遍**，
+  // 于是一次失败的导出会让下一次的余量更少——同"每个 VideoFrame 都必须 close"
+  // （硬规则 4）、`OfflineAudioContext` 要显式 `close()`（D22）、WebGL 上下文要复用
+  // （D15）是同一条：这类资源一律显式释放，不指望 GC。
+  try {
+    const STEP = 1024;
+    for (let offset = 0; offset < PROBE_FRAMES; offset += STEP) {
+      const length = Math.min(STEP, PROBE_FRAMES - offset);
+      // f32-planar：各声道依次排列，每个声道都喂同一份噪声
+      const data = new Float32Array(length * channels);
+      for (let ch = 0; ch < channels; ch++) {
+        data.set(reference.subarray(offset, offset + length), ch * length);
+      }
+      const audioData = new AudioData({
+        format: "f32-planar",
+        sampleRate: config.sampleRate,
+        numberOfFrames: length,
+        numberOfChannels: channels,
+        timestamp: Math.round((offset / config.sampleRate) * 1e6),
+        data,
+      });
+      encoder.encode(audioData);
+      audioData.close();
     }
-    const audioData = new AudioData({
-      format: "f32-planar",
-      sampleRate: config.sampleRate,
-      numberOfFrames: length,
-      numberOfChannels: channels,
-      timestamp: Math.round((offset / config.sampleRate) * 1e6),
-      data,
-    });
-    encoder.encode(audioData);
-    audioData.close();
+    await encoder.flush();
+  } finally {
+    if (encoder.state !== "closed") encoder.close();
   }
-  await encoder.flush();
-  encoder.close();
 
   const first = packets[0];
   if (!first?.config) {
@@ -198,10 +207,15 @@ async function runMeasurement(config: AudioEncoderConfig): Promise<EncoderDelay>
     },
     error: () => undefined,
   });
-  decoder.configure(first.config);
-  for (const { chunk } of packets) decoder.decode(chunk);
-  await decoder.flush();
-  decoder.close();
+  // 同上：`configure` 会因为配置不受支持而抛，`flush` 会把异步解码错误抛出来，
+  // 两条都必须走到 close
+  try {
+    decoder.configure(first.config);
+    for (const { chunk } of packets) decoder.decode(chunk);
+    await decoder.flush();
+  } finally {
+    if (decoder.state !== "closed") decoder.close();
+  }
 
   const decoded = new Float32Array(decodedFrames);
   let cursor = 0;

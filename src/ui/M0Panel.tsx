@@ -21,7 +21,13 @@ import type { VerifyResult } from "../dev/verify-m0";
 import type { PreviewVerifyResult } from "../dev/verify-preview";
 import type { TimelineVerifyResult } from "../dev/verify-timeline";
 import type { PixiVerifyResult } from "../dev/verify-pixi";
-import type { DeviceReport, LengthReport } from "../dev/verify-device";
+// 这一条是**值的**静态 import，而 `verify-device.ts` 顶层 import 了 mediabunny。
+// 之所以没把那 500KB 拖进主 chunk：那个模块只定义函数和常量、没有顶层副作用，
+// 于是 Rollup 把 mediabunny 摇掉了——**实测确认过**（主 chunk 前后逐字节相同，
+// 判断方法见 CLAUDE.md「首屏体积」）。给 `verify-device.ts` 加任何顶层副作用都会
+// 让这条失效，那时把 LENGTH_LADDER 挪进一个不碰 mediabunny 的小模块。
+import { LENGTH_LADDER } from "../dev/verify-device";
+import type { DeviceReport, LengthReport, LengthResult } from "../dev/verify-device";
 
 type Status =
   | { kind: "idle" }
@@ -43,6 +49,14 @@ export function M0Panel({ onBack }: { readonly onBack: () => void }) {
   const [px, setPx] = useState<PixiVerifyResult | null>(null);
   const [dev, setDev] = useState<DeviceReport | null>(null);
   const [len, setLen] = useState<LengthReport | null>(null);
+  /**
+   * 已经跑完的档，**边跑边攒**。
+   *
+   * 和 `len` 分开：`len` 要等整轮返回才有，而"连导 N 次"这种用法下第 N 次卡住时，
+   * 前 N−1 次的结果必须已经在屏幕上——不然人只能盯着一行状态文字等 90 秒空转超时，
+   * 标签页真被系统杀掉时那些结果还会全部丢掉。
+   */
+  const [lenRows, setLenRows] = useState<LengthResult[]>([]);
   const [devStep, setDevStep] = useState<string>("");
   const [devCrash, setDevCrash] = useState<string | null>(null);
   const handleRef = useRef<ExportHandle | null>(null);
@@ -184,21 +198,50 @@ export function M0Panel({ onBack }: { readonly onBack: () => void }) {
     }
   }, []);
 
-  const runLength = useCallback(async () => {
+  /**
+   * `onlySeconds` 只跑那一档。
+   *
+   * **单档不是"图快"的选项，是唯一干净的那个变量。** 整条阶梯从头跑起时，跑到第 N 档
+   * 已经背着前 N−1 档的资源账，于是"这一档本身扛不扛得住"问不出来。
+   *
+   * 曾拿"单独跑 10 分钟通过、阶梯里同一档 7.6 秒就 `Decoder failure`"当这条的实证，
+   * **那个对比不作数**：阶梯那次跑在被并行自检污染的窗口里（见 `client.ts` 的
+   * `activeRun`）。理由仍然成立，证据要重新取。
+   */
+  const runLength = useCallback(async (onlySeconds?: number, repeat?: number) => {
     setLen(null);
+    setLenRows([]);
     setDevStep("");
-    setStatus({ kind: "busy", label: "长片自检：最后一档 30 分钟，整轮可能十几分钟…" });
+    setStatus({
+      kind: "busy",
+      label: repeat
+        ? `连导 ${repeat} 次（量一个页面能导几次）——别切走也别锁屏`
+        : onlySeconds
+          ? `长片自检：只跑这一档，别切走也别锁屏`
+          : "长片自检：最后一档 30 分钟，整轮可能十几分钟…",
+    });
     try {
       const { runLengthReport } = await import("../dev/verify-device");
-      const report = await runLengthReport(setDevStep);
+      const report = await runLengthReport(setDevStep, {
+        ...(onlySeconds !== undefined ? { onlySeconds } : {}),
+        ...(repeat !== undefined ? { repeat } : {}),
+        // 边跑边显示：卡在第 N 次时，前 N−1 次的结果必须已经在屏幕上了
+        onRung: (r) => setLenRows((prev) => [...prev, r]),
+      });
       setLen(report);
       setDevCrash(report.diedAt);
+      // 手点的也发回 `.reports/`。屏幕上这份会被截图截断，而要看的恰恰是被截掉的
+      // 那些诊断字段（停在哪一步、看门狗被冻住几次）。见 `postManualReport`
+      void (await import("../dev/autorun")).postManualReport("length", report);
       setStatus({
         kind: "done",
         text: `长片自检跑完：最长跑通 ${report.maxLength ?? "无"} · 混音峰值倍率 ${report.mixPeakRatio?.toFixed(2) ?? "?"}`,
       });
     } catch (error) {
-      setStatus({ kind: "error", text: error instanceof Error ? error.message : String(error) });
+      const text = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+      setStatus({ kind: "error", text });
+      // 整轮没跑起来（不是某一档失败——那个由报告自己记）时更要留下痕迹
+      void (await import("../dev/autorun")).postManualReport("length", { error: text });
     } finally {
       setDevStep("");
     }
@@ -620,7 +663,71 @@ export function M0Panel({ onBack }: { readonly onBack: () => void }) {
         >
           运行长片自检（十几分钟）
         </button>
+        {/* 单档按钮：整条阶梯跑到第 N 档时已经背着前 N−1 档的资源账，要问"这一档
+            本身扛不扛得住"只能这么问。**一台设备上同时只许跑一轮**——同页并发会
+            互相掐断并把对方判成死等（现在会明确报错，见 client.ts 的 activeRun），
+            那正是"移动端的墙是导出次数"这个假结论的来源 */}
+        <p className="hint" style={{ margin: "8px 0 4px" }}>
+          只跑一档（<b>一台设备同时只跑一轮</b>——别在另一个标签里也开着 <code>?autorun=</code>）：
+        </p>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {LENGTH_LADDER.map((s) => (
+            <button
+              key={s.seconds}
+              type="button"
+              onClick={() => void runLength(s.seconds)}
+              disabled={exporting || status.kind === "busy"}
+            >
+              {s.label}
+            </button>
+          ))}
+        </div>
+        {/* 连导 N 次：把"次数"这个变量单独拎出来量。**它已经给出答案了**——iPhone
+            上 24 次连导（8 × 3 轮）全过、吞吐死平，次数不是墙；在此之前"第 2、3 次
+            就挂"看着像铁证，实为并发污染。留着是因为它便宜，换设备时先跑它 */}
+        <p className="hint" style={{ margin: "8px 0 4px" }}>
+          同一页里<b>连着导多次</b>（iPhone 实测 24 次全过、吞吐死平，30 秒一档约 5 秒）：
+        </p>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {[3, 8].map((n) => (
+            <button
+              key={n}
+              type="button"
+              onClick={() => void runLength(30, n)}
+              disabled={exporting || status.kind === "busy"}
+            >
+              30 秒 × {n}
+            </button>
+          ))}
+          <button
+            type="button"
+            onClick={() => void runLength(120, 5)}
+            disabled={exporting || status.kind === "busy"}
+          >
+            2 分钟 × 5
+          </button>
+        </div>
         {devStep && <p className="hint mono" style={{ margin: "8px 0 0" }}>{devStep}</p>}
+
+        {/* 跑的过程中就把已完成的档显示出来。卡住那一次之前的结果必须看得见——
+            等整轮返回才显示的话，标签页被系统杀掉时它们会全部丢掉 */}
+        {lenRows.length > 0 && !len && (
+          <table className="checks" style={{ marginTop: 8 }}>
+            <tbody>
+              {lenRows.map((r, i) => (
+                <tr key={i} className={r.ok ? "ok" : "bad"}>
+                  <td>{r.ok ? "✓" : "✕"}</td>
+                  <td>{r.label}</td>
+                  <td className="mono">
+                    {r.ok
+                      ? `${(r.elapsedMs / 1000).toFixed(1)}s · ${r.realtime.toFixed(2)}× 实时 · ${r.decoded}`
+                      : r.note}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
 
         {len && (
           <>

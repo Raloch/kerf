@@ -160,8 +160,27 @@ export interface ExportPlan {
   readonly totalFrames: number;
 }
 
+/**
+ * 这一条消息属于哪一次导出。
+ *
+ * **Worker 是跨导出常驻的**（合成器住在里面，见 `client.ts`），于是"这条消息是
+ * 这一次的还是上一次的"不再由 Worker 的生命周期免费保证。不带这个号会静默串线，
+ * 实测撞过一次：同一页里两次 `runLengthReport` 并行跑（一个来自 `?autorun=`、
+ * 一个是手点的），**A 的死等看门狗发出的 `cancel` 掐掉了 B 正在跑的那次导出**
+ * ——B 那一档报"导出被取消"，而 B 自己谁也没取消；同时 A 因为
+ * `worker.onmessage` 被 B 覆盖而再也收不到进度，90 秒后把一次**正在正常推进**
+ * 的导出判成死等。两份读数全是假的，而两边都不抛错。
+ *
+ * 所以：`cancel` / `audio-chunk` 认号，不认号的一律忽略；响应也带号，让主线程
+ * 能把别人的消息丢掉。`release` 不带——它不属于任何一次导出。
+ *
+ * 真正拦住并发的是 `client.ts` 里那道同页互斥，这个号是第二道：互斥挡不住
+ * "上一次被放弃、它的 cancel 迟到"这种跨时间的串线。
+ */
+export type RunId = number;
+
 export type WorkerRequest =
-  | { readonly type: "start"; readonly request: ExportRequest }
+  | { readonly type: "start"; readonly runId: RunId; readonly request: ExportRequest }
   /**
    * 应答一次 `audio-pull`。`chunk` 为 null 表示**没有更多段了**。
    *
@@ -170,6 +189,7 @@ export type WorkerRequest =
    */
   | {
       readonly type: "audio-chunk";
+      readonly runId: RunId;
       /**
        * 应答的是哪一次 `audio-pull`。
        *
@@ -181,7 +201,7 @@ export type WorkerRequest =
       readonly chunk: MixChunk | null;
       readonly error?: string;
     }
-  | { readonly type: "cancel" }
+  | { readonly type: "cancel"; readonly runId: RunId }
   /**
    * 放掉常驻资源（合成器画布），但**不结束 Worker**。
    *
@@ -193,9 +213,9 @@ export type WorkerRequest =
   | { readonly type: "release" };
 
 export type WorkerResponse =
-  | { readonly type: "progress"; readonly progress: ExportProgress }
+  | { readonly type: "progress"; readonly runId: RunId; readonly progress: ExportProgress }
   /** 要第 `index` 段 PCM。主线程按序应答一条 `audio-chunk`。 */
-  | { readonly type: "audio-pull"; readonly index: number }
-  | { readonly type: "done"; readonly result: ExportDone }
-  | { readonly type: "error"; readonly message: string }
-  | { readonly type: "canceled" };
+  | { readonly type: "audio-pull"; readonly runId: RunId; readonly index: number }
+  | { readonly type: "done"; readonly runId: RunId; readonly result: ExportDone }
+  | { readonly type: "error"; readonly runId: RunId; readonly message: string }
+  | { readonly type: "canceled"; readonly runId: RunId };
