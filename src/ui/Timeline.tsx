@@ -17,11 +17,30 @@ import { toNumber } from "../time/rational";
 import { useTimeline } from "../state/timeline-store";
 import { ghostForTrack, useClipDrag, type ClipDragApi, type Ghost } from "./use-clip-drag";
 import { buildStrip, cachedStrip, drawStrip } from "../media/thumbnails";
+import {
+  buildWaveform,
+  cachedWaveform,
+  drawVolumeEnvelope,
+  drawWaveform,
+  waveformSettled,
+} from "../media/waveform";
 import { proxyManager } from "../media/proxy-client";
+import { resolveVolume } from "../anim/keyframes";
+import { PROPERTY_RANGES } from "../state/operations";
 import { IconCut, IconEye, IconFilm, IconLock, IconMagnet, IconMute, IconPlus, IconText, IconTrash, IconVolume, IconWave } from "./icons";
 
 /** 片段内缩略图条高度，与 .strip 的 CSS 保持一致。 */
 const STRIP_HEIGHT = 32;
+/** 片段内波形高度，与 .wave 的 CSS 保持一致。 */
+const WAVE_HEIGHT = 30;
+/**
+ * 波形和包络的颜色。写成常量而不是从 CSS 变量读：canvas 里没有 `currentColor`，
+ * 读 CSS 变量要每次重绘 `getComputedStyle`（那是一次强制布局）。界面是单一深色
+ * 主题（design/ 里的稿子已定稿），所以这里不需要跟着主题变。
+ */
+const WAVE_COLOR = "rgba(150, 235, 190, 0.55)";
+const ENVELOPE_COLOR = "rgba(255, 214, 102, 0.95)";
+const ENVELOPE_REF_COLOR = "rgba(255, 255, 255, 0.18)";
 
 /** 缩放滑块的取值范围（每帧像素数 × 100）。 */
 const ZOOM_MIN = 8;
@@ -388,6 +407,11 @@ function ClipView({
   const length = clipDuration(clip);
   const widthPx = length * pxPerFrame;
   const stripRef = useRef<HTMLCanvasElement>(null);
+  const waveRef = useRef<HTMLCanvasElement>(null);
+  // 拆成两个标量再进依赖数组：直接依赖 `clip` 会让每次任何编辑都重画所有波形
+  const volumeBase = clip.kind === "media" ? clip.volume : undefined;
+  const keyframes = clip.keyframes;
+  const hasVolume = volumeBase !== undefined || (keyframes?.volume?.length ?? 0) > 0;
 
   // 缩略图只画素材片段，且只在代理就绪后——从原片抽帧比转一遍代理还慢
   useEffect(() => {
@@ -435,6 +459,72 @@ function ClipView({
     };
   }, [sourceInFrame, kind, length, proxyUrl, pxPerFrame, source, widthPx]);
 
+  // 波形只画音频轨上的素材片段。**解原片而不是代理**（代理丢掉了音轨），所以
+  // 不必等代理就绪；解不出来时缓存记 null，不会每次重绘都重试
+  useEffect(() => {
+    if (kind !== "audio" || !source || clip.kind !== "media") return;
+    const canvas = waveRef.current;
+    if (!canvas || widthPx < 8) return;
+
+    let cancelled = false;
+    const paint = (wave: ReturnType<typeof cachedWaveform>) => {
+      if (cancelled) return;
+      const dpr = Math.min(2, window.devicePixelRatio || 1);
+      canvas.width = Math.max(1, Math.round(widthPx * dpr));
+      canvas.height = Math.round(WAVE_HEIGHT * dpr);
+      canvas.style.height = `${WAVE_HEIGHT}px`;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.scale(dpr, dpr);
+      ctx.clearRect(0, 0, widthPx, WAVE_HEIGHT);
+
+      if (wave) {
+        drawWaveform(ctx, wave, {
+          widthPx,
+          heightPx: WAVE_HEIGHT,
+          // 源片时刻按**源片自己的帧率**换算；时间轴帧率换算的是片段有多长
+          sourceInSeconds: sourceInFrame / toNumber(source.fps),
+          lengthSeconds: length / toNumber(timeline.fps),
+          color: WAVE_COLOR,
+        });
+      }
+      // 恒等音量不画线——每个片段都横一条毫无信息的线，反而看不出哪个调过
+      if (hasVolume) {
+        drawVolumeEnvelope(ctx, {
+          widthPx,
+          heightPx: WAVE_HEIGHT,
+          lengthFrames: length,
+          maxValue: PROPERTY_RANGES.volume.max,
+          valueAt: (offset) => resolveVolume(volumeBase, keyframes, offset) ?? 1,
+          color: ENVELOPE_COLOR,
+          referenceColor: ENVELOPE_REF_COLOR,
+        });
+      }
+    };
+
+    if (waveformSettled(source.id)) {
+      paint(cachedWaveform(source.id));
+      return () => {
+        cancelled = true;
+      };
+    }
+    void buildWaveform(source.id, source.file).then(paint).catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    clip.kind,
+    hasVolume,
+    keyframes,
+    kind,
+    length,
+    source,
+    sourceInFrame,
+    timeline.fps,
+    volumeBase,
+    widthPx,
+  ]);
+
   return (
     <div
       className="clip"
@@ -465,6 +555,7 @@ function ClipView({
       }}
     >
       {kind === "video" && !isText && <canvas className="strip" ref={stripRef} />}
+      {kind === "audio" && !isText && <canvas className="wave" ref={waveRef} />}
       <span className="lbl">
         {isText ? <IconText /> : kind === "video" ? <IconFilm /> : <IconWave />}
         {label}

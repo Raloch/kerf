@@ -1152,6 +1152,17 @@
   opacity: 0.92;
 }
 
+/* 波形条。和 .strip 一样贴在片段底部、不吃指针事件（否则挡住拖拽和裁切手柄）。
+   高度与 Timeline.tsx 的 WAVE_HEIGHT 一致——两处不一致会让波形被裁掉一截 */
+.ed .clip .wave {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: 100%;
+  display: block;
+  pointer-events: none;
+}
+
 /* ---------- 代理状态徽标 ---------- */
 .ed .px {
   display: inline-flex;
