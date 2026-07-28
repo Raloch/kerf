@@ -16,9 +16,11 @@
 
 import {
   ANIMATABLE_PROPERTIES,
+  AUDIO_PROPERTIES,
   COLOR_PROPERTIES,
   TRANSFORM_PROPERTIES,
   type AnimatableProperty,
+  type AudioProperty,
   type ColorProperty,
   type Easing,
   type Keyframe,
@@ -486,6 +488,7 @@ export const PROPERTY_LABELS: Record<AnimatableProperty, string> = {
   saturation: "饱和度",
   hue: "色相",
   lutIntensity: "LUT 强度",
+  volume: "音量",
 };
 
 export interface PropertyRange {
@@ -529,20 +532,17 @@ export const PROPERTY_RANGES: Record<AnimatableProperty, PropertyRange> = {
   // LUT 强度：0 = 不套，1 = 完全套用。上限就是 1——外插一张查找表没有意义，
   // 那不是"更强的看"，只是把颜色推出色域
   lutIntensity: { fallback: 1, min: 0, max: 1 },
+
+  // 音量倍数，1 = 原样、0 = 静音。上限 2（约 +6dB）：再往上几乎必然削波，而
+  // Web Audio 到编码器那一步是**硬截断、不抛错**，用户听到的只是"声音变糊了"
+  volume: { fallback: 1, min: 0, max: 2 },
 };
 
 /**
- * 片段音量的缺省值与取值范围。
- *
- * **刻意不在 `PROPERTY_RANGES` 里**：那张表键在 `AnimatableProperty` 上，而音量
- * 这一轮只有静态值、还不能打关键帧。做包络时把 `volume` 加进 `ANIMATABLE_PROPERTIES`，
- * 这条常量就搬进那张表里（届时这里删掉，编译器会指着 `setClipVolume` 要求改）。
- *
- * 上限 2（约 +6dB）而不是更高：再往上几乎必然削波，而 Web Audio 到编码器那一步
- * 是**硬截断、不抛错**，用户听到的只是"声音变糊了"，查不到原因。下限 0 就是静音，
- * 和轨道级的 `muted` 不冲突——那个是"整条轨不参与混音"，这个是这一段的高低。
+ * 片段音量的范围。`PROPERTY_RANGES.volume` 的别名，留着是为了**调用点读起来是
+ * "音量的范围"而不是"从一张大表里按名字取"**——检查器和编辑入口都只关心这一项。
  */
-export const VOLUME_RANGE: PropertyRange = { fallback: 1, min: 0, max: 2 };
+export const VOLUME_RANGE: PropertyRange = PROPERTY_RANGES.volume;
 
 /** 变换补丁：给数值就设，显式给 `undefined` 就**删掉**这个属性（回到缺省）。 */
 export type TransformPatch = {
@@ -639,6 +639,26 @@ const applyColorPatch = (
  */
 export function isColorProperty(property: AnimatableProperty): property is ColorProperty {
   return (COLOR_PROPERTIES as readonly AnimatableProperty[]).includes(property);
+}
+
+/** 这个属性作用到声音。判据同上，是 `AUDIO_PROPERTIES` 那份名单本身。 */
+export function isAudioProperty(property: AnimatableProperty): property is AudioProperty {
+  return (AUDIO_PROPERTIES as readonly AnimatableProperty[]).includes(property);
+}
+
+/**
+ * 这个属性的**静态值**（没有关键帧时生效的那个），取不到就返回 `undefined`。
+ *
+ * 三组的静态值存在三个地方：`clip.transform` / `clip.color` 是对象，`clip.volume`
+ * 是标量。**这个"存在哪儿"的判断只能有一处**——检查器要显示它、`clearKeyframes`
+ * 要往回烘、将来的曲线编辑器也要读它，三处各写一遍 `isColorProperty ? … : …`
+ * 就一定会在加第三组时漏掉一处，而漏掉的表现是"关掉动画之后这个属性的值丢了"
+ * 或者"输入框显示缺省值而画面/声音不是"。都不报错。
+ */
+export function staticValueOf(clip: Clip, property: AnimatableProperty): number | undefined {
+  if (isAudioProperty(property)) return clip.kind === "media" ? clip.volume : undefined;
+  const group = isColorProperty(property) ? clip.color : clip.transform;
+  return (group as Record<string, number | undefined> | undefined)?.[property];
 }
 
 /**
@@ -931,6 +951,11 @@ export function setKeyframe(
   const found = findClip(timeline, clipId);
   if (!found) return reject(timeline, `找不到片段 ${clipId}`);
   if (found.track.locked) return reject(timeline, "轨道已锁定");
+  // 关键帧通道挂在 `ClipBase` 上（三组共用一张表，见 keyframes.ts），所以类型上
+  // 拦不住"给文字片段打一条音量曲线"。那条曲线永远不会被求值——文字片段没有音轨
+  if (isAudioProperty(property) && found.clip.kind !== "media") {
+    return reject(timeline, "文字片段没有音量");
+  }
 
   const clamped = clampProperty(property, value);
   const series = found.clip.keyframes?.[property] ?? [];
@@ -986,7 +1011,13 @@ export function clearKeyframes(
     // 烘到哪一组由属性自己决定。写死成 transform 的话，关掉「亮度」的动画会把
     // `brightness` 塞进 LayerTransform——合成器不认识那个字段，也不会报错，
     // 表现是"关掉动画之后调色整个丢了"
-    if (isColorProperty(property)) {
+    if (isAudioProperty(property)) {
+      // 音量的静态值是片段上的标量，没有"一组"可以归一化，所以自己夹紧 + 判缺省
+      if (next.kind !== "media") return reject(timeline, "文字片段没有音量");
+      const clamped = clampProperty(property, bakeValue);
+      const keep = clamped === PROPERTY_RANGES[property].fallback ? undefined : clamped;
+      next = setOptional(next, property, keep);
+    } else if (isColorProperty(property)) {
       const baked = applyColorPatch(next.color, { [property]: bakeValue });
       if (!baked.ok) return reject(timeline, baked.reason);
       next = setOptional(next, "color", baked.value);

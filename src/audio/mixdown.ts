@@ -612,17 +612,43 @@ function releaseContext(ctx: OfflineAudioContext): void {
  * 一个节点**：静态音量是个常数，把它乘进起始值和每条曲线的采样点上就是精确的
  * 合成，没有第二次浮点舍入。串两个 `GainNode` 也对，但那样"没调音量"的项目就
  * 多穿了一级恒等节点，上面那条逐样本一致的保证要靠"第二级也走快路径"来维持，
- * 判据从一个变成两个。**音量做成包络（关键帧）之后这条会变**：两条随时间变化的
- * 曲线相乘就不再是常数缩放，届时要么把乘积采样成一条曲线，要么真的串两级。
+ * 判据从一个变成两个。
+ *
+ * **音量打了关键帧时仍然只穿一个节点**，因为排期那边已经把淡化 × 包络逐帧乘成了
+ * 一条 `gainCurve`（理由见 `mix-plan.ts` 的 `AudioJob.gainCurve`）。这里的分支只是
+ * "有合成曲线就只喂它"——同一段时间上喂两条 `setValueCurveAtTime` 会抛错，而
+ * 那条曲线里已经含着淡化了，再喂一遍 `ramps` 等于把淡化乘两次。
  *
  * 两段包络可以直接顺序喂给同一个 `AudioParam`：D19 保证一个片段两侧的转场窗口
  * **永不重叠**（每个片段最多借出自己长度的一半），所以 `setValueCurveAtTime`
  * 不会撞上"曲线区间重叠"那个抛错。这条结构性保证在这里第二次收到回报。
  */
 function envelopeInput(ctx: OfflineAudioContext, job: AudioJob): AudioNode {
-  if (job.ramps.length === 0 && job.baseGain === 1 && job.volume === 1) return ctx.destination;
+  if (
+    job.ramps.length === 0 &&
+    job.baseGain === 1 &&
+    job.volume === 1 &&
+    job.gainCurve === undefined
+  ) {
+    return ctx.destination;
+  }
 
   const gain = ctx.createGain();
+
+  // 音量有包络时排期已经把淡化和音量乘成了一条曲线（见 `AudioJob.gainCurve`），
+  // 这时**不能再喂 ramps**：同一段时间上两条 `setValueCurveAtTime` 会直接抛错，
+  // 而且那条曲线里已经含着淡化了，再喂一遍等于乘两次
+  const curve = job.gainCurve;
+  if (curve) {
+    gain.gain.setValueCurveAtTime(
+      new Float32Array(curve.points),
+      curve.startSeconds,
+      curve.durationSeconds,
+    );
+    gain.connect(ctx.destination);
+    return gain;
+  }
+
   gain.gain.setValueAtTime(job.baseGain * job.volume, 0);
   for (const ramp of job.ramps) {
     const curve = crossfadeCurve(

@@ -174,6 +174,101 @@ describe("片段音量", () => {
   });
 });
 
+describe("音量包络", () => {
+  /** 给片段挂一条音量关键帧曲线。`points` 是 [片段内帧偏移, 值] 对。 */
+  const animate = (base: Timeline, id: string, points: [number, number][]): Timeline => {
+    const track = base.tracks[0]!;
+    return {
+      ...base,
+      tracks: [
+        {
+          ...track,
+          clips: track.clips.map((c) =>
+            c.id === id
+              ? { ...c, keyframes: { volume: points.map(([frame, value]) => ({ frame, value })) } }
+              : c,
+          ),
+        },
+      ],
+    };
+  };
+
+  const plain = () => timeline([clip("a", 0, 100, 200), clip("b", 100, 200, 500)]);
+
+  it("没打关键帧时根本没有 gainCurve 字段", () => {
+    // `envelopeInput` 判的就是这个字段有没有，留个空对象会让所有片段都走曲线分支
+    const job = jobOf(planAudioJobs(plain(), FULL), "a");
+    expect("gainCurve" in job).toBe(false);
+  });
+
+  it("每帧一个采样点，首尾各一个", () => {
+    const job = jobOf(planAudioJobs(animate(plain(), "a", [[0, 1], [99, 0]]), FULL), "a");
+    // 片段占位 [0,100)，解码区间 [0,100) → 101 个点（含两端）
+    expect(job.gainCurve?.points).toHaveLength(101);
+    expect(job.gainCurve?.startSeconds).toBeCloseTo(0, US);
+    expect(job.gainCurve?.durationSeconds).toBeCloseTo(100 * FRAME_SECONDS, US);
+  });
+
+  it("线性包络在采样点上就是线性的", () => {
+    const job = jobOf(planAudioJobs(animate(plain(), "a", [[0, 0], [100, 1]]), FULL), "a");
+    const points = job.gainCurve!.points;
+    expect(points[0]).toBeCloseTo(0, 6);
+    expect(points[50]).toBeCloseTo(0.5, 6);
+    expect(points[100]).toBeCloseTo(1, 6);
+  });
+
+  it("**音量恒定时，合成曲线逐点等于老路径 × 音量**", () => {
+    // 这条钉的是 `crossfadeGainAtFrame` 与"喂给 AudioParam 的那串 setValue*"语义
+    // 一致：起点 baseGain、进到包络里取当前进度、越过之后保持末值。分叉的表现是
+    // "打了关键帧之后淡化的形状变了"，而那会被当成包络本身算错
+    const base = crossfadeTimeline();
+    const held = animate(base, "b", [[0, 0.5], [200, 0.5]]); // 恒定 0.5
+    const job = jobOf(planAudioJobs(held, FULL), "b");
+    const points = job.gainCurve!.points;
+
+    // b 是入场片段，解码区间起于窗口起点（帧 90），窗口 [90,110)
+    const at = (timelineFrame: number) => points[timelineFrame - 90]!;
+    expect(at(90)).toBeCloseTo(crossfadeGain("xfade-power", "to", 0) * 0.5, 6);
+    expect(at(95)).toBeCloseTo(crossfadeGain("xfade-power", "to", 0.25) * 0.5, 6);
+    expect(at(100)).toBeCloseTo(crossfadeGain("xfade-power", "to", 0.5) * 0.5, 6);
+    // 窗口结束之后保持末值 1，于是只剩音量
+    expect(at(150)).toBeCloseTo(0.5, 6);
+  });
+
+  it("包络的帧偏移相对**片段起点**，不是时间轴起点", () => {
+    // 两个片段挂同一条曲线（片段内 0 → 1），第二个片段从帧 100 开始。
+    // 混用坐标系时它的曲线会整体偏移 100 帧——而片段恰好从 0 开始时完全正常
+    const both = animate(animate(plain(), "a", [[0, 0], [100, 1]]), "b", [[0, 0], [100, 1]]);
+    const jobs = planAudioJobs(both, FULL);
+    expect(jobOf(jobs, "a").gainCurve!.points[0]).toBeCloseTo(0, 6);
+    expect(jobOf(jobs, "b").gainCurve!.points[0]).toBeCloseTo(0, 6);
+    expect(jobOf(jobs, "b").gainCurve!.points[100]).toBeCloseTo(1, 6);
+  });
+
+  it("导出区间切一半时，曲线只覆盖可见那一截且从对应位置接上", () => {
+    const job = jobOf(
+      planAudioJobs(animate(plain(), "a", [[0, 0], [100, 1]]), { inFrame: 50, outFrame: 400 }),
+      "a",
+    );
+    // 解码区间变成 [50,100) → 51 个点，起播时刻是 0（导出区间起点）
+    expect(job.gainCurve?.points).toHaveLength(51);
+    expect(job.gainCurve?.startSeconds).toBeCloseTo(0, US);
+    expect(job.gainCurve!.points[0]).toBeCloseTo(0.5, 6);
+  });
+
+  it("静态音量与包络并存时以包络为准（同 D10 的并存规则）", () => {
+    const both = animate(
+      { ...plain(), tracks: [{ ...plain().tracks[0]!, clips: plain().tracks[0]!.clips.map((c) => (c.id === "a" ? { ...c, volume: 0.2 } : c)) }] },
+      "a",
+      [[0, 0.8], [100, 0.8]],
+    );
+    const job = jobOf(planAudioJobs(both, FULL), "a");
+    // `volume` 字段仍然报静态值——它是"关掉动画之后的那个值"
+    expect(job.volume).toBe(0.2);
+    expect(job.gainCurve!.points[0]).toBeCloseTo(0.8, 6);
+  });
+});
+
 describe("解码区间要按 clipRenderSpan 撑开", () => {
   it("出场段向后多解半个窗口，入场段向前多解半个窗口", () => {
     const jobs = planAudioJobs(crossfadeTimeline(), FULL);

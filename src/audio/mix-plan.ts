@@ -30,6 +30,7 @@ import {
   type AudioTransitionKind,
   type CrossfadeRole,
 } from "./crossfade";
+import { resolveVolume, type KeyframeChannels } from "../anim/keyframes";
 import { clipRenderSpan, trackTransitionWindows } from "../edl/transition";
 import { microsToSeconds, sourceMicrosAt } from "../edl/sampling";
 import {
@@ -106,8 +107,125 @@ export interface AudioJob {
    * 上就分不开——两者都表现为"某个数不对"。分开留着，一条断言只会因为一个原因红。
    *
    * 相乘发生在 `mixdown.ts` 的 `envelopeInput`，那里也是恒等快路径的判据所在。
+   *
+   * **音量被打了关键帧时这个字段仍然是静态值**，实际生效的是下面的 `gainCurve`。
    */
   readonly volume: number;
+  /**
+   * 淡化 × 音量的**合成曲线**，只在音量有关键帧时才有。有它的时候
+   * `baseGain` / `ramps` 都不再喂给 `AudioParam`——那三样加起来就是这一条。
+   *
+   * ## 为什么要把两者预先乘成一条，而不是串两级 GainNode
+   *
+   * 静态音量是常数，乘进淡化曲线的每个采样点上就完事（D27）。**包络不是常数**：
+   * 两条随时间变化的曲线相乘，结果不是任何一条曲线的缩放版。Web Audio 的
+   * `AudioParam` 上同一段时间只能有一条 `setValueCurveAtTime`（重叠直接抛错），
+   * 所以要么串第二个 `GainNode`、要么把乘积算出来。选后者：
+   *
+   * - **算术留在纯函数里**。乘积的形状（淡化窗口内外怎么接、包络在片段坐标系而
+   *   淡化在导出坐标系）正是会写错的地方，而写错的表现是"声音大小不对"，不抛错。
+   *   放在这里它就能被单测钉住，同这个文件存在的全部理由。
+   * - **没打关键帧的项目一个字节都不变**。串两级的话得再证明"第二级在恒等时也
+   *   走快路径"，判据从一个变成两个（同 D27 否掉串两级的理由，在这里第二次成立）。
+   *
+   * 采样点是**每帧一个**（`lastFrame - firstFrame + 1` 个），`setValueCurveAtTime`
+   * 在点之间线性插值。关键帧本来就只能打在整数帧上，所以在关键帧处是精确的；
+   * 帧之间用 33ms 的直线段逼近缓动曲线，听不出来。这不违反"音频进度是连续的"
+   * ——那条说的是**不要取帧中点**，而这里取的是帧起点，插值把中间补上了。
+   */
+  readonly gainCurve?: {
+    readonly points: readonly number[];
+    /** 相对导出区间起点，恒等于 `whenSeconds`；显式给出免得读的人去推。 */
+    readonly startSeconds: number;
+    readonly durationSeconds: number;
+  };
+}
+
+/** 一条淡化包络在**帧**坐标系下的位置，`gainCurve` 逐帧求值时要用。 */
+interface RampSpan {
+  readonly kind: AudioTransitionKind;
+  readonly role: CrossfadeRole;
+  readonly startFrame: number;
+  readonly windowStartFrame: number;
+  readonly windowFrames: number;
+  readonly toProgress: number;
+}
+
+/**
+ * 第 `frame` 帧上的**淡化**增益（不含音量）。
+ *
+ * 语义必须与喂给 `AudioParam` 的那串 `setValueAtTime` + `setValueCurveAtTime`
+ * **逐点一致**：起点是 `baseGain`；进到某条包络里取当前进度的曲线值；越过它之后
+ * **保持末值**（`AudioParam` 在曲线结束后就是这样，不会跳回去）。`spans` 按起点
+ * 升序且互不重叠（D19 保证一个片段两侧的窗口最多各借一半），所以顺序走一遍即可。
+ *
+ * 单测里有一条"音量恒定时这条曲线等于老路径 × 音量"、M0 里有一条"恒定包络的成片
+ * 与静态音量逐样本相同"，钉的都是这份一致性——两条路径分叉的表现是"打了关键帧
+ * 之后淡化的形状变了"，而那会被当成包络本身算错。反向验证过：把这个函数改成只返回
+ * `baseGain`（= 忘了把淡化折进合成曲线），M0 那条立刻红到 **1.15e-1**，比容差高
+ * 五个数量级，而"恒定包络·无转场"那条仍绿——没有淡化可折，也就无从忘记。
+ *
+ * `Math.min(toProgress, …)` 那层夹紧**是可证明冗余的**，留着只为了把"越过之后保持
+ * 末值"这件事写在本地：`crossfadeGain` 内部已经把进度夹在 [0,1]，而 `toProgress < 1`
+ * 只在窗口被区间切掉尾巴时出现，那时 `lastFrame` 同样被切到那里、`frame` 到不了
+ * 更远。别把它当成护栏——我拿去掉它当破坏验过一轮，两层断言全绿，那是对的。
+ */
+function crossfadeGainAtFrame(
+  baseGain: number,
+  spans: readonly RampSpan[],
+  frame: number,
+): number {
+  let gain = baseGain;
+  for (const span of spans) {
+    if (frame < span.startFrame) break;
+    const progress = Math.min(
+      span.toProgress,
+      (frame - span.windowStartFrame) / span.windowFrames,
+    );
+    gain = crossfadeGain(span.kind, span.role, progress);
+  }
+  return gain;
+}
+
+/**
+ * 音量有关键帧时，把淡化 × 音量逐帧采成一条曲线；没关键帧返回 `null`
+ * （于是那条 spread 什么都不加，`gainCurve` 字段根本不存在——同"改回缺省值要把
+ * 字段整个删掉"，这里更要紧：`envelopeInput` 判的就是这个字段有没有）。
+ *
+ * 关键帧的帧偏移**相对片段起点**（D10），而淡化和采样点都在时间轴/导出坐标系里，
+ * 所以这里要减 `clip.timelineIn`。两个坐标系混用的表现是"包络整体偏移了一个片段
+ * 起点的量"——片段恰好从 0 开始时完全正常，拖到时间轴中间才出错。
+ */
+function sampleGainCurve(
+  clip: { readonly timelineIn: number; readonly volume?: number; readonly keyframes?: KeyframeChannels },
+  seconds: (frames: number) => number,
+  rangeInFrame: number,
+  baseGain: number,
+  spans: readonly RampSpan[],
+  firstFrame: number,
+  lastFrame: number,
+): { readonly gainCurve: NonNullable<AudioJob["gainCurve"]> } | null {
+  const series = clip.keyframes?.volume;
+  if (!series || series.length === 0) return null;
+
+  const count = lastFrame - firstFrame + 1;
+  const points: number[] = new Array<number>(count);
+  for (let i = 0; i < count; i++) {
+    const frame = firstFrame + i;
+    // 关键帧的值域由 `setKeyframe` 夹紧过，插值不会越界，所以这里不再夹一遍
+    const volume = resolveVolume(clip.volume, clip.keyframes, frame - clip.timelineIn) ?? 1;
+    points[i] = crossfadeGainAtFrame(baseGain, spans, frame) * volume;
+  }
+
+  return {
+    gainCurve: {
+      // 和 `whenSeconds` 同一个坐标系：相对**导出区间起点**，不是时间轴起点。
+      // 少减这一项时片段的起播和它的增益曲线会错开整个 trim 入点的量
+      points,
+      startSeconds: seconds(firstFrame - rangeInFrame),
+      durationSeconds: seconds(lastFrame - firstFrame),
+    },
+  };
 }
 
 /**
@@ -137,6 +255,8 @@ export function planAudioJobs(timeline: Timeline, range: RenderRange): AudioJob[
       if (lastFrame <= firstFrame) continue;
 
       const ramps: CrossfadeRamp[] = [];
+      /** 同一批包络的帧坐标，只有 `gainCurve` 用得到。 */
+      const spans: RampSpan[] = [];
       /** 最早那段包络，用来定 `baseGain`。比帧号而不是比秒——硬规则 1。 */
       let earliest: { readonly startFrame: number; readonly gain: number } | null = null;
 
@@ -163,6 +283,14 @@ export function planAudioJobs(timeline: Timeline, range: RenderRange): AudioJob[
           toProgress,
           points: crossfadeCurvePoints(endFrame - startFrame),
         });
+        spans.push({
+          kind: window.kind,
+          role,
+          startFrame,
+          windowStartFrame: window.startFrame,
+          windowFrames: window.frames,
+          toProgress,
+        });
 
         if (!earliest || startFrame < earliest.startFrame) {
           earliest = { startFrame, gain: crossfadeGain(window.kind, role, fromProgress) };
@@ -170,6 +298,7 @@ export function planAudioJobs(timeline: Timeline, range: RenderRange): AudioJob[
       }
 
       ramps.sort((a, b) => a.startSeconds - b.startSeconds);
+      spans.sort((a, b) => a.startFrame - b.startFrame);
       // 包络在这段 PCM 起播之前就已经开始 → 起始增益取那一刻的曲线值。
       // 作为入场片段时解码区间恰好起于窗口起点，于是这里取到 0
       const baseGain = earliest && earliest.startFrame <= firstFrame ? earliest.gain : 1;
@@ -187,6 +316,8 @@ export function planAudioJobs(timeline: Timeline, range: RenderRange): AudioJob[
         baseGain,
         ramps,
         volume: clip.volume ?? 1,
+        ...(sampleGainCurve(clip, seconds, range.inFrame, baseGain, spans, firstFrame, lastFrame) ??
+          {}),
       });
     }
   }

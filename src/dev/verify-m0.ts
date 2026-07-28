@@ -20,7 +20,7 @@ import { makeSampleVideo } from "./make-sample";
 import { probeFile } from "../media/probe";
 import { startExport } from "../export/client";
 import { readExportFile, removeExportFile } from "../export/write-target";
-import { singleClipTimeline, type MediaSource, type Timeline } from "../edl/types";
+import { singleClipTimeline, type Clip, type MediaSource, type Timeline } from "../edl/types";
 import { crossfadeGain } from "../audio/crossfade";
 import { createMixer, MIX_CHANNELS, MIX_SAMPLE_RATE } from "../audio/mixdown";
 import { formatBytes, residency } from "../export/residency";
@@ -503,23 +503,36 @@ const VOLUME_PROBE = 0.5;
  */
 async function verifyVolume(timeline: Timeline, total: number): Promise<Check[]> {
   const range = { inFrame: 0, outFrame: total };
-  const withVolume = (target: Timeline): Timeline => ({
+
+  /** 给每个音频素材片段套一层音量，套法由 `apply` 决定（静态值还是关键帧）。 */
+  const mapAudioClips = (target: Timeline, apply: (clip: Clip) => Clip): Timeline => ({
     ...target,
     tracks: target.tracks.map((track) =>
       track.kind !== "audio"
         ? track
-        : {
-            ...track,
-            clips: track.clips.map((clip) =>
-              clip.kind === "media" ? { ...clip, volume: VOLUME_PROBE } : clip,
-            ),
-          },
+        : { ...track, clips: track.clips.map((c) => (c.kind === "media" ? apply(c) : c)) },
     ),
   });
 
-  const compare = async (label: string, target: Timeline): Promise<Check[]> => {
+  const withStatic = (target: Timeline) =>
+    mapAudioClips(target, (clip) => ({ ...clip, volume: VOLUME_PROBE }));
+  /**
+   * 恒定包络：**一个**关键帧就够——`valueAt` 在区间外取端点值，所以整段恒为它。
+   * 这一路走的是 `gainCurve` 那条分支，而结果必须和静态音量那一路一模一样。
+   */
+  const withFlatEnvelope = (target: Timeline) =>
+    mapAudioClips(target, (clip) => ({
+      ...clip,
+      keyframes: { volume: [{ frame: 0, value: VOLUME_PROBE }] },
+    }));
+
+  const compare = async (
+    label: string,
+    target: Timeline,
+    variant: (t: Timeline) => Timeline = withStatic,
+  ): Promise<Check[]> => {
     const plain = await mixWholeTimeline(target, range, XFADE_SEGMENT_SECONDS);
-    const scaled = await mixWholeTimeline(withVolume(target), range, XFADE_SEGMENT_SECONDS);
+    const scaled = await mixWholeTimeline(variant(target), range, XFADE_SEGMENT_SECONDS);
 
     let peak = 0;
     let scaledPeak = 0;
@@ -559,6 +572,12 @@ async function verifyVolume(timeline: Timeline, total: number): Promise<Check[]>
   return [
     ...(await compare("无转场", withoutAudioTransitions(timeline))),
     ...(await compare("带淡化", timeline)),
+    // 恒定包络走的是 `gainCurve` 那条分支（淡化被逐帧重建再乘上音量），而结果必须
+    // 和上面那条乘常数的路径**逐样本相同**。这是 `crossfadeGainAtFrame` 唯一的
+    // 端到端护栏：它算错半帧、把"越过窗口后保持末值"写成"回到 1"、或者把片段坐标
+    // 和时间轴坐标混起来，表现都只是"声音大小不太对"，不抛错
+    ...(await compare("恒定包络", timeline, withFlatEnvelope)),
+    ...(await compare("恒定包络·无转场", withoutAudioTransitions(timeline), withFlatEnvelope)),
   ];
 }
 

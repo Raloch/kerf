@@ -24,6 +24,7 @@ import {
   rippleDeleteClip,
   setClipColor,
   setClipVolume,
+  staticValueOf,
   setClipLut,
   setClipTransform,
   setKeyframe,
@@ -618,6 +619,58 @@ describe("片段音量", () => {
   it("锁定轨道上改不动", () => {
     const t = timeline([{ id: "A1", kind: "audio", locked: true, clips: [clip("a", 0, 100)] }]);
     expect(setClipVolume(t, "a", 0.5).reason).toContain("锁定");
+  });
+
+  it("能打关键帧，且不落到摆位/调色两组里", () => {
+    const t = setKeyframe(one(), "a", "volume", 0, 0.3).timeline;
+    const got = findClip(t, "a")!.clip;
+    expect(got.keyframes?.volume).toEqual([{ frame: 0, value: 0.3 }]);
+    expect("transform" in got).toBe(false);
+    expect("color" in got).toBe(false);
+  });
+
+  it("关键帧的值同样被夹紧", () => {
+    const t = setKeyframe(one(), "a", "volume", 0, 9).timeline;
+    expect(findClip(t, "a")!.clip.keyframes?.volume?.[0]?.value).toBe(2);
+  });
+
+  it("文字片段打不了音量关键帧——通道表挂在 ClipBase 上，类型拦不住", () => {
+    // 那条曲线永远不会被求值（文字片段没有音轨），留着就是"打了点没反应"
+    const r = setKeyframe(one(), "t", "volume", 0, 0.5);
+    expect(r.changed).toBe(false);
+    expect(r.reason).toContain("没有音量");
+  });
+
+  it("**关掉音量动画时值烘进 clip.volume，不是 transform 也不是 color**", () => {
+    // 写死成 transform 的话会静默把 volume 塞进 LayerTransform：合成器不认识那个
+    // 字段、混音器读不到这个值，表现是"关掉动画之后音量整个丢了"，而且不报错
+    let t = setKeyframe(one(), "a", "volume", 0, 0.4).timeline;
+    t = setKeyframe(t, "a", "volume", 50, 0.9).timeline;
+    const cleared = clearKeyframes(t, "a", "volume", 0.65).timeline;
+    const got = media(findClip(cleared, "a")!.clip);
+    expect(got.volume).toBe(0.65);
+    expect(got.keyframes).toBeUndefined();
+    expect("transform" in got).toBe(false);
+    expect("color" in got).toBe(false);
+  });
+
+  it("烘的值恰好是缺省 1 时，volume 字段整个删掉", () => {
+    const t = setKeyframe(one(), "a", "volume", 0, 0.4).timeline;
+    const cleared = clearKeyframes(t, "a", "volume", 1).timeline;
+    expect("volume" in findClip(cleared, "a")!.clip).toBe(false);
+  });
+
+  it("staticValueOf 认三个地方，一处判据", () => {
+    let t = setClipVolume(one(), "a", 0.5).timeline;
+    t = setClipTransform(t, "a", { x: 40 }).timeline;
+    t = setClipColor(t, "a", { hue: 1 }).timeline;
+    const c = findClip(t, "a")!.clip;
+    expect(staticValueOf(c, "volume")).toBe(0.5);
+    expect(staticValueOf(c, "x")).toBe(40);
+    expect(staticValueOf(c, "hue")).toBe(1);
+    expect(staticValueOf(c, "opacity")).toBeUndefined();
+    // 文字片段没有音量，取到的是 undefined 而不是抛错
+    expect(staticValueOf(findClip(t, "t")!.clip, "volume")).toBeUndefined();
   });
 });
 

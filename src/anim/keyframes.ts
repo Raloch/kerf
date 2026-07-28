@@ -82,8 +82,22 @@ export const COLOR_PROPERTIES = [
   "lutIntensity",
 ] as const;
 
+/**
+ * 声音类属性。只有 `volume`（`MediaClip.volume`）。
+ *
+ * **单独一组而不是塞进上面两组里**：它既不作用到摆位也不作用到颜色，而是走音频图。
+ * 更要紧的是它的静态值是**片段上的一个标量**，不是一组对象——所以求值函数的形状
+ * 和另外两组不同（见 `resolveVolume`），混进去会被迫返回一个假的包装对象。
+ *
+ * 一组只有一项看着多余，但判据必须是"名单"而不是"名字里有没有 volume"，理由同
+ * `COLOR_PROPERTIES`：名单是求值和编辑共用的同一份，加第二项（声道平衡、低通）
+ * 时只改这里。
+ */
+export const AUDIO_PROPERTIES = ["volume"] as const;
+
 export type TransformProperty = (typeof TRANSFORM_PROPERTIES)[number];
 export type ColorProperty = (typeof COLOR_PROPERTIES)[number];
+export type AudioProperty = (typeof AUDIO_PROPERTIES)[number];
 
 /**
  * 所有能打关键帧的属性。
@@ -93,15 +107,17 @@ export type ColorProperty = (typeof COLOR_PROPERTIES)[number];
  * - **共用一张表**：打/删/平移关键帧、撤销栈合并键、检查器的关键帧条，这些逻辑
  *   与"这个属性最后作用到摆位还是颜色"完全无关。分成两张表等于把它们全部写两遍，
  *   而漏改一处的表现是"某类属性的关键帧撤销不了"。
- * - **分成两组**：求值时必须知道去向——`resolveTransform` 只能吐 `LayerTransform`，
- *   把 `brightness` 混进去会变成一个合成器不认识、也不报错的字段。
+ * - **分成三组**：求值时必须知道去向——`resolveTransform` 只能吐 `LayerTransform`，
+ *   把 `brightness` 混进去会变成一个合成器不认识、也不报错的字段。而 `volume` 连
+ *   返回类型都不同（一个标量），见 `resolveVolume`。
  */
 export const ANIMATABLE_PROPERTIES = [
   ...TRANSFORM_PROPERTIES,
   ...COLOR_PROPERTIES,
+  ...AUDIO_PROPERTIES,
 ] as const;
 
-export type AnimatableProperty = TransformProperty | ColorProperty;
+export type AnimatableProperty = TransformProperty | ColorProperty | AudioProperty;
 
 /** 每个属性一条独立的关键帧序列。没有条目 = 这个属性不动画。 */
 export type KeyframeChannels = {
@@ -229,4 +245,26 @@ export function resolveColor(
   frame: number,
 ): ColorAdjust | undefined {
   return resolveGroup(COLOR_PROPERTIES, base, channels, frame);
+}
+
+/**
+ * 这一帧的音量（静态值 + 关键帧）。`frame` 是**片段内的帧偏移**。
+ *
+ * **不能复用 `resolveGroup`**：那个函数吐的是"一组属性的对象"，而音量的静态值是
+ * 片段上的一个标量。硬套要造一个 `{ volume }` 包装对象再拆开，而那个对象的
+ * "省略 = 不动"语义在只有一项时反而更容易读错。
+ *
+ * 没有静态值也没有关键帧时返回 `undefined`，**不是 1**：调用方据此判"这个片段
+ * 动过音量没有"，而那正是混音那条恒等快路径的依据。返回 1 会让所有片段都看起来
+ * 调过音量，于是每个片段都白穿一个 `GainNode`（同 `resolveTransform` 必须原样
+ * 返回 `base` 而不是 `{}` 的理由）。
+ */
+export function resolveVolume(
+  base: number | undefined,
+  channels: KeyframeChannels | undefined,
+  frame: number,
+): number | undefined {
+  const series = channels?.volume;
+  if (!series || series.length === 0) return base;
+  return valueAt(series, frame) ?? base;
 }

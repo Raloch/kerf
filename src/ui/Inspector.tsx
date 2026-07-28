@@ -49,7 +49,8 @@ import {
   DEFAULT_TRANSITION_KIND,
   PROPERTY_LABELS,
   PROPERTY_RANGES,
-  VOLUME_RANGE,
+  isAudioProperty,
+  staticValueOf,
   TRANSITION_LABELS,
   TRANSITION_ORDER,
   type ColorPatch,
@@ -122,6 +123,18 @@ const LUT_INTENSITY_SPEC: PropertySpec = {
   ...PERCENT,
 };
 
+/**
+ * 音量一项。按百分比显示（100% = 原样），和缩放/不透明度同一套换算。
+ *
+ * 走 `PropertySpec` 而不是单独一个组件，是为了**白拿关键帧按钮和关键帧条**：
+ * 打点 / 删点 / 跳到关键帧 / 播放头不在片段内时不可编辑，这些逻辑与"这个值最后
+ * 作用到画面还是声音"完全无关。分岔只在两处——改哪个 store action（`PropertyRow`
+ * 的 `commit`）、静态值读哪个字段（`staticValueOf`）。
+ */
+const VOLUME_SPECS: readonly PropertySpec[] = [
+  { property: "volume", label: PROPERTY_LABELS.volume, suffix: "%", step: 5, digits: 0, ...PERCENT },
+];
+
 const EASINGS: readonly { readonly value: Easing; readonly label: string }[] = [
   { value: "linear", label: "线性" },
   { value: "ease-in", label: "缓入" },
@@ -140,9 +153,9 @@ function effectiveValue(clip: Clip, property: AnimatableProperty, offset: number
   const fallback = PROPERTY_RANGES[property].fallback;
   const series = clip.keyframes?.[property];
   if (series && series.length > 0) return valueAt(series, offset) ?? fallback;
-  // 静态值存在两个字段里，去哪儿取由属性自己决定（判据同 `clearKeyframes` 的烘焙）
-  const statics = isColorProperty(property) ? clip.color : clip.transform;
-  return (statics as Record<string, number | undefined> | undefined)?.[property] ?? fallback;
+  // 静态值存在三个地方（两个对象 + 一个标量），"存在哪儿"的判断只有 `staticValueOf`
+  // 一处——同 `clearKeyframes` 的烘焙用的是同一个函数
+  return staticValueOf(clip, property) ?? fallback;
 }
 
 function round(value: number, digits: number): number {
@@ -229,7 +242,9 @@ export function Inspector() {
       )}
       {/* 音量只在**音频轨的素材片段**上出现：`planAudioJobs` 只混音频轨，
           视频轨上的片段调了音量也不会有任何效果——那就是"能调但没用" */}
-      {track.kind === "audio" && clip.kind === "media" && <VolumeSection clip={clip} />}
+      {track.kind === "audio" && clip.kind === "media" && (
+        <PropertySection group="audio" clip={clip} playhead={playhead} />
+      )}
     </>
   );
 }
@@ -410,7 +425,7 @@ function TransitionSection({
  * 明天是变换那边的重置按钮判据不一样。它们只在两处分岔（改哪个 store action、
  * 读哪个静态字段），下面用一张表把这两处收起来。
  */
-type PropertyGroup = "transform" | "color";
+type PropertyGroup = "transform" | "color" | "audio";
 
 const GROUPS: Record<
   PropertyGroup,
@@ -433,6 +448,15 @@ const GROUPS: Record<
     staticsOf: (clip) => clip.color,
     resetHint: "把静态调色恢复成默认（不动关键帧）",
   },
+  audio: {
+    title: "音量",
+    specs: VOLUME_SPECS,
+    // 音量的静态值是标量，这里只是把"动过没有"包成 staticsOf 要的形状
+    // （它唯一的用处是重置按钮的可用状态）
+    staticsOf: (clip) =>
+      clip.kind === "media" && clip.volume !== undefined ? { volume: clip.volume } : undefined,
+    resetHint: "把音量恢复成 100%（不动关键帧）",
+  },
 };
 
 function PropertySection({
@@ -446,10 +470,16 @@ function PropertySection({
 }) {
   const setClipTransform = useTimeline((s) => s.setClipTransform);
   const setClipColor = useTimeline((s) => s.setClipColor);
+  const setClipVolume = useTimeline((s) => s.setClipVolume);
   const inside = playhead >= clip.timelineIn && playhead < clip.timelineOut;
   const { title, specs, staticsOf, resetHint } = GROUPS[group];
 
   const reset = (): void => {
+    // 音量没有"一组属性"，重置就是设回缺省值本身
+    if (group === "audio") {
+      setClipVolume(clip.id, PROPERTY_RANGES.volume.fallback);
+      return;
+    }
     const patch: Record<string, undefined> = {};
     for (const spec of specs) patch[spec.property] = undefined;
     if (group === "color") setClipColor(clip.id, patch as ColorPatch);
@@ -485,61 +515,31 @@ function PropertySection({
         ))}
       </div>
       {group === "color" && <LutRow clip={clip} playhead={playhead} inside={inside} />}
+      {group === "audio" && <GainReadout clip={clip} playhead={playhead} />}
     </>
   );
 }
 
 /**
- * 片段音量。EDL 存**倍数**，界面显示百分比 + dB，换算收在这里（同 `PROPERTY_SPECS`
- * 那条"单位换算只有 Inspector 这一层"）。
+ * 音量的 dB 读数。**跟着播放头走**——有包络时它显示的是这一帧实际生效的增益，
+ * 所以拖播放头能看出曲线在动。
  *
- * 暂时不复用 `PropertyRow`：那个组件的每一行都带关键帧按钮和关键帧条，而音量
- * 这一轮还不能打关键帧。硬塞进去要给它加一个"这个属性不能动画"的分支，等做包络时
- * 又要拆掉——那时它才真的和调色/变换同构，届时并进 `PROPERTY_SPECS` 即可。
+ * dB 是音频里唯一有意义的刻度（50% 听起来不是"一半响"），而百分比是拖动时好用的
+ * 那个。两个一起给，不用其中一个替掉另一个。放大时标出削波风险：Web Audio 到
+ * 编码器那一步是**硬截断、不报错**，只表现为"声音变糊了"。
  */
-function VolumeSection({ clip }: { readonly clip: MediaClip }) {
-  const setClipVolume = useTimeline((s) => s.setClipVolume);
-  const volume = clip.volume ?? VOLUME_RANGE.fallback;
-
+function GainReadout({ clip, playhead }: { readonly clip: Clip; readonly playhead: number }) {
+  const volume = effectiveValue(clip, "volume", playhead - clip.timelineIn);
   return (
-    <>
-      <div className="grp-title row">
-        <span>音量</span>
-        <button
-          type="button"
-          className="mini"
-          disabled={clip.volume === undefined}
-          title="回到 100%"
-          onClick={() => setClipVolume(clip.id, VOLUME_RANGE.fallback)}
-        >
-          重置
-        </button>
+    <div className="fields">
+      <div className="f">
+        <label>增益</label>
+        <span className="val">
+          {volume === 0 ? "静音" : `${volume > 1 ? "+" : ""}${round(20 * Math.log10(volume), 1)} dB`}
+          {volume > 1 ? " · 可能削波" : ""}
+        </span>
       </div>
-      <div className="fields">
-        <div className="f ctl">
-          <label>音量</label>
-          <NumberField
-            value={volume * 100}
-            step={5}
-            min={VOLUME_RANGE.min * 100}
-            max={VOLUME_RANGE.max * 100}
-            digits={0}
-            suffix="%"
-            title="这个片段的音量。和转场淡化相乘，不互相覆盖"
-            onCommit={(display) => setClipVolume(clip.id, display / 100)}
-          />
-        </div>
-        <div className="f">
-          <label>增益</label>
-          {/* dB 是音频里唯一有意义的刻度：50% 听起来不是"一半响"。放大时标出削波
-              风险——Web Audio 到编码器那一步是硬截断、不报错，只表现为"声音变糊" */}
-          <span className="val">
-            {volume === 0 ? "静音" : `${volume > 1 ? "+" : ""}${round(20 * Math.log10(volume), 1)} dB`}
-            {volume > 1 ? " · 可能削波" : ""}
-          </span>
-        </div>
-      </div>
-    </>
+    </div>
   );
 }
 
@@ -648,6 +648,7 @@ function PropertyRow({
 }) {
   const setClipTransform = useTimeline((s) => s.setClipTransform);
   const setClipColor = useTimeline((s) => s.setClipColor);
+  const setClipVolume = useTimeline((s) => s.setClipVolume);
   const setKeyframeAt = useTimeline((s) => s.setKeyframeAt);
   const removeKeyframeAt = useTimeline((s) => s.removeKeyframeAt);
   const clearKeyframes = useTimeline((s) => s.clearKeyframes);
@@ -666,6 +667,7 @@ function PropertyRow({
     // 有动画就改这一帧的关键帧，没有就改静态值——见文件头
     if (animated && inside) setKeyframeAt(clip.id, property, playhead, next);
     else if (animated) return;
+    else if (isAudioProperty(property)) setClipVolume(clip.id, next);
     else if (isColorProperty(property)) setClipColor(clip.id, { [property]: next } as ColorPatch);
     else setClipTransform(clip.id, { [property]: next } as TransformPatch);
   };

@@ -20,6 +20,7 @@ import {
   easeProgress,
   resolveColor,
   resolveTransform,
+  resolveVolume,
   TRANSFORM_PROPERTIES,
   valueAt,
   type Keyframe,
@@ -259,5 +260,37 @@ describe("resolveColor", () => {
     expect(resolveColor({ brightness: 2 }, { brightness: [kf(0, 1), kf(10, 3)] }, 0)).toEqual({
       brightness: 1,
     });
+  });
+});
+
+describe("resolveVolume", () => {
+  it("没有关键帧时原样返回静态值，包括 undefined", () => {
+    // 返回 1 会让每个片段看起来都调过音量，于是全都白穿一个 GainNode——
+    // 而"没调音量的项目逐样本一致"正是靠那条快路径成立的
+    expect(resolveVolume(undefined, undefined, 3)).toBeUndefined();
+    expect(resolveVolume(0.5, undefined, 3)).toBe(0.5);
+    // 别的属性有关键帧不算音量有
+    expect(resolveVolume(0.5, { brightness: [kf(0, 0), kf(10, 1)] }, 5)).toBe(0.5);
+  });
+
+  it("有关键帧就按帧求值，盖掉静态值", () => {
+    expect(resolveVolume(0.2, { volume: [kf(0, 0), kf(10, 1)] }, 5)).toBeCloseTo(0.5, 9);
+    expect(resolveVolume(0.2, { volume: [kf(0, 0), kf(10, 1)] }, 0)).toBe(0);
+  });
+
+  it("区间外取端点值（同 valueAt），所以拖回入点动画能原样回来", () => {
+    const channels = { volume: [kf(5, 0.25), kf(15, 0.75)] };
+    expect(resolveVolume(1, channels, 0)).toBe(0.25);
+    expect(resolveVolume(1, channels, 100)).toBe(0.75);
+  });
+
+  it("音量在 ANIMATABLE_PROPERTIES 里，但不进摆位/调色两组", () => {
+    expect(ANIMATABLE_PROPERTIES).toContain("volume");
+    expect(TRANSFORM_PROPERTIES as readonly string[]).not.toContain("volume");
+    expect(COLOR_PROPERTIES as readonly string[]).not.toContain("volume");
+    // 而且它不会被那两个求值函数捡进去——捡进去就是一个合成器不认识的字段
+    const channels = { volume: [kf(0, 0), kf(10, 1)] };
+    expect(resolveTransform(undefined, channels, 5)).toBeUndefined();
+    expect(resolveColor(undefined, channels, 5)).toBeUndefined();
   });
 });
