@@ -47,6 +47,7 @@ import {
   rippleDeleteClip,
   setClipColor,
   setClipLut,
+  setClipVolume,
   setTransition,
   setClipTransform,
   setKeyframe,
@@ -128,6 +129,8 @@ export interface TimelineState {
   setClipTransform: (clipId: ClipId, patch: TransformPatch) => void;
   /** 改静态调色。合并策略同上。 */
   setClipColor: (clipId: ClipId, patch: ColorPatch) => void;
+  /** 改片段音量。合并键带 clipId，理由同 `setClipTransform`。 */
+  setClipVolume: (clipId: ClipId, volume: number) => void;
   /** 把一张解析好的 LUT 加进项目库。 */
   addLut: (lut: LutSource) => void;
   /** 给片段挂上 / 摘掉 LUT。传 undefined 表示摘掉。 */
@@ -347,6 +350,10 @@ export const useTimeline = create<TimelineState>((set, get) => {
     setClipColor(clipId, patch) {
       const keys = Object.keys(patch).sort().join(",");
       apply(setClipColor(get().timeline(), clipId, patch), "调色", `color:${clipId}:${keys}`);
+    },
+
+    setClipVolume(clipId, volume) {
+      apply(setClipVolume(get().timeline(), clipId, volume), "音量", `volume:${clipId}`);
     },
 
     addLut(lut) {

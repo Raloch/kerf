@@ -328,6 +328,15 @@ const SEGMENT_MATCH_TOLERANCE = 1e-6;
 const SEGMENT_ENVELOPE_TOLERANCE = 1e-6;
 
 /**
+ * 音量缩放的容差。沿用上面那个 1e-6：被比的是同一条带淡化的时间轴，
+ * 精度地板同样由 `Float32Array` 里的包络曲线决定（f32 相对精度约 1e-7）。
+ *
+ * 破坏侧的量级完全不同——"音量没生效"的偏差是 `0.5 × 峰值`，约 **0.1**，
+ * 离容差五个数量级。这条断言不需要精调，它抓的不是精度而是"有没有乘"。
+ */
+const VOLUME_MATCH_TOLERANCE = 1e-6;
+
+/**
  * 增益比值的容差。**两侧都是量出来的，不是估的。**
  *
  * 破坏侧最轻的一档是"整条包络被丢掉"（比值恒为 1）在 t=0.25 上的偏差：
@@ -460,6 +469,96 @@ async function verifyMixSegmentation(timeline: Timeline, total: number): Promise
   return [
     ...(await compare("无转场", withoutAudioTransitions(timeline), SEGMENT_MATCH_TOLERANCE)),
     ...(await compare("带淡化", timeline, SEGMENT_ENVELOPE_TOLERANCE)),
+  ];
+}
+
+/** 自检里给片段设的音量。取 0.5 而不是 0.9：偏差要比浮点噪声大好几个数量级。 */
+const VOLUME_PROBE = 0.5;
+
+/**
+ * 片段音量：**同一条带淡化的时间轴，音量设成一半之后逐样本恰好是原值的一半。**
+ *
+ * **两条时间轴各测一次**：
+ *
+ * - **无转场**那一路是"音量根本没生效"的干净判据。最可能的形态是 `envelopeInput`
+ *   的恒等快路径忘了把 `job.volume` 算进去，于是调过音量的片段照旧直连总线。
+ *   这条时间轴上没有任何 `ramps`，所以每一段都必然走那条快路径。
+ * - **带淡化**那一路多覆盖了淡化窗口内的样本，抓"音量覆盖了淡化"而不是与它相乘
+ *   （比如写成 `baseGain = volume`）——那时窗口外仍然正好是 0.5，只有窗口里偏。
+ *
+ * 我第一版写的理由是"带淡化那条每个片段都有 ramps、进不了快路径，所以只有无转场
+ * 那条能抓快路径的 bug"。**反向验证当场否掉了它**：注入那个 bug 之后两条都红。
+ * 原因是 `renderSegment` 的排期**按段重算**（不是切整条的排期），而段长 0.5 秒、
+ * 转场窗口只有 0.667 秒——绝大多数段里 `ramps` 是空的，于是带淡化那条时间轴
+ * 同样在走快路径。这不影响两条断言各自的价值，但它说明**"这条断言覆盖了什么"
+ * 也要靠反向验证去确认，光读代码推是会推错的。**
+ *
+ * 走 `mixWholeTimeline` 而不是端到端导出：被测对象在 `envelopeInput` 里，
+ * 而 AAC 是有损的、它自己就会改动样本值，容差得放到 1e-2 才不误报——那时
+ * "少乘了一次"和"编码噪声"就分不开了。同分段自检那条"绕开编码器"的理由。
+ *
+ * **不加"volume:1 与不设该字段逐位相同"那条**：`× 1` 在浮点上是精确的，所以
+ * 快路径坏掉时那条读数**和健康值一模一样**，测的是运气。恒等快路径的真正护栏
+ * 是 M0 那条"成片与素材的第一声位置差"——它对多穿一级节点是敏感的。
+ */
+async function verifyVolume(timeline: Timeline, total: number): Promise<Check[]> {
+  const range = { inFrame: 0, outFrame: total };
+  const withVolume = (target: Timeline): Timeline => ({
+    ...target,
+    tracks: target.tracks.map((track) =>
+      track.kind !== "audio"
+        ? track
+        : {
+            ...track,
+            clips: track.clips.map((clip) =>
+              clip.kind === "media" ? { ...clip, volume: VOLUME_PROBE } : clip,
+            ),
+          },
+    ),
+  });
+
+  const compare = async (label: string, target: Timeline): Promise<Check[]> => {
+    const plain = await mixWholeTimeline(target, range, XFADE_SEGMENT_SECONDS);
+    const scaled = await mixWholeTimeline(withVolume(target), range, XFADE_SEGMENT_SECONDS);
+
+    let peak = 0;
+    let scaledPeak = 0;
+    let worst = 0;
+    let worstAt = -1;
+    const length = Math.min(plain.frameCount, scaled.frameCount);
+    for (let ch = 0; ch < MIX_CHANNELS; ch++) {
+      const a = plain.planes[ch]!;
+      const b = scaled.planes[ch]!;
+      for (let i = 0; i < length; i++) {
+        const av = a[i]!;
+        const bv = b[i]!;
+        if (Math.abs(av) > peak) peak = Math.abs(av);
+        if (Math.abs(bv) > scaledPeak) scaledPeak = Math.abs(bv);
+        const diff = Math.abs(bv - av * VOLUME_PROBE);
+        if (diff > worst) {
+          worst = diff;
+          worstAt = i;
+        }
+      }
+    }
+
+    return [
+      check(`音量自检（${label}）：参照 PCM 里有信号`, "峰值 > 0.05", peak.toFixed(4), peak > 0.05),
+      check(
+        `音量自检（${label}）：逐样本等于原值 × ${VOLUME_PROBE}`,
+        `最大差 < ${VOLUME_MATCH_TOLERANCE}`,
+        // 两个操作数都印出来：只印差值时"音量没生效"和"参照那边量歪了"长得一样。
+        // 峰值那一对同时是"音量确实小了一半"的旁证
+        `${worst.toExponential(2)}（第 ${worstAt} 个样本）· 峰值 ${peak.toFixed(3)} → ` +
+          `${scaledPeak.toFixed(3)}`,
+        worst < VOLUME_MATCH_TOLERANCE,
+      ),
+    ];
+  };
+
+  return [
+    ...(await compare("无转场", withoutAudioTransitions(timeline))),
+    ...(await compare("带淡化", timeline)),
   ];
 }
 
@@ -669,6 +768,7 @@ async function verifyCrossfade(): Promise<Check[]> {
 
   // 分段混音是否透明，先在**不经过编码器**的地方判掉——见 verifyMixSegmentation
   checks.push(...(await verifyMixSegmentation(timeline, total)));
+  checks.push(...(await verifyVolume(timeline, total)));
   checks.push(...(await verifyMixResidency(tone, SEG)));
 
   await removeExportFile(XFADE_OUT);

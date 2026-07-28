@@ -49,6 +49,7 @@ import {
   DEFAULT_TRANSITION_KIND,
   PROPERTY_LABELS,
   PROPERTY_RANGES,
+  VOLUME_RANGE,
   TRANSITION_LABELS,
   TRANSITION_ORDER,
   type ColorPatch,
@@ -226,6 +227,9 @@ export function Inspector() {
           <PropertySection group="color" clip={clip} playhead={playhead} />
         </>
       )}
+      {/* 音量只在**音频轨的素材片段**上出现：`planAudioJobs` 只混音频轨，
+          视频轨上的片段调了音量也不会有任何效果——那就是"能调但没用" */}
+      {track.kind === "audio" && clip.kind === "media" && <VolumeSection clip={clip} />}
     </>
   );
 }
@@ -481,6 +485,60 @@ function PropertySection({
         ))}
       </div>
       {group === "color" && <LutRow clip={clip} playhead={playhead} inside={inside} />}
+    </>
+  );
+}
+
+/**
+ * 片段音量。EDL 存**倍数**，界面显示百分比 + dB，换算收在这里（同 `PROPERTY_SPECS`
+ * 那条"单位换算只有 Inspector 这一层"）。
+ *
+ * 暂时不复用 `PropertyRow`：那个组件的每一行都带关键帧按钮和关键帧条，而音量
+ * 这一轮还不能打关键帧。硬塞进去要给它加一个"这个属性不能动画"的分支，等做包络时
+ * 又要拆掉——那时它才真的和调色/变换同构，届时并进 `PROPERTY_SPECS` 即可。
+ */
+function VolumeSection({ clip }: { readonly clip: MediaClip }) {
+  const setClipVolume = useTimeline((s) => s.setClipVolume);
+  const volume = clip.volume ?? VOLUME_RANGE.fallback;
+
+  return (
+    <>
+      <div className="grp-title row">
+        <span>音量</span>
+        <button
+          type="button"
+          className="mini"
+          disabled={clip.volume === undefined}
+          title="回到 100%"
+          onClick={() => setClipVolume(clip.id, VOLUME_RANGE.fallback)}
+        >
+          重置
+        </button>
+      </div>
+      <div className="fields">
+        <div className="f ctl">
+          <label>音量</label>
+          <NumberField
+            value={volume * 100}
+            step={5}
+            min={VOLUME_RANGE.min * 100}
+            max={VOLUME_RANGE.max * 100}
+            digits={0}
+            suffix="%"
+            title="这个片段的音量。和转场淡化相乘，不互相覆盖"
+            onCommit={(display) => setClipVolume(clip.id, display / 100)}
+          />
+        </div>
+        <div className="f">
+          <label>增益</label>
+          {/* dB 是音频里唯一有意义的刻度：50% 听起来不是"一半响"。放大时标出削波
+              风险——Web Audio 到编码器那一步是硬截断、不报错，只表现为"声音变糊" */}
+          <span className="val">
+            {volume === 0 ? "静音" : `${volume > 1 ? "+" : ""}${round(20 * Math.log10(volume), 1)} dB`}
+            {volume > 1 ? " · 可能削波" : ""}
+          </span>
+        </div>
+      </div>
     </>
   );
 }

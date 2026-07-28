@@ -195,6 +195,19 @@ export interface MediaClip extends ClipBase {
   readonly kind: "media";
   readonly sourceId: SourceId;
   readonly sourceIn: number;
+  /**
+   * 这个片段的音量倍数。缺省 = 1 = 原样，0 = 静音。
+   *
+   * **放在 `MediaClip` 上而不是 `ClipBase`**：声音只可能来自素材，文字片段没有
+   * 音轨。给它一个永远无意义的音量字段就是状态层约定里那条"加可选字段来兼容
+   * 两种片段"，而它的代价是每个消费点都要先判"这个片段到底有没有声音"。
+   *
+   * **和转场淡化是同一条增益链上的两个来源**，合成方式是相乘：淡化是交界处的
+   * 形状，音量是整段的高低。相乘发生在 `audio/mixdown.ts` 的 `envelopeInput`，
+   * 那里也是"恒等增益不穿 `GainNode`"这条快路径的判据所在——所以没调过音量、
+   * 也没有转场的项目，混出来的 PCM 与加这个功能之前**逐样本一致**。
+   */
+  readonly volume?: number;
 }
 
 /**

@@ -118,6 +118,62 @@ describe("没有转场时", () => {
   });
 });
 
+describe("片段音量", () => {
+  const withVolume = (volume: number | undefined, transition = false): Timeline => {
+    const base = transition
+      ? crossfadeTimeline()
+      : timeline([clip("a", 0, 100, 200), clip("b", 100, 200, 500)]);
+    const track = base.tracks[0]!;
+    return {
+      ...base,
+      tracks: [
+        {
+          ...track,
+          clips: track.clips.map((c) =>
+            c.id === "b" && volume !== undefined ? { ...c, volume } : c,
+          ),
+        },
+      ],
+    };
+  };
+
+  it("没调过音量的片段是 1", () => {
+    expect(jobOf(planAudioJobs(withVolume(undefined), FULL), "b").volume).toBe(1);
+  });
+
+  it("原样带出来，只作用在自己那个片段上", () => {
+    const jobs = planAudioJobs(withVolume(0.25), FULL);
+    expect(jobOf(jobs, "b").volume).toBe(0.25);
+    expect(jobOf(jobs, "a").volume).toBe(1);
+  });
+
+  it("**不乘进 baseGain**——两个来源在这一层必须还分得开", () => {
+    // 乘在一起之后"淡化进度算错了"和"音量传错了"在返回值上长得一模一样，
+    // 而这一层唯一的用处就是让一条断言只因为一个原因红。相乘在 envelopeInput。
+    //
+    // **导出区间必须从窗口中间切过去**：整条导出时入场片段的 baseGain 恰好是 0
+    // （窗口起点上的淡化曲线值），而 `0 × 音量` 还是 0——那个用例里把音量乘进去
+    // 一个字节都看不出来。反向验证当场抓到了这一点。窗口 [90,110)，从 100 切
+    // → 进度 0.5 → 等功率增益 sin(π/4)，一个既不是 0 也不是 1 的值
+    const cut = { inFrame: 100, outFrame: 400 };
+    const plain = jobOf(planAudioJobs(withVolume(undefined, true), cut), "b");
+    const quiet = jobOf(planAudioJobs(withVolume(0.25, true), cut), "b");
+
+    expect(plain.baseGain).toBeCloseTo(Math.SQRT1_2, 6); // 健康值，先钉住它不是 0/1
+    expect(quiet.baseGain).toBe(plain.baseGain);
+    expect(quiet.ramps).toEqual(plain.ramps);
+    expect(quiet.volume).toBe(0.25);
+  });
+
+  it("音量为 0 的片段照常排期", () => {
+    // 不顺手跳过：等价的做法是"静音就别解码了"，但那对**静态**音量才成立，
+    // 做包络之后 volume 会随时间变，那时"这一刻是 0"完全不意味着整段是静音
+    const jobs = planAudioJobs(withVolume(0), FULL);
+    expect(jobOf(jobs, "b").volume).toBe(0);
+    expect(jobs).toHaveLength(2);
+  });
+});
+
 describe("解码区间要按 clipRenderSpan 撑开", () => {
   it("出场段向后多解半个窗口，入场段向前多解半个窗口", () => {
     const jobs = planAudioJobs(crossfadeTimeline(), FULL);

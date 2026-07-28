@@ -98,6 +98,16 @@ export interface AudioJob {
   readonly baseGain: number;
   /** 按时间先后排；D19 保证两段永不重叠，所以可以直接顺序喂给 AudioParam。 */
   readonly ramps: readonly CrossfadeRamp[];
+  /**
+   * 片段的静态音量倍数（`MediaClip.volume`，缺省 1）。
+   *
+   * **刻意不乘进 `baseGain` / 各条 `ramps` 里**，尽管那在算术上完全等价。这一层
+   * 唯一的用处是可单测，而乘在一起之后"淡化的进度算错了"和"音量传错了"在返回值
+   * 上就分不开——两者都表现为"某个数不对"。分开留着，一条断言只会因为一个原因红。
+   *
+   * 相乘发生在 `mixdown.ts` 的 `envelopeInput`，那里也是恒等快路径的判据所在。
+   */
+  readonly volume: number;
 }
 
 /**
@@ -176,6 +186,7 @@ export function planAudioJobs(timeline: Timeline, range: RenderRange): AudioJob[
         ),
         baseGain,
         ramps,
+        volume: clip.volume ?? 1,
       });
     }
   }

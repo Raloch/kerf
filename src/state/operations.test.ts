@@ -23,6 +23,7 @@ import {
   removeKeyframe,
   rippleDeleteClip,
   setClipColor,
+  setClipVolume,
   setClipLut,
   setClipTransform,
   setKeyframe,
@@ -557,6 +558,66 @@ describe("静态变换", () => {
   it("锁定轨道上改不动", () => {
     const t = timeline([{ id: "V1", kind: "video", locked: true, clips: [clip("a", 0, 100)] }]);
     expect(setClipTransform(t, "a", { x: 10 }).reason).toContain("锁定");
+  });
+});
+
+describe("片段音量", () => {
+  const one = () =>
+    timeline([
+      { id: "A1", kind: "audio", clips: [clip("a", 0, 100)] },
+      { id: "T1", kind: "video", clips: [textClip("t", 0, 100)] },
+    ]);
+
+  it("设值后写进 volume", () => {
+    const r = setClipVolume(one(), "a", 0.5);
+    expect(media(findClip(r.timeline, "a")!.clip).volume).toBe(0.5);
+  });
+
+  it("超范围的值被夹住，不是拒绝", () => {
+    expect(media(findClip(setClipVolume(one(), "a", 9).timeline, "a")!.clip).volume).toBe(2);
+    expect(media(findClip(setClipVolume(one(), "a", -3).timeline, "a")!.clip).volume).toBe(0);
+  });
+
+  it("拒绝 NaN", () => {
+    // NaN 会一路传到 GainNode，那一段整个静音且不报错
+    const r = setClipVolume(one(), "a", Number.NaN);
+    expect(r.changed).toBe(false);
+    expect(r.reason).toContain("有限数");
+  });
+
+  it("调回 100% 时把 volume 字段整个删掉，不留 volume:1", () => {
+    // 混音那边的恒等快路径判的是值，所以这不是正确性问题；但"这个片段调过音量
+    // 没有"要能在数据层一眼看出来，重置按钮的可用状态也照着它判
+    const set = setClipVolume(one(), "a", 0.3).timeline;
+    const back = setClipVolume(set, "a", 1).timeline;
+    expect("volume" in findClip(back, "a")!.clip).toBe(false);
+  });
+
+  it("值没变时 changed:false 且不给 reason", () => {
+    // 滑块拖到边界后会持续发同一个值，当失败处理会让状态栏一直闪红字
+    const set = setClipVolume(one(), "a", 0.5).timeline;
+    const again = setClipVolume(set, "a", 0.5);
+    expect(again.changed).toBe(false);
+    expect(again.reason).toBeUndefined();
+  });
+
+  it("夹紧之后等于原值也算「值没变」", () => {
+    // 已经在上限上还继续往上拖：夹紧后仍是 2，不该记一步撤销
+    const set = setClipVolume(one(), "a", 2).timeline;
+    const again = setClipVolume(set, "a", 5);
+    expect(again.changed).toBe(false);
+    expect(again.reason).toBeUndefined();
+  });
+
+  it("文字片段拒掉，不静默忽略", () => {
+    const r = setClipVolume(one(), "t", 0.5);
+    expect(r.changed).toBe(false);
+    expect(r.reason).toContain("没有音量");
+  });
+
+  it("锁定轨道上改不动", () => {
+    const t = timeline([{ id: "A1", kind: "audio", locked: true, clips: [clip("a", 0, 100)] }]);
+    expect(setClipVolume(t, "a", 0.5).reason).toContain("锁定");
   });
 });
 

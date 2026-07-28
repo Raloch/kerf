@@ -531,6 +531,19 @@ export const PROPERTY_RANGES: Record<AnimatableProperty, PropertyRange> = {
   lutIntensity: { fallback: 1, min: 0, max: 1 },
 };
 
+/**
+ * 片段音量的缺省值与取值范围。
+ *
+ * **刻意不在 `PROPERTY_RANGES` 里**：那张表键在 `AnimatableProperty` 上，而音量
+ * 这一轮只有静态值、还不能打关键帧。做包络时把 `volume` 加进 `ANIMATABLE_PROPERTIES`，
+ * 这条常量就搬进那张表里（届时这里删掉，编译器会指着 `setClipVolume` 要求改）。
+ *
+ * 上限 2（约 +6dB）而不是更高：再往上几乎必然削波，而 Web Audio 到编码器那一步
+ * 是**硬截断、不抛错**，用户听到的只是"声音变糊了"，查不到原因。下限 0 就是静音，
+ * 和轨道级的 `muted` 不冲突——那个是"整条轨不参与混音"，这个是这一段的高低。
+ */
+export const VOLUME_RANGE: PropertyRange = { fallback: 1, min: 0, max: 2 };
+
 /** 变换补丁：给数值就设，显式给 `undefined` 就**删掉**这个属性（回到缺省）。 */
 export type TransformPatch = {
   readonly [K in TransformProperty]?: number | undefined;
@@ -848,6 +861,33 @@ export function setClipColor(timeline: Timeline, clipId: ClipId, patch: ColorPat
   if (sameGroup(COLOR_PROPERTIES, result.value, found.clip.color)) return unchanged(timeline);
 
   return ok(replaceClip(timeline, found.track.id, setOptional(found.clip, "color", result.value)));
+}
+
+/**
+ * 改片段音量。只有素材片段有音量，文字片段拒掉而不是静默忽略。
+ *
+ * 不走 `applyGroupPatch` 那一套：那是给"一组属性 + 关键帧通道"设计的，音量目前
+ * 是单个静态值，套进去要先造一个只有一项的组。做包络时会反过来——那时它就该
+ * 并进那一套里。
+ *
+ * **回到缺省值 1 时把字段整个删掉**（同 `normalizeGroup`）：合成器判的是值不是
+ * 字段，所以这不是正确性问题；但"这个片段调过音量没有"要能在数据层一眼看出来，
+ * 而混音那边的恒等快路径也正是照着这个值判的。
+ */
+export function setClipVolume(timeline: Timeline, clipId: ClipId, volume: number): EditResult {
+  const found = findClip(timeline, clipId);
+  if (!found) return reject(timeline, `找不到片段 ${clipId}`);
+  if (found.track.locked) return reject(timeline, "轨道已锁定");
+  if (found.clip.kind !== "media") return reject(timeline, "文字片段没有音量");
+  // NaN 会一路传到 GainNode，那一段整个静音且不报错
+  if (!Number.isFinite(volume)) return reject(timeline, "音量必须是有限数");
+
+  const clamped = Math.min(VOLUME_RANGE.max, Math.max(VOLUME_RANGE.min, volume));
+  // 滑块拖到边界后会持续发同一个值——那是"值没变"，不是失败（见 EditResult 那条约定）
+  if ((found.clip.volume ?? VOLUME_RANGE.fallback) === clamped) return unchanged(timeline);
+
+  const next = clamped === VOLUME_RANGE.fallback ? undefined : clamped;
+  return ok(replaceClip(timeline, found.track.id, setOptional(found.clip, "volume", next)));
 }
 
 /** 把某个属性的关键帧序列换成新的；空序列会连通道一起删掉。 */

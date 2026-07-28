@@ -599,22 +599,31 @@ function releaseContext(ctx: OfflineAudioContext): void {
 }
 
 /**
- * 这个片段该接到哪儿：没有淡化就直接接总线，有淡化就穿一个排好程的 `GainNode`。
+ * 这个片段该接到哪儿：增益恒等就直接接总线，否则穿一个排好程的 `GainNode`。
  *
  * **恒等增益走原路径**，和合成层 `isDefaultGeometry` / `isDefaultColor` 完全同构
  * （CLAUDE.md 合成层约定）。这里也不是性能优化：多一级节点意味着多一次浮点乘法，
- * 而没有转场的项目应该和加这个功能之前**逐样本一模一样**——否则 M0 自检里那条
- * "成片与素材的第一声位置差"就会开始漂，而漂的原因和转场毫无关系。
+ * 而没有转场、也没调过音量的项目应该和加这些功能之前**逐样本一模一样**——否则
+ * M0 自检里那条"成片与素材的第一声位置差"就会开始漂，而漂的原因和它们毫无关系。
+ *
+ * ## 两个增益来源合成一条链
+ *
+ * 淡化（`ramps`，交界处的形状）和音量（`volume`，整段的高低）是两个来源，但**只穿
+ * 一个节点**：静态音量是个常数，把它乘进起始值和每条曲线的采样点上就是精确的
+ * 合成，没有第二次浮点舍入。串两个 `GainNode` 也对，但那样"没调音量"的项目就
+ * 多穿了一级恒等节点，上面那条逐样本一致的保证要靠"第二级也走快路径"来维持，
+ * 判据从一个变成两个。**音量做成包络（关键帧）之后这条会变**：两条随时间变化的
+ * 曲线相乘就不再是常数缩放，届时要么把乘积采样成一条曲线，要么真的串两级。
  *
  * 两段包络可以直接顺序喂给同一个 `AudioParam`：D19 保证一个片段两侧的转场窗口
  * **永不重叠**（每个片段最多借出自己长度的一半），所以 `setValueCurveAtTime`
  * 不会撞上"曲线区间重叠"那个抛错。这条结构性保证在这里第二次收到回报。
  */
 function envelopeInput(ctx: OfflineAudioContext, job: AudioJob): AudioNode {
-  if (job.ramps.length === 0 && job.baseGain === 1) return ctx.destination;
+  if (job.ramps.length === 0 && job.baseGain === 1 && job.volume === 1) return ctx.destination;
 
   const gain = ctx.createGain();
-  gain.gain.setValueAtTime(job.baseGain, 0);
+  gain.gain.setValueAtTime(job.baseGain * job.volume, 0);
   for (const ramp of job.ramps) {
     const curve = crossfadeCurve(
       ramp.kind,
@@ -623,6 +632,12 @@ function envelopeInput(ctx: OfflineAudioContext, job: AudioJob): AudioNode {
       ramp.toProgress,
       ramp.points,
     );
+    // 音量为 1 时**一个采样点都不碰**，于是没调音量的项目里这条曲线与
+    // 加音量之前逐位相同——`× 1` 在浮点上确实是恒等，但少走一遍循环
+    // 也少一个"将来把这里改成别的算术"的机会
+    if (job.volume !== 1) {
+      for (let i = 0; i < curve.length; i++) curve[i]! *= job.volume;
+    }
     gain.gain.setValueCurveAtTime(curve, ramp.startSeconds, ramp.durationSeconds);
   }
   gain.connect(ctx.destination);
