@@ -357,7 +357,12 @@ export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult>
       audio: null,
       target: { kind: "opfs", name: VERIFY_OUT },
     },
-    { onProgress: () => undefined, isCanceled: () => false },
+    {
+      onProgress: () => undefined,
+      isCanceled: () => false,
+      // 这几条自检都传 audio: null，逐帧循环里的音频泵是空实现，拉不到这儿
+      pullAudio: async () => null,
+    },
   );
 
   checks.push(

@@ -6,7 +6,10 @@
  * 否则导出期间界面完全卡死（CLAUDE.md 硬规则 6）。
  *
  * **音频混流不在这里**：`OfflineAudioContext` 在 Worker 里不可用，
- * PCM 由主线程混好 transfer 进来（见 `audio/mixdown.ts`）。
+ * PCM 由主线程混好 transfer 进来（见 `audio/mixdown.ts`）。而且是**按段拉**的
+ * ——整条一次性传过来，一小时的项目就是 2GB。所以这里有一个小邮箱
+ * （`AudioChunkChannel`）：流水线发 `audio-pull`，主线程回 `audio-chunk`，
+ * 邮箱把那条消息接回到等着的那个 Promise 上。
  *
  * 结果也不再回传字节：`StreamTarget` 已经把成品写进用户选定的文件或 OPFS
  * （硬规则 9），回传的只有元信息。
@@ -17,6 +20,7 @@
  * 每条消息都要把状态复位干净——它不再是"一次性"的。
  */
 
+import type { MixChunk } from "../audio/mixdown";
 import { ExportCanceled, releaseResidentCompositor, runExport } from "./pipeline";
 import type { WorkerRequest, WorkerResponse } from "./protocol";
 
@@ -27,11 +31,66 @@ function post(message: WorkerResponse): void {
   self.postMessage(message);
 }
 
+/**
+ * 音频分段的邮箱：把 `audio-chunk` 消息接回到 `pull()` 那个 Promise 上。
+ *
+ * **同时可以有不止一个未决请求**：`makeAudioPump` 会预取，好让主线程混第 k+1 段
+ * 的同时这边在编第 k 段的视频。所以按段序号索引，而不是留一个槽位——留一个槽位
+ * 的第一版当场就炸在"请求重入"上。
+ *
+ * 取消时要把等着的那些 Promise 都叫醒（`reject`），否则流水线会永远停在
+ * `await pullAudio()` 上——用户点了取消而进度条不动，Worker 也不退出。
+ */
+class AudioChunkChannel {
+  private readonly pending = new Map<
+    number,
+    { readonly resolve: (chunk: MixChunk | null) => void; readonly reject: (e: Error) => void }
+  >();
+
+  pull(index: number): Promise<MixChunk | null> {
+    if (this.pending.has(index)) {
+      return Promise.reject(new Error(`音频分段请求重复：第 ${index} 段已经在等了`));
+    }
+    const promise = new Promise<MixChunk | null>((resolve, reject) => {
+      this.pending.set(index, { resolve, reject });
+      post({ type: "audio-pull", index });
+    });
+    // 兜底一个 rejection 处理器：`abort()` 可能在流水线已经因为别的原因倒下、
+    // 没人再 await 这个 Promise 时开火，那会变成 unhandled rejection——在 Worker
+    // 里表现为 `onerror`，主线程据此把这个常驻 Worker 当成坏的 terminate 掉
+    promise.catch(() => undefined);
+    return promise;
+  }
+
+  deliver(index: number, chunk: MixChunk | null, error?: string): void {
+    const waiting = this.pending.get(index);
+    if (!waiting) return;
+    this.pending.delete(index);
+    // 主线程混这一段炸了：**不能当成"音频到此为止"**，那会静默产出被截短的音轨
+    if (error) waiting.reject(new Error(error));
+    else waiting.resolve(chunk);
+  }
+
+  abort(reason: Error): void {
+    const waiting = [...this.pending.values()];
+    this.pending.clear();
+    for (const one of waiting) one.reject(reason);
+  }
+}
+
+const audioChannel = new AudioChunkChannel();
+
 self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
   const message = event.data;
 
   if (message.type === "cancel") {
     canceled = true;
+    audioChannel.abort(new ExportCanceled());
+    return;
+  }
+
+  if (message.type === "audio-chunk") {
+    audioChannel.deliver(message.index, message.chunk, message.error);
     return;
   }
 
@@ -55,6 +114,7 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
     const result = await runExport(message.request, {
       onProgress: (progress) => post({ type: "progress", progress }),
       isCanceled: () => canceled,
+      pullAudio: (index) => audioChannel.pull(index),
     });
     post({ type: "done", result });
   } catch (error) {
@@ -65,5 +125,8 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
     }
   } finally {
     running = false;
+    // Worker 跨导出存活，邮箱也是。上一次要是在等一段 PCM 的时候失败了，
+    // 那个槽位不清掉，下一次导出的第一次 pull 就会被当成"请求重入"直接拒掉
+    audioChannel.abort(new Error("导出已结束"));
   }
 };

@@ -166,7 +166,12 @@ async function exportAndMeasure(
       audio: null,
       target: { kind: "opfs", name },
     },
-    { onProgress: () => undefined, isCanceled: () => false },
+    {
+      onProgress: () => undefined,
+      isCanceled: () => false,
+      // 这几条自检都传 audio: null，逐帧循环里的音频泵是空实现，拉不到这儿
+      pullAudio: async () => null,
+    },
   );
 
   const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(await readExportFile(name)) });
@@ -259,7 +264,12 @@ export async function verifyPreviewMatchesExport(): Promise<PreviewVerifyResult>
       audio: null,
       target: { kind: "opfs", name: VERIFY_OUT },
     },
-    { onProgress: () => undefined, isCanceled: () => false },
+    {
+      onProgress: () => undefined,
+      isCanceled: () => false,
+      // 这几条自检都传 audio: null，逐帧循环里的音频泵是空实现，拉不到这儿
+      pullAudio: async () => null,
+    },
   );
   checks.push(check("导出单帧成功", 1, exported.encodedFrames));
 

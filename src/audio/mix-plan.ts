@@ -41,6 +41,25 @@ import {
 } from "../edl/types";
 import { frameToMicros } from "../time/timebase";
 
+/**
+ * 帧数 → 秒，**不经过微秒**。
+ *
+ * 管线里别处的秒一律走 `microsToSeconds(frameToMicros(...))`，那是硬规则 1 要的。
+ * 音频的**起播时刻**不能这么算：微秒取整在 48kHz 上是 **0.048 个样本**的误差，
+ * 而 Web Audio 的 `start(when)` 是亚采样精确的（Chrome 会按小数相位插值）。
+ * 于是同一个片段在不同段里被排期时相位不同，接缝两侧的波形对不上。
+ *
+ * 实测就是这么发现的：分段与不分段混出来的 PCM 差 **5.22e-4**，而 0.016 个样本
+ * 的相位差在 0.25 幅度的 1kHz 正弦上恰好是 5.3e-4——两个数对上了，改成精确
+ * 有理数之后归零。这不违反硬规则 1：帧运算仍然是整数帧号，只是**换算成秒的
+ * 那一步**不再多绕一道量化。
+ *
+ * `frames × den` 在 800 万帧、den=1001 时是 8e9，远在安全整数内。
+ */
+function exactSeconds(frames: number, fps: { readonly num: number; readonly den: number }): number {
+  return (frames * fps.den) / fps.num;
+}
+
 /** 一段增益包络。时间相对**导出区间起点**，不是时间轴起点。 */
 export interface CrossfadeRamp {
   readonly kind: AudioTransitionKind;
@@ -89,7 +108,7 @@ export interface AudioJob {
  */
 export function planAudioJobs(timeline: Timeline, range: RenderRange): AudioJob[] {
   const jobs: AudioJob[] = [];
-  const seconds = (frames: number) => microsToSeconds(frameToMicros(frames, timeline.fps));
+  const seconds = (frames: number) => exactSeconds(frames, timeline.fps);
 
   for (const track of timeline.tracks) {
     if (track.kind !== "audio" || track.muted) continue;

@@ -11,7 +11,7 @@
  * 其余（解码、合成、编码、封装）全在 Worker，导出期间界面不卡。
  */
 
-import type { MixedAudio } from "../audio/mixdown";
+import type { MixChunk, Mixer } from "../audio/mixdown";
 import type { RenderRange, Timeline } from "../edl/types";
 import type { ContainerChoice } from "../media/capability";
 import type {
@@ -35,6 +35,11 @@ export interface ExportOptions {
   readonly target: WriteTargetSpec;
   /** 成品写完后自动触发下载（仅 OPFS 回退路径需要；picker 路径已经写进用户选的文件）。 */
   readonly autoDownload?: boolean;
+  /**
+   * 混音的段长（秒）。**只有自检会传**——缺省 10 秒，而自检素材只有几秒，
+   * 不压小就只会跑出一段，分段路径等于完全没被走到。
+   */
+  readonly mixSegmentSeconds?: number;
 }
 
 export interface ExportHandle {
@@ -52,61 +57,64 @@ export function startExport(
   let worker: Worker | null = null;
 
   const done = (async (): Promise<ExportDone | null> => {
-    // ---- 阶段 1：主线程混音 ----
+    // ---- 阶段 1：建混音器，拿到元信息 ----
     // 动态 import：mixdown 拖着 mediabunny 的运行时（约 500KB），
     // 静态 import 会让它经由导出对话框回到首屏 chunk（实测踩过一次）
-    const { mixdown, mixedAudioTransferables } = await import("../audio/mixdown");
+    const { createMixer, mixChunkTransferables } = await import("../audio/mixdown");
 
     // 混音的常驻量要**主线程自己量**：计量器每个 JS 上下文一份，Worker 那份
-    // 看不到这一段。而混音恰恰是长片最可能先崩的地方——它要一次性把整条
-    // 时间轴的 PCM 分配出来，且中途有两三份同时活着（见 mixdown.ts 文件头）
+    // 看不到这一段。而混音恰恰是长片最可能先崩的地方——分段之前它要一次性把
+    // 整条时间轴的 PCM 分配出来，30 分钟实测峰值 989MB（见 mixdown.ts 文件头）
     const mixTracker = new ResidencyTracker();
     residency.reset();
-    const sampleMix = () => {
-      mixTracker.sample(0);
-      onProgress({
-        stage: "mix",
-        encodedFrames: 0,
-        totalFrames,
-        elapsedMs: 0,
-        residency: residency.snapshot(),
-      });
-    };
+    const sampleMix = () => mixTracker.sample(0);
 
-    sampleMix();
-    const audio = options.includeAudio
-      ? await mixdown(options.timeline, options.range, sampleMix)
+    onProgress({
+      stage: "mix",
+      encodedFrames: 0,
+      totalFrames,
+      elapsedMs: 0,
+      residency: residency.snapshot(),
+    });
+    // 这一步只探"有没有解得出来的音轨"并排期，不解 PCM——真正的混音跟着
+    // Worker 的 `audio-pull` 一段一段地跑
+    const mixer = options.includeAudio
+      ? await createMixer(options.timeline, options.range, {
+          onSample: sampleMix,
+          ...(options.mixSegmentSeconds !== undefined
+            ? { segmentSeconds: options.mixSegmentSeconds }
+            : {}),
+        })
       : null;
     sampleMix();
-    if (canceled) return null;
+    if (canceled) {
+      mixer?.dispose();
+      return null;
+    }
 
-    // ---- 阶段 2：交给 Worker ----
+    // ---- 阶段 2：交给 Worker，边编码边喂段 ----
     const request: ExportRequest = {
       timeline: options.timeline,
       range: options.range,
       container: options.container,
       videoBitrate: options.videoBitrate,
       audioBitrate: options.audioBitrate,
-      audio,
+      audio: mixer?.header ?? null,
       target: options.target,
     };
 
-    const result = await runInWorker(
-      request,
-      audio ? mixedAudioTransferables(audio) : [],
-      onProgress,
-      (w) => {
+    let result: ExportDone | null;
+    try {
+      result = await runInWorker(request, mixer, mixChunkTransferables, sampleMix, onProgress, (w) => {
         worker = w;
-        // 这个回调在 postMessage **之后**才被调，所以 PCM 的所有权已经交给
-        // Worker 了（transfer 之后主线程这边是零长数组）。计量报的是"我们还
-        // 引用着多少"，那就得在这里销账——否则 mixTracker 的末尾采样会一直
-        // 显示几百 MB，看起来像主线程没放手
-        residency.setAudioPcmBytes(0);
-        sampleMix();
         // 混音期间用户就点了取消
         if (canceled) w.postMessage({ type: "cancel" } satisfies WorkerRequest);
-      },
-    );
+      });
+    } finally {
+      mixer?.dispose();
+      residency.setAudioPcmBytes(0);
+      sampleMix();
+    }
 
     if (!result) return null;
     // Worker 报的 residency 只覆盖导出循环，混音那一段挂在这里合并回去
@@ -168,12 +176,51 @@ export function releaseExportResources(): void {
 
 function runInWorker(
   request: ExportRequest,
-  audioTransfer: Transferable[],
+  mixer: Mixer | null,
+  transferablesOf: (chunk: MixChunk) => Transferable[],
+  sampleMix: () => void,
   onProgress: (progress: ExportProgress) => void,
   onReady: (worker: Worker) => void,
 ): Promise<ExportDone | null> {
   const worker = getWorker();
   let settled = false;
+  /**
+   * 混音是串行的（`Mixer.next()` 共用一个解码池），而 `audio-pull` 是消息驱动的
+   * ——预取会让两条请求挨得很近。用一条 Promise 链把它们排成队，比在 `next()`
+   * 里加锁简单，也不需要 mixer 知道有并发这回事。
+   */
+  let mixQueue: Promise<void> = Promise.resolve();
+  /**
+   * 混音炸了要让**整次导出**失败，不能当成"音频到此为止"——后者会静默产出一条
+   * 被截短的音轨（硬规则 10 那类"选了 A 拿到 B"）。所以错误既发给 Worker（叫醒
+   * 它那个 await），也留在这里：Worker 走取消路径回来时用它替掉"用户取消"。
+   */
+  let mixError: Error | null = null;
+
+  const answerPull = (index: number): void => {
+    mixQueue = mixQueue.then(async () => {
+      if (mixError) {
+        worker.postMessage({ type: "audio-chunk", index, chunk: null, error: mixError.message });
+        return;
+      }
+      try {
+        const chunk = (await mixer?.next()) ?? null;
+        if (chunk && chunk.index !== index) {
+          throw new Error(`音频分段乱序：要第 ${index} 段，混出来的是第 ${chunk.index} 段`);
+        }
+        sampleMix();
+        const message: WorkerRequest = { type: "audio-chunk", index, chunk };
+        // PCM 每段几 MB，transfer 而不是结构化克隆——克隆会整份复制一遍。
+        // post 之后 `chunk.channels` 在主线程这边就是零长数组了，不能再读
+        worker.postMessage(message, chunk ? transferablesOf(chunk) : []);
+        residency.setAudioPcmBytes(0);
+        sampleMix();
+      } catch (error) {
+        mixError = error instanceof Error ? error : new Error(String(error));
+        worker.postMessage({ type: "audio-chunk", index, chunk: null, error: mixError.message });
+      }
+    });
+  };
 
   const promise = new Promise<ExportDone | null>((resolve, reject) => {
     // 每次导出重挂 handler：Worker 是复用的，上一次的闭包还挂着就会
@@ -184,19 +231,25 @@ function runInWorker(
         case "progress":
           onProgress(message.progress);
           break;
+        case "audio-pull":
+          answerPull(message.index);
+          break;
         case "done":
           settled = true;
           resolve(message.result);
           break;
         case "canceled":
           settled = true;
-          resolve(null);
+          // 混音失败会让 Worker 那边的 await 抛 ExportCanceled，于是它回的是
+          // "canceled"。那不是用户取消，要把真正的原因报出去
+          if (mixError) reject(mixError);
+          else resolve(null);
           break;
         case "error":
           settled = true;
           // 业务错误（编码器不可用、写盘失败等）由管道自己收拾干净，
           // Worker 仍然可用，留着它——常驻的意义就在这里
-          reject(new Error(message.message));
+          reject(mixError ?? new Error(message.message));
           break;
       }
     };
@@ -210,9 +263,8 @@ function runInWorker(
     };
   });
 
-  // PCM 可能有几百 MB，必须 transfer 而不是结构化克隆——克隆会整份复制一遍
   const startMessage: WorkerRequest = { type: "start", request };
-  worker.postMessage(startMessage, audioTransfer);
+  worker.postMessage(startMessage);
   onReady(worker);
 
   return promise;

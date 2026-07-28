@@ -20,8 +20,10 @@ import { makeSampleVideo } from "./make-sample";
 import { probeFile } from "../media/probe";
 import { startExport } from "../export/client";
 import { readExportFile, removeExportFile } from "../export/write-target";
-import { singleClipTimeline, type Timeline } from "../edl/types";
+import { singleClipTimeline, type MediaSource, type Timeline } from "../edl/types";
 import { crossfadeGain } from "../audio/crossfade";
+import { createMixer, MIX_CHANNELS, MIX_SAMPLE_RATE } from "../audio/mixdown";
+import { formatBytes, residency } from "../export/residency";
 import { FPS, toNumber } from "../time/rational";
 import { frameToSeconds } from "../time/timebase";
 
@@ -297,6 +299,35 @@ const RMS_WINDOW = 0.04;
 const XFADE_PROBES = [0.25, 0.5, 0.75] as const;
 
 /**
+ * 淡化自检里用的段长（秒）。**远小于素材长度是刻意的**——缺省 10 秒会让
+ * 这条 6 秒的时间轴只跑出一段，分段路径整个不被走到。
+ */
+const XFADE_SEGMENT_SECONDS = 0.5;
+
+/**
+ * "分段与不分段混出来的 PCM 一致"的容差，**无转场**那一路。
+ *
+ * 自检素材是 48kHz 单声道、输出也是 48kHz，中间既没有重采样也没有采样率转换，
+ * 所以健康值应当是纯 float64 噪声——实测 **1.82e-12**。
+ *
+ * 破坏侧有实测值垫底：起播时刻经微秒取整时是 **5.22e-4**（那是真踩过的 bug，
+ * 见 `mix-plan.ts` 的 `exactSeconds`）。容差落在两者之间，离健康值六个数量级、
+ * 离破坏值两个数量级。
+ */
+const SEGMENT_MATCH_TOLERANCE = 1e-6;
+
+/**
+ * 带淡化那一路的容差。
+ *
+ * 健康值 **1.49e-8**，比上面高四个数量级，原因是包络曲线存在 `Float32Array` 里
+ * ——f32 的相对精度约 1e-7，落在 0.25 幅度上就是这个量级。**这是精度地板，
+ * 不是误差**，所以不能用同一个 1.82e-12 去要求它。
+ *
+ * 仍然取 1e-6：离健康值 67 倍，离实测破坏值（5.2e-4 / 7.4e-4）两个数量级。
+ */
+const SEGMENT_ENVELOPE_TOLERANCE = 1e-6;
+
+/**
  * 增益比值的容差。**两侧都是量出来的，不是估的。**
  *
  * 破坏侧最轻的一档是"整条包络被丢掉"（比值恒为 1）在 t=0.25 上的偏差：
@@ -343,6 +374,235 @@ const XFADE_TOLERANCE = 0.03;
  * 缺省的每秒一声提示音在 0.667 秒的窗口里可能一声都没有，那时 RMS 全是 0，
  * 三条断言会**同时通过**（0 和 0 比较总是相等）——测的是运气不是代码。
  */
+/**
+ * 分段混音是否**透明**：同一条时间轴，切成很多段混 vs 一整段混，逐样本比对。
+ *
+ * 这条断言存在的理由是**隔离**。分段的失效形态里最坏的一种是接缝错开一个样本
+ * ——20.8µs 的台阶，在连续波形上是一声轻微咔哒，而下面那 9 条 RMS 包络断言
+ * 对它**完全免疫**（40ms 窗口里一个样本的偏差淹没在噪声里）。走一遍编码器再读
+ * 回来更查不出：AAC 是有损的，它自己就会改动样本值。
+ *
+ * 所以这里绕开编码器和封装器，直接拿两次混音的 PCM 对拍。素材是 48kHz、
+ * 输出也是 48kHz，中间没有重采样，健康值应当是**精确的 0**。
+ *
+ * 三条断言缺一不可：
+ *
+ * - **段数确实大于 1**——不然比的是同一条路径跑两遍，恒绿。这是"先确认健康值
+ *   量的是被测对象"那条规矩的直接应用。
+ * - **参照那次确实只有一段**——它是被比对的基准，自己分了段就说明不了问题。
+ * - **PCM 里真的有信号**——两条静音也是逐样本一致的。
+ */
+async function verifyMixSegmentation(timeline: Timeline, total: number): Promise<Check[]> {
+  const range = { inFrame: 0, outFrame: total };
+
+  const compare = async (label: string, target: Timeline, tolerance: number) => {
+    const inner: Check[] = [];
+    // 段长取得比整条还长 = 一段。这就是分段之前的行为，拿它当基准
+    const whole = await mixWholeTimeline(target, range, 3600);
+    const split = await mixWholeTimeline(target, range, XFADE_SEGMENT_SECONDS);
+
+    inner.push(
+      check(`分段自检（${label}）：参照混音只有一段`, 1, whole.segments),
+      check(
+        `分段自检（${label}）：对照混音真的切开了`,
+        "> 1 段",
+        `${split.segments} 段`,
+        split.segments > 1,
+      ),
+      check(`分段自检（${label}）：总样本数一致`, whole.frameCount, split.frameCount),
+    );
+
+    let peak = 0;
+    let worst = 0;
+    let worstAt = -1;
+    let firstBad = -1;
+    let badCount = 0;
+    const length = Math.min(whole.frameCount, split.frameCount);
+    for (let ch = 0; ch < MIX_CHANNELS; ch++) {
+      const a = whole.planes[ch]!;
+      const b = split.planes[ch]!;
+      for (let i = 0; i < length; i++) {
+        const av = a[i]!;
+        if (Math.abs(av) > peak) peak = Math.abs(av);
+        const diff = Math.abs(av - b[i]!);
+        if (diff > tolerance) {
+          badCount++;
+          if (firstBad < 0) firstBad = i;
+        }
+        if (diff > worst) {
+          worst = diff;
+          worstAt = i;
+        }
+      }
+    }
+
+    inner.push(
+      check(
+        `分段自检（${label}）：参照 PCM 里有信号`,
+        "峰值 > 0.05",
+        peak.toFixed(4),
+        peak > 0.05,
+      ),
+      check(
+        `分段自检（${label}）：分段与不分段一致`,
+        `最大差 < ${tolerance}`,
+        // **把定位信息一起印出来**：只报一个最大值时，"某一段整段错位"和"接缝上
+        // 差几个样本"长得一模一样，而这两个的处置完全不同。第一个越界样本的位置
+        // 除以段长就知道是哪一段先坏的
+        `${worst.toExponential(2)}（第 ${worstAt} 个样本，峰值 ${peak.toFixed(3)}）` +
+          ` · 越界 ${badCount}/${length * MIX_CHANNELS} 个，首个在 ${firstBad}`,
+        worst < tolerance,
+      ),
+    );
+    return inner;
+  };
+
+  return [
+    ...(await compare("无转场", withoutAudioTransitions(timeline), SEGMENT_MATCH_TOLERANCE)),
+    ...(await compare("带淡化", timeline, SEGMENT_ENVELOPE_TOLERANCE)),
+  ];
+}
+
+/**
+ * 分段的**目的**本身：混音峰值不随片长增长。
+ *
+ * 这是 M3 那条"长视频内存"风险的验收判据，也是唯一能证明分段有用的断言——
+ * 上面那些只证明了分段**没把声音弄坏**。
+ *
+ * 做法是同一种素材接出两条长度差 4 倍的时间轴，各混一遍，比峰值。峰值必须在
+ * `renderSegment` **内部**采（`onSample`）：段与段之间解码结果和渲染目标都已经
+ * 销账，那时采到的是谷值，两条长度当然都一样——那种"绿"什么也没说明。
+ *
+ * 判据取 1.5 倍而不是"完全相等"：长的那条一段里可能多压上一个片段，允许有常数
+ * 级差别，但**不允许 4 倍**。旧行为（整条混）在这两条上正好是 1:4。
+ */
+const RESIDENCY_SEGMENT_SECONDS = 2;
+
+async function verifyMixResidency(source: MediaSource, clipFrames: number): Promise<Check[]> {
+  const build = (count: number): Timeline => ({
+    fps: source.fps,
+    width: source.width,
+    height: source.height,
+    durationFrames: clipFrames * count,
+    sources: [source],
+    tracks: [
+      {
+        id: "A1",
+        kind: "audio",
+        clips: Array.from({ length: count }, (_, i) => ({
+          id: `a${i}`,
+          kind: "media" as const,
+          sourceId: source.id,
+          timelineIn: i * clipFrames,
+          timelineOut: (i + 1) * clipFrames,
+          sourceIn: 0,
+        })),
+      },
+    ],
+  });
+
+  const peakOf = async (count: number): Promise<number> => {
+    let peak = 0;
+    const mixer = await createMixer(build(count), { inFrame: 0, outFrame: clipFrames * count }, {
+      // **两边都必须切成好几段**，否则比的是"一段装得下"和"要好几段"这两件不同的事
+      // ——第一版短的那条只有一段，比值 2.04，看起来像还在随片长涨
+      segmentSeconds: RESIDENCY_SEGMENT_SECONDS,
+      onSample: () => {
+        const snapshot = residency.snapshot();
+        peak = Math.max(peak, snapshot.audioMixBytes + snapshot.audioPcmBytes);
+      },
+    });
+    if (!mixer) throw new Error("常驻量自检：混音器建不起来");
+    try {
+      while (await mixer.next()) {
+        /* 逐段跑完，峰值由 onSample 采到 */
+      }
+    } finally {
+      mixer.dispose();
+    }
+    return peak;
+  };
+
+  const shortPeak = await peakOf(5);
+  const longPeak = await peakOf(20);
+  const ratio = shortPeak > 0 ? longPeak / shortPeak : Infinity;
+  // 一段交出去的 PCM 有多大。峰值必须**明显**比它大——峰值那一刻源片解码结果和
+  // 渲染目标同时活着，两者都比交出去的那截大
+  const chunkBytes = RESIDENCY_SEGMENT_SECONDS * MIX_SAMPLE_RATE * MIX_CHANNELS * 4;
+  return [
+    // **这条是被反向验证逼出来的。** 第一版只断言"峰值 > 0"，而把采样点错误地挪到
+    // 段与段之间（那时解码结果和渲染目标都已销账）仍然读得到 751KB——上一段交出去
+    // 的 PCM 还挂在计量上——于是断言全绿而量的根本不是峰值。健康值 2.0MB = 2.7×，
+    // 错误采样点恰好是 1.0×，取 1.5 落在两者之间
+    check(
+      "常驻量自检：峰值确实采在段内（不是段间的谷值）",
+      `> 1.5 × 单段 ${formatBytes(chunkBytes)}`,
+      `${formatBytes(shortPeak)} = ${(shortPeak / chunkBytes).toFixed(2)}×`,
+      shortPeak > chunkBytes * 1.5,
+    ),
+    check(
+      "常驻量自检：峰值不随片长增长（4× 长度）",
+      "比值 < 1.5",
+      `${formatBytes(shortPeak)} → ${formatBytes(longPeak)}，比值 ${ratio.toFixed(2)}`,
+      ratio < 1.5,
+    ),
+  ];
+}
+
+/** 把整条时间轴按指定段长混完，拼成完整 PCM。段长大于片长就是"不分段"。 */
+async function mixWholeTimeline(
+  timeline: Timeline,
+  range: { readonly inFrame: number; readonly outFrame: number },
+  segmentSeconds: number,
+  padSeconds?: number,
+): Promise<{
+  readonly planes: Float32Array[];
+  readonly segments: number;
+  readonly frameCount: number;
+}> {
+  const mixer = await createMixer(timeline, range, {
+    segmentSeconds,
+    ...(padSeconds !== undefined ? { padSeconds } : {}),
+  });
+  if (!mixer) throw new Error("分段自检：混音器建不起来（素材没有可解的音轨？）");
+  try {
+    const { frameCount } = mixer.header;
+    const planes = Array.from({ length: MIX_CHANNELS }, () => new Float32Array(frameCount));
+    let segments = 0;
+    for (;;) {
+      const chunk = await mixer.next();
+      if (!chunk) break;
+      for (let ch = 0; ch < MIX_CHANNELS; ch++) {
+        const plane = chunk.channels[ch];
+        if (plane) planes[ch]!.set(plane, chunk.startSample);
+      }
+      segments++;
+    }
+    return { planes, segments, frameCount };
+  } finally {
+    mixer.dispose();
+  }
+}
+
+/** 把音频轨上的转场全部摘掉，其余原样。用来把包络的影响从分段比对里剥出来。 */
+function withoutAudioTransitions(timeline: Timeline): Timeline {
+  return {
+    ...timeline,
+    tracks: timeline.tracks.map((track) =>
+      track.kind !== "audio"
+        ? track
+        : {
+            ...track,
+            clips: track.clips.map((clip) => {
+              if (!("transitionIn" in clip) || clip.transitionIn === undefined) return clip;
+              const { transitionIn: _drop, ...rest } = clip;
+              return rest;
+            }),
+          },
+    ),
+  };
+}
+
 async function verifyCrossfade(): Promise<Check[]> {
   const checks: Check[] = [];
   const total = SEG * 3;
@@ -407,6 +667,10 @@ async function verifyCrossfade(): Promise<Check[]> {
     ],
   };
 
+  // 分段混音是否透明，先在**不经过编码器**的地方判掉——见 verifyMixSegmentation
+  checks.push(...(await verifyMixSegmentation(timeline, total)));
+  checks.push(...(await verifyMixResidency(tone, SEG)));
+
   await removeExportFile(XFADE_OUT);
   const done = await startExport(
     {
@@ -418,6 +682,10 @@ async function verifyCrossfade(): Promise<Check[]> {
       includeAudio: true,
       target: { kind: "opfs", name: XFADE_OUT },
       autoDownload: false,
+      // **刻意压到远小于素材长度**：缺省 10 秒，而这条时间轴只有 6 秒，不压小
+      // 就只跑出一段,下面那 9 条包络断言一次都碰不到段边界。压到 0.5 秒之后
+      // 整个淡化窗口横跨好几段,拉取顺序、priming 跨段扣、接缝全在被测范围内
+      mixSegmentSeconds: XFADE_SEGMENT_SECONDS,
     },
     () => undefined,
   ).done;

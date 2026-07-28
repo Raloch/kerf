@@ -10,8 +10,13 @@
  * 不需要额外的序列化层。`File` 克隆进 Worker 不复制内容，只是转移引用。
  *
  * **音频例外**：Worker 里没有 `OfflineAudioContext`（硬规则 6），
- * 多轨混流只能在主线程算好 PCM 再 transfer 进来，所以 `audio` 是请求的一部分，
- * 而不是 Worker 自己去混。
+ * 多轨混流只能在主线程算好 PCM 再 transfer 进来。请求里带的只有**元信息**
+ * （`MixHeader`）——Worker 据此建音轨、探编码器延迟；PCM 本身**按段拉取**：
+ * Worker 发 `audio-pull`，主线程混好一段回一条 `audio-chunk`。
+ *
+ * 之所以是"拉"而不是"推"，是为了**背压**。推的话主线程会尽快把所有段混完发过来，
+ * Worker 那边照样堆成整条 PCM，峰值一个字节都没省，只是从主线程搬到了 Worker。
+ * 拉才能让同时活着的段数有上界（见 `pipeline.ts` 的 `AudioChunkChannel`）。
  */
 
 import type { Rational } from "../time/rational";
@@ -19,7 +24,7 @@ import type { ContainerChoice } from "../media/capability";
 import type { RenderRange, Timeline } from "../edl/types";
 import type { EncoderDelay } from "../audio/encoder-delay";
 import type { CompositorBackend } from "../compose/backend";
-import type { MixedAudio } from "../audio/mixdown";
+import type { MixChunk, MixHeader } from "../audio/mixdown";
 import type { ResidencyReport, ResidencySnapshot } from "./residency";
 import type { WriteTargetSpec } from "./write-target";
 
@@ -30,8 +35,13 @@ export interface ExportRequest {
   readonly container: ContainerChoice;
   readonly videoBitrate: number;
   readonly audioBitrate: number;
-  /** 主线程混好的 PCM。null 表示这次导出没有音频。 */
-  readonly audio: MixedAudio | null;
+  /**
+   * 主线程混音的元信息。null 表示这次导出没有音频。
+   *
+   * **PCM 不在这里**——它按段拉取，见文件头。这个字段只回答"要不要建音轨、
+   * 采样率和声道数是多少、一共多少样本"，那三件事都发生在逐帧循环开始之前。
+   */
+  readonly audio: MixHeader | null;
   readonly target: WriteTargetSpec;
 }
 
@@ -110,6 +120,25 @@ export interface ExportPlan {
 
 export type WorkerRequest =
   | { readonly type: "start"; readonly request: ExportRequest }
+  /**
+   * 应答一次 `audio-pull`。`chunk` 为 null 表示**没有更多段了**。
+   *
+   * `error` 非空表示主线程混这一段时炸了。**不能当成"音频结束"处理**——那会
+   * 静默产出一条被截短的音轨（硬规则 10 那类"选了 A 拿到 B"），必须让整次导出失败。
+   */
+  | {
+      readonly type: "audio-chunk";
+      /**
+       * 应答的是哪一次 `audio-pull`。
+       *
+       * **不能靠 `chunk.index` 认领**：`chunk` 为 null（产完了 / 混炸了）时没有
+       * 段序号可读，而那恰恰是必须把等着的那个 Promise 叫醒的时刻。同时在飞的
+       * 请求不止一个（预取），认领错了就是死等。
+       */
+      readonly index: number;
+      readonly chunk: MixChunk | null;
+      readonly error?: string;
+    }
   | { readonly type: "cancel" }
   /**
    * 放掉常驻资源（合成器画布），但**不结束 Worker**。
@@ -123,6 +152,8 @@ export type WorkerRequest =
 
 export type WorkerResponse =
   | { readonly type: "progress"; readonly progress: ExportProgress }
+  /** 要第 `index` 段 PCM。主线程按序应答一条 `audio-chunk`。 */
+  | { readonly type: "audio-pull"; readonly index: number }
   | { readonly type: "done"; readonly result: ExportDone }
   | { readonly type: "error"; readonly message: string }
   | { readonly type: "canceled" };

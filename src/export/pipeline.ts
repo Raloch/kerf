@@ -40,6 +40,7 @@ import {
 } from "mediabunny";
 
 import { measureEncoderDelay, type EncoderDelay } from "../audio/encoder-delay";
+import type { MixChunk, MixHeader } from "../audio/mixdown";
 import { createCompositor, type CompositorBackend } from "../compose/backend";
 import type { ComposeLayer, ComposeSourceLayer, Compositor } from "../compose/compositor";
 import { residency, ResidencyTracker } from "./residency";
@@ -56,6 +57,14 @@ export interface PipelineHooks {
   onProgress(progress: ExportProgress): void;
   /** 返回 true 表示用户已取消，流水线会尽快停下并清理。 */
   isCanceled(): boolean;
+  /**
+   * 向主线程要第 `index` 段混好的 PCM，产完返回 null。
+   *
+   * 这是**唯一**能拿到音频的口子：混音在主线程（硬规则 6），而整条 PCM 一小时
+   * 能到 2GB，所以按段拉。混那一段出错时这里抛，整次导出跟着失败——静默截短
+   * 音轨比失败坏得多。
+   */
+  pullAudio(index: number): Promise<MixChunk | null>;
 }
 
 export class ExportCanceled extends Error {
@@ -92,9 +101,9 @@ export async function runExport(
   const leftover = residency.reset();
   // text-raster 的缓存字节由它自己算，这里注入取值函数，避免 residency 反向依赖 compose
   residency.bindTextRasterBytes(textRasterCacheBytes);
-  residency.setAudioPcmBytes(
-    audio ? audio.channels.reduce((sum, plane) => sum + plane.byteLength, 0) : 0,
-  );
+  // PCM 不再一次性拿到手，`audioPcmBytes` 由音频泵按"此刻攥着几段"逐段维护。
+  // 这一项从"随片长线性增长"变成"有上界"，正是分段要证明的事
+  residency.setAudioPcmBytes(0);
 
   const report = (stage: ExportProgress["stage"], encodedFrames: number) => {
     hooks.onProgress({
@@ -171,7 +180,9 @@ export async function runExport(
     checkCancel();
 
     const frameDurationSeconds = frameDurationMicros(timeline.fps) / MICROS_PER_SECOND;
-    const pumpAudio = makeAudioPump(audio, audioSource, encoderDelay.samples);
+    const pumpAudio = makeAudioPump(audio, audioSource, encoderDelay.samples, (index) =>
+      hooks.pullAudio(index),
+    );
 
     let lastReportedAt = 0;
     for (let i = 0; i < totalFrames; i++) {
@@ -406,58 +417,203 @@ function audioCodecString(codec: AudioCodec): string | null {
 }
 
 /**
- * 造一个"把音频喂到指定时刻"的函数。
+ * 段的预取深度。**1 表示"手上这段之外再多要一段"。**
  *
- * 主线程混好的 PCM 是 f32-planar 的一组声道数组，切块时要把各声道的这一段
+ * 0 会把两条线串起来：Worker 每次都停下来等主线程混完下一段，而混一段要真解
+ * 音频，长片上累计几十秒的干等。预取 1 就够——主线程混第 k+1 段的同时 Worker
+ * 在编第 k 段的视频，两边都不闲着。再大只是把峰值抬高，换不到吞吐。
+ */
+const AUDIO_PREFETCH = 1;
+
+/**
+ * 按段拉取 PCM，拼成"把音频喂到指定时刻"的函数。
+ *
+ * 混好的 PCM 是 f32-planar 的一组声道数组，切块时要把各声道的这一段
  * **按平面顺序拼进一个连续数组**（ch0 全部帧，然后 ch1 全部帧），
  * 这是 `f32-planar` 的内存布局；写成交错格式会得到左右声道互相穿插的噪音。
  *
  * `delayFrames` 是编码器的 priming 长度，要从 PCM **头部**丢掉这么多帧。
  * 为什么必须这么做、以及为什么容器这一层补偿不了，见 `audio/encoder-delay.ts`。
+ * **注意 skip 可能横跨不止一段**（段长 10 秒时轮不到，但自检会把段长压到 1 秒），
+ * 所以它按"还欠多少"逐段扣，不能只在第一段上减。
+ *
+ * 时间戳一律按 `written`（已喂样本数）算，**不按段边界算**：段是内存管理的单位，
+ * 不是时间单位，让它渗进时间戳就等于把分段的实现细节写进成片。
  */
 function makeAudioPump(
-  audio: ExportRequest["audio"],
+  audio: MixHeader | null,
   audioSource: AudioSampleSource | null,
   delayFrames: number,
+  pull: (index: number) => Promise<MixChunk | null>,
 ): (untilSeconds: number) => Promise<void> {
   if (!audio || !audioSource) return async () => undefined;
 
-  const { sampleRate, numberOfChannels, frameCount, channels } = audio;
+  const { sampleRate, numberOfChannels, frameCount, segmentCount } = audio;
   const chunkFrames = Math.max(1, Math.round(sampleRate * AUDIO_CHUNK_SECONDS));
+  const bytesPerFrame = numberOfChannels * 4;
   // 编码延迟补偿：源里的第 delayFrames 个样本要成为喂进去的第 0 个，
   // 解码器把它吐回到绝对位置 delayFrames 上，正好对上（见 encoder-delay.ts）。
   // 丢掉的那一小段（AAC 是 44ms）只能落在 priming 区，没有别的地方可去
-  const skip = Math.max(0, Math.min(delayFrames, frameCount));
-  const feedFrames = frameCount - skip;
+  let remainingSkip = Math.max(0, Math.min(delayFrames, frameCount));
+  const feedFrames = frameCount - remainingSkip;
+
+  /** 已喂给编码器的样本数。成片里的时间戳只由它决定。 */
   let written = 0;
+  /** 从混音流里取走的样本数 = 已喂 + 已因 priming 丢弃。段边界按它对账。 */
+  let consumed = 0;
+
+  /**
+   * 已经到手、还没喂完的 PCM 字节。
+   *
+   * 记的是**到手**而不是**请求**：预取中的那一段正在主线程混，那边有自己的计量
+   * （`audioMixBytes`）；重复计一次会让"分段之后峰值有上界"这个结论建立在
+   * 虚高的数上。而 transfer 一旦落地它就实打实在 Worker 手里，那一刻要立即入账，
+   * 不能等到开始喂——否则峰值恰好漏掉预取的那一段，低报一半。
+   */
+  let heldBytes = 0;
+  const noteHeld = (delta: number): void => {
+    heldBytes += delta;
+    residency.setAudioPcmBytes(heldBytes);
+  };
+
+  /** 已发出、还没消费的请求。键是段序号，保证一段只拉一次、且按序消费。 */
+  const inflight = new Map<number, Promise<MixChunk | null>>();
+  let nextToRequest = 0;
+  const requestAhead = (): void => {
+    while (nextToRequest < segmentCount && inflight.size <= AUDIO_PREFETCH) {
+      const index = nextToRequest++;
+      inflight.set(
+        index,
+        pull(index).then((chunk) => {
+          if (chunk) noteHeld(chunk.frameCount * bytesPerFrame);
+          return chunk;
+        }),
+      );
+    }
+  };
+
+  let current: MixChunk | null = null;
+  let currentOffset = 0;
+  let currentIndex = 0;
+  let drained = false;
+
+  const dropCurrent = (): void => {
+    if (!current) return;
+    noteHeld(-current.frameCount * bytesPerFrame);
+    current = null;
+    currentOffset = 0;
+  };
+
+  /** 保证手上有没喂完的样本；产完了返回 false。 */
+  const ensureChunk = async (): Promise<boolean> => {
+    while (!current) {
+      if (drained) return false;
+      requestAhead();
+      const pending = inflight.get(currentIndex);
+      if (!pending) {
+        drained = true;
+        return false;
+      }
+      inflight.delete(currentIndex);
+      currentIndex++;
+      const chunk = await pending;
+      if (!chunk) {
+        drained = true;
+        return false;
+      }
+      // 起始样本由主线程带过来，这里对一遍。对不上说明段被跳过或乱序了——
+      // 那让整条音频从此错位，而**听起来仍然是正常的声音**，只是内容挪了位，
+      // 是最难从成片上发现的一类 bug。宁可当场炸
+      if (chunk.startSample !== consumed) {
+        throw new Error(
+          `音频分段错位：第 ${chunk.index} 段自称起于样本 ${chunk.startSample}，` +
+            `但已取走 ${consumed}`,
+        );
+      }
+      if (chunk.frameCount <= 0) {
+        noteHeld(-chunk.frameCount * bytesPerFrame);
+        continue;
+      }
+      current = chunk;
+      currentOffset = 0;
+    }
+    return true;
+  };
+
+  const advance = (count: number): void => {
+    currentOffset += count;
+    consumed += count;
+    if (current && currentOffset >= current.frameCount) dropCurrent();
+  };
+
+  /**
+   * 攒够一整块再喂编码器。**段边界不能变成编码器的输入边界。**
+   *
+   * 段长几乎不可能正好是喂块的整数倍（段 24024 样本、喂块 24000），直接从段里
+   * 切就会在每段末尾多喂一个 **24 样本的碎块**。Chrome 上没事，**Safari 上成片的
+   * 淡出曲线整体偏高约 0.05**（等于内容晚了约 33ms）——AudioToolbox 对这种远短于
+   * 一个 AAC 帧（1024 样本）的输入不是白拿的。判据是把导出侧分段关掉重跑，两条
+   * 断言立刻变绿。
+   *
+   * 攒了之后喂进去的每一块都是 `chunkFrames`，只有整条最后一块可能短——和分段
+   * 之前逐字节一致。这也顺带让"分段"这个纯内存管理的决定不再渗进成片。
+   */
+  const staging = Array.from({ length: numberOfChannels }, () => new Float32Array(chunkFrames));
+  let staged = 0;
+
+  const emit = async (): Promise<void> => {
+    if (staged === 0) return;
+    const data = new Float32Array(staged * numberOfChannels);
+    for (let ch = 0; ch < numberOfChannels; ch++) {
+      data.set(staging[ch]!.subarray(0, staged), ch * staged);
+    }
+    const sample = new AudioSample({
+      format: "f32-planar",
+      sampleRate,
+      numberOfChannels,
+      timestamp: written / sampleRate,
+      data,
+    });
+    try {
+      await audioSource.add(sample);
+    } finally {
+      sample.close();
+    }
+    written += staged;
+    staged = 0;
+  };
 
   return async (untilSeconds: number) => {
-    while (written < feedFrames) {
+    for (;;) {
+      if (written + staged >= feedFrames) break;
       // 已经喂到比视频还超前一整块了就先停，等视频追上来
       if (written / sampleRate > untilSeconds + AUDIO_CHUNK_SECONDS) return;
+      if (!(await ensureChunk())) break;
+      const chunk = current;
+      if (!chunk) break;
+      const available = chunk.frameCount - currentOffset;
 
-      const length = Math.min(chunkFrames, feedFrames - written);
-      const from = written + skip;
-      const data = new Float32Array(length * numberOfChannels);
+      // priming 补偿：头部这些样本要丢掉，而它可能横跨不止一段（段长 10 秒时
+      // 轮不到，但自检会把段长压到 1 秒），所以按"还欠多少"逐段扣
+      if (remainingSkip > 0) {
+        const drop = Math.min(remainingSkip, available);
+        remainingSkip -= drop;
+        advance(drop);
+        continue;
+      }
+
+      const take = Math.min(chunkFrames - staged, available, feedFrames - written - staged);
       for (let ch = 0; ch < numberOfChannels; ch++) {
-        const plane = channels[ch];
+        const plane = chunk.channels[ch];
         if (!plane) continue;
-        data.set(plane.subarray(from, from + length), ch * length);
+        staging[ch]!.set(plane.subarray(currentOffset, currentOffset + take), staged);
       }
-
-      const sample = new AudioSample({
-        format: "f32-planar",
-        sampleRate,
-        numberOfChannels,
-        timestamp: written / sampleRate,
-        data,
-      });
-      try {
-        await audioSource.add(sample);
-      } finally {
-        sample.close();
-      }
-      written += length;
+      staged += take;
+      advance(take);
+      if (staged === chunkFrames) await emit();
     }
+    // 流走完了（或者只剩不足一块的尾巴）：把余量喂出去
+    await emit();
+    dropCurrent();
   };
 }
