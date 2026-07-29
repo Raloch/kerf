@@ -122,6 +122,13 @@ export async function createPreviewEngine(
   /** sourceId → 代理 blob URL。有代理就用它，没有才回退原片。 */
   const proxies = new Map<string, string>();
   let playing = false;
+  /**
+   * 引擎已销毁。`renderFrame` 里有两段 await（等素材、等 seek），Editor 卸载
+   * （回首页、进自检）时正在飞的那一帧会在 await 之后才碰合成器——那时它已经
+   * dispose，表现是每次切走都在 console 里刷「合成器已释放」。销毁后的帧直接
+   * 不画（画布都已经摘了），不是吞错误：上下文丢失那条救援路径照旧。
+   */
+  let disposed = false;
 
   /** 拆掉一个 video 元素并回收它的 URL。 */
   function dropHandle(key: string): void {
@@ -351,6 +358,7 @@ export async function createPreviewEngine(
    * 画面停住，不是整个界面炸掉。真正的治本在导出侧不再抢上下文（D15）。
    */
   async function draw(layers: readonly ComposeLayer[]): Promise<void> {
+    if (disposed) return;
     try {
       compositor.composeFrame(layers);
     } catch (error) {
@@ -380,6 +388,8 @@ export async function createPreviewEngine(
           await seekTo(handle.video, seekSeconds);
         }),
       ]);
+      // await 期间引擎可能已经随 Editor 卸载销毁（回首页/进自检），见 `disposed`
+      if (disposed) return;
       // seek 期间 handle.ready 可能才变 true，重新收集一次
       const fresh = layersFor(timeline, frame);
       await draw(fresh.layers.length > 0 ? fresh.layers : layers);
@@ -436,6 +446,7 @@ export async function createPreviewEngine(
     },
 
     dispose() {
+      disposed = true;
       playing = false;
       for (const key of [...handles.keys()]) dropHandle(key);
       compositor.dispose();

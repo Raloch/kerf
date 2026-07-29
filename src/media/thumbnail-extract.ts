@@ -17,6 +17,49 @@ import type { ThumbnailStrip } from "./thumbnails";
 const STRIP_COUNT = 20;
 /** 单张缩略图高度（像素）。时间轴轨道高 54，留出标签行后约 32。 */
 const THUMB_HEIGHT = 36;
+/** 首页卡片封面的高度（像素）。画面区 118px，×2 抗高分屏。 */
+const POSTER_HEIGHT = 236;
+
+/**
+ * 抽单张封面帧（首页项目卡片用，D37）。
+ *
+ * 和 `extractStrip` 同一套解码路径，只是取一个时间点。原片和代理都收：
+ * 封面只抽一帧，原片慢也只慢这一张卡，而调度侧会优先喂已有的代理。
+ */
+export async function extractPoster(file: File, seconds: number): Promise<ImageBitmap | null> {
+  const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(file) });
+  try {
+    const track = await input.getPrimaryVideoTrack();
+    if (!track || !(await track.canDecode())) return null;
+
+    const srcWidth = await track.getDisplayWidth();
+    const srcHeight = await track.getDisplayHeight();
+    const height = Math.min(POSTER_HEIGHT, srcHeight);
+    const width = Math.max(2, Math.round((srcWidth / srcHeight) * height));
+
+    const sink = new VideoSampleSink(track);
+    const canvas = new OffscreenCanvas(width, height);
+    const ctx = canvas.getContext("2d", { alpha: false });
+    if (!ctx) return null;
+
+    for await (const sample of sink.samplesAtTimestamps([seconds])) {
+      if (!sample) continue;
+      const frame = sample.toVideoFrame();
+      try {
+        ctx.drawImage(frame, 0, 0, width, height);
+        return canvas.transferToImageBitmap();
+      } finally {
+        frame.close();
+        sample.close();
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    input.dispose();
+  }
+}
 
 /**
  * 从代理文件抽一组缩略图。**不要传原片**——抽 20 张 4K 帧比转一遍代理还慢。

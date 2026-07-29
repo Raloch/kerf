@@ -12,9 +12,13 @@ import type {
 } from "../edl/types";
 import { computeDuration } from "./operations";
 import {
+  duplicatedSnapshot,
   fromSnapshot,
-  snapshotHasWork,
+  isSnapshotUsable,
+  posterTarget,
+  renamedSnapshot,
   SNAPSHOT_VERSION,
+  summarizeProject,
   toSnapshot,
   type ProjectSnapshot,
   type RestoreAssets,
@@ -358,19 +362,127 @@ describe("字体找不回来（同 LUT 那条不对称，但必须清）", () =>
   });
 });
 
-describe("值不值得提议恢复", () => {
-  it("有片段才算有编辑成果", () => {
-    const withClip = toSnapshot(
-      timeline([{ id: "V1", kind: "video", clips: [clip("a", 0, 10)] }]),
+describe("快照可用性（列项目的过滤器）", () => {
+  it("本版本的快照可用", () => {
+    const snapshot = toSnapshot(timeline([{ id: "V1", kind: "video", clips: [] }]), 0, 0);
+    expect(isSnapshotUsable(snapshot)).toBe(true);
+  });
+
+  it("旧版本（单项目时代的 current）不可用，不出现在列表里", () => {
+    const snapshot = toSnapshot(timeline([{ id: "V1", kind: "video", clips: [] }]), 0, 0);
+    expect(isSnapshotUsable({ ...snapshot, version: SNAPSHOT_VERSION - 1 })).toBe(false);
+  });
+
+  it("不是快照的东西一律不可用", () => {
+    expect(isSnapshotUsable(null)).toBe(false);
+    expect(isSnapshotUsable("current")).toBe(false);
+    expect(isSnapshotUsable({ version: SNAPSHOT_VERSION })).toBe(false);
+  });
+});
+
+describe("项目摘要", () => {
+  it("片段数从所有轨道数出来，名字缺省为 null", () => {
+    const snapshot = toSnapshot(
+      timeline([
+        { id: "V1", kind: "video", clips: [clip("a", 0, 10), clip("b", 10, 20)] },
+        { id: "A1", kind: "audio", clips: [clip("c", 0, 10)] },
+      ]),
+      42,
+      1234,
+    );
+    const summary = summarizeProject("proj-1", snapshot);
+    expect(summary.id).toBe("proj-1");
+    expect(summary.name).toBeNull();
+    expect(summary.savedAt).toBe(1234);
+    expect(summary.clipCount).toBe(3);
+    expect(summary.durationFrames).toBe(20);
+  });
+
+  it("取过名的项目摘要里带名字", () => {
+    const named = { ...timeline([{ id: "V1", kind: "video", clips: [] }]), name: "婚礼粗剪" };
+    expect(summarizeProject("p", toSnapshot(named, 0, 0)).name).toBe("婚礼粗剪");
+  });
+});
+
+describe("封面目标（posterTarget）", () => {
+  it("挑最早的视频片段，返回它的素材和入点", () => {
+    const late = clip("late", 50, 90);
+    const early: MediaClip = { ...clip("early", 10, 40), sourceIn: 7 };
+    const snapshot = toSnapshot(
+      timeline([{ id: "V1", kind: "video", clips: [late, early] }]),
       0,
       0,
     );
-    expect(snapshotHasWork(withClip)).toBe(true);
+    const target = posterTarget(snapshot.timeline);
+    expect(target?.source.id).toBe("src");
+    // 抽的是"第一个视频片段的首帧"，不是源片第 0 帧——裁过入点要跟着入点走
+    expect(target?.sourceIn).toBe(7);
   });
 
-  it("导入了素材但一个片段都没放，不值得问", () => {
-    // 恢复它等于什么都没恢复，而弹一句"要不要恢复上次编辑"是纯噪声
-    const empty = toSnapshot(timeline([{ id: "V1", kind: "video", clips: [] }]), 0, 0);
-    expect(snapshotHasWork(empty)).toBe(false);
+  it("同一帧起点时取更靠下的轨（主视频打底）", () => {
+    const top = { ...source("src-top"), id: "src-top" };
+    const bottom = { ...source("src-bottom"), id: "src-bottom" };
+    const snapshot = toSnapshot(
+      timeline(
+        [
+          { id: "V2", kind: "video", clips: [clip("t", 0, 10, "src-top")] },
+          { id: "V1", kind: "video", clips: [clip("b", 0, 10, "src-bottom")] },
+        ],
+        [top, bottom],
+      ),
+      0,
+      0,
+    );
+    expect(posterTarget(snapshot.timeline)?.source.id).toBe("src-bottom");
+  });
+
+  it("纯音频 / 纯文字项目没有封面目标（退回类型图标）", () => {
+    const noVideo = toSnapshot(
+      timeline([{ id: "V1", kind: "video", clips: [textClip("t1")] }], []),
+      0,
+      0,
+    );
+    expect(posterTarget(noVideo.timeline)).toBeNull();
+  });
+
+  it("音频轨上的片段不当封面（哪怕素材带画面）", () => {
+    const snapshot = toSnapshot(
+      timeline([{ id: "A1", kind: "audio", clips: [clip("a", 0, 10)] }]),
+      0,
+      0,
+    );
+    expect(posterTarget(snapshot.timeline)).toBeNull();
+  });
+});
+
+describe("重命名与副本", () => {
+  const base = () =>
+    toSnapshot({ ...timeline([{ id: "V1", kind: "video", clips: [clip("a", 0, 10)] }]) }, 5, 100);
+
+  it("重命名置位 namedByUser 并刷新改动时间", () => {
+    const renamed = renamedSnapshot(base(), "成片 v2", 999);
+    expect(renamed.timeline.name).toBe("成片 v2");
+    expect(renamed.timeline.namedByUser).toBe(true);
+    expect(renamed.savedAt).toBe(999);
+    // 播放头这类无关字段原样保留
+    expect(renamed.playhead).toBe(5);
+  });
+
+  it("副本换名字、共享 sourceId、摘掉 namedByUser", () => {
+    const named = renamedSnapshot(base(), "婚礼粗剪", 100);
+    const copy = duplicatedSnapshot(named, 200);
+    expect(copy.timeline.name).toBe("婚礼粗剪 副本");
+    // 「X 副本」是系统起的名，不算用户给的——否则副本永远失去自动取名
+    expect(copy.timeline.namedByUser).toBeUndefined();
+    expect(copy.savedAt).toBe(200);
+    // **共享 sourceId 是刻意的**（File 是磁盘引用），删副本才因此绝不能顺手删 assets
+    expect(copy.timeline.sources.map((s) => s.id)).toEqual(
+      named.timeline.sources.map((s) => s.id),
+    );
+    expect(copy.timeline.tracks).toEqual(named.timeline.tracks);
+  });
+
+  it("没取过名的项目，副本叫「未命名项目 副本」", () => {
+    expect(duplicatedSnapshot(base(), 0).timeline.name).toBe("未命名项目 副本");
   });
 });

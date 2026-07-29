@@ -176,3 +176,36 @@ export const IconWarn = () => (
     <path d="M8 6.4v3.2M8 11.6h.01" />
   </svg>
 );
+
+export const IconDots = () => (
+  <svg viewBox="0 0 16 16" aria-hidden="true" fill="currentColor">
+    <circle cx="8" cy="3.6" r="1.25" />
+    <circle cx="8" cy="8" r="1.25" />
+    <circle cx="8" cy="12.4" r="1.25" />
+  </svg>
+);
+
+export const IconPen = () => (
+  <svg viewBox="0 0 16 16" aria-hidden="true" {...stroke} strokeWidth={1.3}>
+    <path d="M11.4 2.9l1.7 1.7-7.7 7.7-2.5.8.8-2.5z" />
+  </svg>
+);
+
+export const IconCopy = () => (
+  <svg viewBox="0 0 16 16" aria-hidden="true" {...stroke} strokeWidth={1.3}>
+    <rect x="5.5" y="5.5" width="8" height="8" rx="1" />
+    <path d="M10.5 5.5V3.5a1 1 0 00-1-1h-6a1 1 0 00-1 1v6a1 1 0 001 1h2" />
+  </svg>
+);
+
+export const IconBack = () => (
+  <svg viewBox="0 0 16 16" aria-hidden="true" {...stroke} strokeWidth={1.35}>
+    <path d="M7.4 3.6L3 8l4.4 4.4M3.4 8h9.4" />
+  </svg>
+);
+
+export const IconCaret = () => (
+  <svg viewBox="0 0 16 16" aria-hidden="true" {...stroke}>
+    <path d="M4.4 6.4L8 10l3.6-3.6" />
+  </svg>
+);

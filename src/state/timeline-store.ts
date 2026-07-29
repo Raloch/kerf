@@ -47,6 +47,7 @@ import {
   moveKeyframe,
   addLut,
   addFont,
+  renameProject,
   rippleDeleteClip,
   setClipColor,
   setClipLut,
@@ -93,6 +94,14 @@ export const EMPTY_TIMELINE: Timeline = {
 
 export interface TimelineState {
   history: History<Timeline>;
+  /**
+   * 当前装着的项目 id；**null = 没有项目装好**（首页、装载中、刚被删掉）。
+   *
+   * 它是自动存盘的闸门（见 `autosave.ts` 文件头）：id 和时间轴由 `openProject()`
+   * **原子地一起换**，autosave 从同一份 state 里读这两样，所以"store 已经是项目 B
+   * 而存盘还捏着项目 A 的 id"在结构上不存在——那正是切项目串写的形态（D37）。
+   */
+  projectId: string | null;
   /** 当前播放头（帧）。不进撤销栈。 */
   playhead: number;
   selectedClipId: ClipId | null;
@@ -119,14 +128,20 @@ export interface TimelineState {
    */
   addSource: (source: MediaSource, timelineIn?: number) => void;
   /**
-   * 用崩溃恢复读回来的项目替掉当前状态。**历史从这里重新开始。**
+   * 把一个项目装进 store。**历史从这里重新开始。**
    *
-   * 不接着旧历史往下走，也不恢复存下来的历史——快照里刻意没有撤销栈
-   * （见 `project-snapshot.ts`）。所以撤销回不到"恢复之前"，那正是想要的：
-   * "恢复之前"是一个空项目，让用户能一键撤销回空白毫无价值，而把一个引用了
-   * 可能已经不在的素材的栈恢复出来，比没有撤销更坏。
+   * 不恢复存下来的历史——快照里刻意没有撤销栈（见 `project-snapshot.ts`）。
+   * 所以撤销回不到"打开之前"，那正是想要的：把一个引用了可能已经不在的素材的
+   * 栈装回来，比没有撤销更坏。id 和时间轴**在同一次 set 里换**，见 `projectId`。
    */
-  restoreProject: (timeline: Timeline, playhead: number) => void;
+  openProject: (projectId: string, timeline: Timeline, playhead: number) => void;
+  /**
+   * 卸下当前项目（删除项目、回首页时用）。`projectId` 归 null，自动存盘的 flush
+   * 从此拒写——**删完项目必须先调它再等卸载**，否则收尾那次 flush 会把项目复活。
+   */
+  closeProject: () => void;
+  /** 重命名当前项目。进撤销栈（它改的是 Timeline），`namedByUser` 由纯函数置位。 */
+  renameProject: (name: string) => void;
   moveClip: (clipId: ClipId, deltaFrames: number, options?: MoveOptions) => void;
   /** 拖拽落点：先算磁吸再移动，中间态按 clipId 合并成一步撤销。 */
   dragClipTo: (clipId: ClipId, desiredIn: number, toTrack?: TrackId) => void;
@@ -212,6 +227,7 @@ export const useTimeline = create<TimelineState>((set, get) => {
 
   return {
     history: initHistory(EMPTY_TIMELINE, "新建项目"),
+    projectId: null,
     playhead: 0,
     selectedClipId: null,
     snapEnabled: true, // 默认开，见 PLAN.md 决策 D2
@@ -246,14 +262,30 @@ export const useTimeline = create<TimelineState>((set, get) => {
       }));
     },
 
-    restoreProject(timeline, playhead) {
+    openProject(projectId, timeline, playhead) {
       set({
-        history: initHistory(timeline, "恢复上次编辑"),
+        projectId,
+        history: initHistory(timeline, "打开项目"),
         playhead,
         selectedClipId: null,
         lastRejection: null,
         dragHint: null,
       });
+    },
+
+    closeProject() {
+      set({
+        projectId: null,
+        history: initHistory(EMPTY_TIMELINE, "新建项目"),
+        playhead: 0,
+        selectedClipId: null,
+        lastRejection: null,
+        dragHint: null,
+      });
+    },
+
+    renameProject(name) {
+      apply(renameProject(get().timeline(), name), "重命名项目");
     },
 
     moveClip(clipId, deltaFrames, options) {

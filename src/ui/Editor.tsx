@@ -5,13 +5,14 @@
  * 沿用 Premiere / Resolve / 剪映共有的骨架，用户不需要重新学（PLAN.md §6）。
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { ExportCapabilities } from "../media/capability";
 import { proxyManager } from "../media/proxy-client";
 import type { ProxyInfo } from "../media/proxy";
 import { useTimeline } from "../state/timeline-store";
-// 只要类型：`project-store` 本身走动态 import，别把 IndexedDB 那一层拖进首屏
-import type { StoredProject } from "../state/project-store";
+// 只要类型：`autosave` 本身走动态 import，别把 IndexedDB 那一层拖进首屏
+import type { AutosaveHandle, SaveReadout } from "../state/autosave";
+import { UNNAMED_PROJECT } from "../state/project-snapshot";
 import { findClip } from "../state/operations";
 import { clipDuration, sourceDurationFrames } from "../edl/types";
 import { formatDuration, framesToTimecode } from "../time/timebase";
@@ -21,27 +22,52 @@ import { Preview } from "./Preview";
 import { TimelinePanel } from "./Timeline";
 import { ExportDialog } from "./ExportDialog";
 import {
+  IconBack,
+  IconCaret,
   IconCheck,
+  IconCopy,
   IconDownload,
   IconFilm,
   IconImage,
   IconMark,
   IconNo,
+  IconPen,
   IconPlus,
   IconRedo,
+  IconTrash,
   IconUndo,
   IconWave,
 } from "./icons";
 import "./editor.css";
 
-export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => void }) {
+/** 顶栏「已保存 · N 秒前」的口语化。悬停有精确时刻。 */
+function savedAgo(at: number, now: number): string {
+  const seconds = Math.max(0, Math.floor((now - at) / 1000));
+  if (seconds < 10) return "刚刚";
+  if (seconds < 60) return `${seconds} 秒前`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} 分钟前`;
+  return new Date(at).toLocaleTimeString();
+}
+
+export function Editor({
+  onOpenSelfCheck,
+  onBack,
+  note,
+}: {
+  readonly onOpenSelfCheck: () => void;
+  readonly onBack: () => void;
+  /** 打开项目时"丢了什么"的说明（App 算好传进来），显示一次、可关。 */
+  readonly note: string | null;
+}) {
   const timeline = useTimeline((s) => s.timeline());
+  const projectId = useTimeline((s) => s.projectId);
   const playhead = useTimeline((s) => s.playhead);
   const selectedClipId = useTimeline((s) => s.selectedClipId);
   const lastRejection = useTimeline((s) => s.lastRejection);
   const dragHint = useTimeline((s) => s.dragHint);
   const addSource = useTimeline((s) => s.addSource);
-  const restoreProject = useTimeline((s) => s.restoreProject);
+  const renameProject = useTimeline((s) => s.renameProject);
   const setPlayhead = useTimeline((s) => s.setPlayhead);
   const undo = useTimeline((s) => s.undo);
   const redo = useTimeline((s) => s.redo);
@@ -57,16 +83,15 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [exportOpen, setExportOpen] = useState(false);
-  /**
-   * 崩溃恢复的三个状态：还在问 IndexedDB（`undefined`）、没有可恢复的（`null`）、
-   * 有一份待用户表态（`StoredProject`）。
-   *
-   * 三态而不是"有/没有"：自动存盘**必须等这个决定做完**才能开工，而"还没问出来"
-   * 和"问出来没有"在那件事上是两种处理。搞混的后果是空时间轴当场把待恢复的快照
-   * 覆盖掉——用户看着提示，按下去已经什么都没有了。见 `autosave.ts` 文件头。
-   */
-  const [recover, setRecover] = useState<StoredProject | null | undefined>(undefined);
-  const [recoverNote, setRecoverNote] = useState<string | null>(null);
+  /** 打开项目时的"丢了什么"说明。显示一次，用户关掉就没了。 */
+  const [notice, setNotice] = useState<string | null>(note);
+  /** 存盘读数。刚装进来的项目本来就是从盘上读的（新建的也先落了一条），所以初始是"已保存"。 */
+  const [readout, setReadout] = useState<SaveReadout>({ status: "saved", at: null, reason: null });
+  /** 「N 秒前」要走表。5 秒一格，比它细就得每秒重渲整个顶栏。 */
+  const [clock, setClock] = useState(() => Date.now());
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const autosaveRef = useRef<AutosaveHandle | null>(null);
 
   // 能力探测和素材探针都动态 import：它们各自拖着 mediabunny 的运行时，
   // 静态 import 会把约 500KB 塞进首屏 chunk，而两者都是"页面出来之后"才需要的。
@@ -85,38 +110,41 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
     };
   }, [timeline.width, timeline.height]);
 
-  // 挂载时先问一次"上次崩了吗"。**在这之前一个字节都不能往回写**，理由见 `recover`
+  /**
+   * 自动存盘跟着剪辑台的生命周期走（D37，改写自 D23 的三态）：App 只在项目
+   * **装进 store 之后**才渲染这里，所以挂载即可开工——"空时间轴把项目覆盖成空的"
+   * 由这个顺序挡第一道，autosave 自己对 `projectId === null` 拒写挡第二道。
+   * 卸载时 `stop()` 会先把欠着的那一份 flush 掉（此刻 store 还装着本项目）。
+   */
   useEffect(() => {
-    let stale = false;
-    void import("../state/project-store")
-      .then(({ loadProject }) => loadProject())
-      .then((found) => {
-        if (!stale) setRecover(found);
-      })
-      .catch(() => {
-        // 读不出来就当没存过：崩溃恢复失效不该拦住用户开始编辑
-        if (!stale) setRecover(null);
-      });
+    let stopped = false;
+    let handle: AutosaveHandle | undefined;
+    void import("../state/autosave").then(({ startAutosave }) => {
+      // 挂载已经被撤销（严格模式双挂载/极快的视图切换）就别再订阅，孤儿订阅没人停
+      if (stopped) return;
+      handle = startAutosave(setReadout);
+      autosaveRef.current = handle;
+    });
     return () => {
-      stale = true;
+      stopped = true;
+      handle?.stop();
+      autosaveRef.current = null;
     };
   }, []);
 
-  /**
-   * **只有 `recover === null` 才开自动存盘**，也就是"没有待决定的恢复"。
-   *
-   * 另两个状态都不能开，而且理由是同一个：`undefined`（还在问）和一份待表态的快照，
-   * 这两个时刻 store 里都是那个空时间轴，存下去就把待恢复的快照冲成空的。
-   * 用户点了恢复或不恢复之后，两条路都把它置成 null，自动存盘随之开工。
-   */
+  // 「已保存 · N 秒前」走表
   useEffect(() => {
-    if (recover !== null) return;
-    let stop: (() => void) | undefined;
-    void import("../state/autosave").then(({ startAutosave }) => {
-      stop = startAutosave();
-    });
-    return () => stop?.();
-  }, [recover]);
+    const timer = setInterval(() => setClock(Date.now()), 5_000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // 点项目菜单外面就收起
+  useEffect(() => {
+    if (!menuOpen) return;
+    const close = () => setMenuOpen(false);
+    document.addEventListener("pointerdown", close);
+    return () => document.removeEventListener("pointerdown", close);
+  }, [menuOpen]);
 
   // 代理状态：素材库要显示进度，预览要在就绪时切过去
   useEffect(
@@ -132,48 +160,47 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
     for (const source of timeline.sources) void proxyManager.request(source);
   }, [timeline.sources]);
 
-  /**
-   * 真正救回来了几个片段，以及丢了哪些素材。
-   *
-   * **不能拿快照里的片段数当这个数**：素材读不回来的片段已经被 `fromSnapshot`
-   * 移除了（留着会让预览崩，见 `project-snapshot.ts`），所以"存的时候有 12 个"
-   * 和"现在能给你 12 个"是两件事。为 0 时连问都不该问。
-   */
-  const recoverable = recover
-    ? recover.timeline.tracks.reduce((n, t) => n + t.clips.length, 0)
-    : 0;
-  const lostNames = recover
-    ? recover.droppedSources.filter((d) => d.clips > 0).map((d) => d.name)
-    : [];
+  const projectName = timeline.name ?? UNNAMED_PROJECT;
 
-  /**
-   * 接受恢复。素材已经在 `loadProject()` 里验过读得动、字体也在那边注册过了，
-   * 这里只是装回 store——所以它可以是同步的，不用等任何异步。
-   */
-  const acceptRecover = useCallback(() => {
-    if (!recover) return;
-    restoreProject(recover.timeline, recover.playhead);
-    // **丢了什么必须说出来。** 素材找不回来会连带移除片段，静默处理就是让用户
-    // 在导出时才发现少了东西（同硬规则 10 那类"选了 A 拿到 B"）
-    const lost = recover.droppedSources.filter((d) => d.clips > 0);
-    const notes = [
-      ...lost.map((d) => `${d.name} 找不到了，用到它的 ${d.clips} 个片段已移除`),
-      ...(recover.droppedLuts.length > 0
-        ? [`${recover.droppedLuts.join("、")} 这几张 LUT 没读回来，相关片段的调色已退回不上表`]
-        : []),
-      ...(recover.droppedFonts.length > 0
-        ? [`${recover.droppedFonts.join("、")} 这几个字体没装回来，相关文字已退回默认字体`]
-        : []),
-    ];
-    setRecoverNote(notes.length > 0 ? notes.join("；") : null);
-    setRecover(null);
-  }, [recover, restoreProject]);
+  const commitRename = useCallback(
+    (raw: string) => {
+      setRenaming(false);
+      const name = raw.trim();
+      // 空白当取消，不当"清掉名字"——清掉会让下一次导入素材悄悄改名（见 operations.ts）
+      if (name.length === 0) return;
+      renameProject(name);
+    },
+    [renameProject],
+  );
 
-  const discardRecover = useCallback(() => {
-    // **真删。** 只是不用它的话，下次打开又会问一遍同一个已经被拒绝过的项目
-    void import("../state/project-store").then(({ clearProject }) => clearProject());
-    setRecover(null);
-  }, []);
+  const duplicate = useCallback(async () => {
+    if (projectId === null) return;
+    // 副本要含最后一秒的编辑：先把欠着的 flush 掉再去读快照
+    await autosaveRef.current?.flush();
+    const { duplicateProject } = await import("../state/project-store");
+    const copy = await duplicateProject(projectId);
+    if (copy) {
+      setBusy(`已创建「${copy.name ?? "副本"}」，回首页可以打开`);
+      setTimeout(() => setBusy(null), 4000);
+    } else {
+      setError("制作副本失败");
+    }
+  }, [projectId]);
+
+  const removeProject = useCallback(async () => {
+    if (projectId === null) return;
+    const clips = timeline.tracks.reduce((n, t) => n + t.clips.length, 0);
+    // 删除给一次确认，写明片段数；没有回收站，删了就是删了（D37）
+    if (!window.confirm(`删除「${projectName}」？${clips} 个片段会一起删除，删了就是删了。`)) {
+      return;
+    }
+    // **先卸下项目再删**：卸载收尾那次 flush 对 projectId === null 拒写，
+    // 顺序反过来的话 flush 会把刚删掉的项目原样写回去（复活）
+    useTimeline.getState().closeProject();
+    const { deleteProject } = await import("../state/project-store");
+    await deleteProject(projectId);
+    onBack();
+  }, [projectId, projectName, timeline, onBack]);
 
   const importFile = useCallback(
     async (file: File) => {
@@ -269,13 +296,102 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
           <IconMark className="mark" />
           <b>KERF</b>
         </div>
+        {/* 项目名是入口不是死文字；第二行说的是**存盘状态**——分辨率在状态栏已经有了（D37） */}
         <div className="proj">
-          <span className="name">{timeline.sources[0]?.name ?? "未命名项目"}</span>
-          <span className="sub">
-            {hasContent
-              ? `${timeline.width}×${timeline.height} · ${formatFps(timeline.fps)} fps`
-              : "还没有素材"}
-          </span>
+          {renaming ? (
+            <>
+              <span className="rename">
+                <input
+                  defaultValue={projectName}
+                  autoFocus
+                  spellCheck={false}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") commitRename((e.target as HTMLInputElement).value);
+                    if (e.key === "Escape") setRenaming(false);
+                  }}
+                  onBlur={() => setRenaming(false)}
+                />
+              </span>
+              <span className="sub">回车确认 · Esc 取消</span>
+            </>
+          ) : (
+            <>
+              <button
+                type="button"
+                className="pbtn"
+                onClick={() => setMenuOpen((open) => !open)}
+                onPointerDown={(e) => e.stopPropagation()}
+              >
+                <span className="name">{projectName}</span>
+                <span className="caret">
+                  <IconCaret />
+                </span>
+              </button>
+              <span
+                className={`sub${readout.status === "failed" ? " bad" : ""}`}
+                title={
+                  readout.status === "failed"
+                    ? (readout.reason ?? undefined)
+                    : readout.at
+                      ? new Date(readout.at).toLocaleString()
+                      : undefined
+                }
+              >
+                {readout.status === "failed"
+                  ? "存不进去了"
+                  : readout.at
+                    ? `已保存 · ${savedAgo(readout.at, clock)}`
+                    : "已保存"}
+              </span>
+              {menuOpen && (
+                <div className="menu" onPointerDown={(e) => e.stopPropagation()}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMenuOpen(false);
+                      onBack();
+                    }}
+                  >
+                    <IconBack />
+                    返回首页
+                  </button>
+                  <hr />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMenuOpen(false);
+                      setRenaming(true);
+                    }}
+                  >
+                    <IconPen />
+                    重命名
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMenuOpen(false);
+                      void duplicate();
+                    }}
+                  >
+                    <IconCopy />
+                    制作副本
+                  </button>
+                  <hr />
+                  <button
+                    type="button"
+                    className="danger"
+                    onClick={() => {
+                      setMenuOpen(false);
+                      void removeProject();
+                    }}
+                  >
+                    <IconTrash />
+                    删除项目
+                  </button>
+                </div>
+              )}
+            </>
+          )}
         </div>
         <div className="ico-row" style={{ marginLeft: 6 }}>
           <button
@@ -316,60 +432,14 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
       </div>
 
       {/*
-        崩溃恢复。**问而不是直接恢复**：Kerf 只有一个隐含项目、没有项目列表，
-        静默替换会让"打开就是上次的样子"和"恢复错了一份陈旧项目"分不开，而且素材
-        找不回来时必须有个地方说这件事。同硬规则 10 的做法——降级要标注，不必禁止。
+        打开项目时"丢了什么"的说明（App 算好传进来）。**必须说出来**：素材找不回来
+        会连带移除片段，静默处理就是让用户在导出时才发现少了东西（同硬规则 10）。
+        "上次崩过"那类说法没有判据、已随项目化删掉（D37）——快照就是项目本体。
       */}
-      {recover && (
-        <div className={`ed-recover${recoverable === 0 ? " warn" : ""}`}>
-          {/*
-            **不要说"上次没有正常结束"。** 判据只是"IndexedDB 里有一份带片段的快照"，
-            而正常关标签页同样会落盘（`autosave.ts` 的 `pagehide` 那一路），所以那句话
-            对每一次正常关闭都成立——用户每次关掉再打开都会被告知程序崩过。
-
-            我们**判不出**崩没崩：那需要一个"正常离开时置位"的标志，而唯一能写它的
-            时机是 `pagehide`，而它在 iOS 上不一定来（同一处已经在 `autosave.ts` 里
-            记着）。于是那个标志会漏写，表现成"正常关闭也报崩溃"——和现在一样，只是
-            多了一个字段。假警告比没有警告更坏（同 D24），所以**只陈述事实**：
-            上次编辑到什么时候、有多少片段，要不要接着。
-          */}
-          {recoverable === 0 ? (
-            /*
-              一个片段都救不回来时**不能还问"要不要接着编"**：按下去得到一个空时间轴，
-              而提示刚说过上次编辑到什么时候，读起来像操作失败了。这一支照样要说清楚
-              原因——静默丢掉才是最坏的，用户既失去了项目也不知道为什么。
-            */
-            <>
-              <span>
-                上次编辑到 {new Date(recover.savedAt).toLocaleString()}，但接不下去了：
-                {lostNames.length > 0
-                  ? `用到的素材已经找不到了（${lostNames.join("、")}）`
-                  : "里面已经没有片段了"}
-              </span>
-              <button type="button" className="chip-btn" onClick={discardRecover}>
-                知道了
-              </button>
-            </>
-          ) : (
-            <>
-              <span>
-                上次编辑到 {new Date(recover.savedAt).toLocaleString()}（{recoverable} 个片段）
-                {lostNames.length > 0 && ` · 其中有素材找不回来了，接着编时会说明`}
-              </span>
-              <button type="button" className="btn-primary" onClick={acceptRecover}>
-                接着编
-              </button>
-              <button type="button" className="chip-btn" onClick={discardRecover}>
-                重新开始
-              </button>
-            </>
-          )}
-        </div>
-      )}
-      {recoverNote && (
+      {notice && (
         <div className="ed-recover warn">
-          <span>{recoverNote}</span>
-          <button type="button" className="chip-btn" onClick={() => setRecoverNote(null)}>
+          <span>{notice}</span>
+          <button type="button" className="chip-btn" onClick={() => setNotice(null)}>
             知道了
           </button>
         </div>

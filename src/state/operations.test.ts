@@ -18,6 +18,7 @@ import {
   addFont,
   addLut,
   addSource,
+  renameProject,
   addTextClip,
   IMAGE_DEFAULT_SECONDS,
   clearKeyframes,
@@ -1685,5 +1686,79 @@ describe("裁切图片片段", () => {
     const r = setClipVolume(withPhoto(), "p", 0.5);
     expect(r.changed).toBe(false);
     expect(r.reason).toContain("只有素材片段有音量");
+  });
+});
+
+describe("项目名（D37）", () => {
+  const emptyLayout = (): Timeline => ({
+    fps: FPS.ndf2997,
+    width: 1920,
+    height: 1080,
+    durationFrames: 0,
+    tracks: [
+      { id: "V1", kind: "video", clips: [] },
+      { id: "A1", kind: "audio", clips: [] },
+    ],
+    sources: [],
+  });
+
+  it("导入第一个素材时自动用素材名", () => {
+    const r = addSource(emptyLayout(), { source: source("v1", 300), timelineIn: 0 });
+    expect(r.changed).toBe(true);
+    expect(r.timeline.name).toBe("v1.mp4");
+    // 自动取名不算"用户给的"
+    expect(r.timeline.namedByUser).toBeUndefined();
+  });
+
+  it("自动取名只做一次：第二个素材不改名", () => {
+    const first = addSource(emptyLayout(), { source: source("v1", 300), timelineIn: 0 });
+    const second = addSource(first.timeline, {
+      source: { ...source("v2", 300), id: "v2", name: "v2.mp4" },
+      timelineIn: 400,
+    });
+    expect(second.changed).toBe(true);
+    expect(second.timeline.name).toBe("v1.mp4");
+  });
+
+  it("用户重命名过之后，导入素材不再自动改名", () => {
+    const named = renameProject(emptyLayout(), "婚礼粗剪");
+    expect(named.changed).toBe(true);
+    expect(named.timeline.name).toBe("婚礼粗剪");
+    expect(named.timeline.namedByUser).toBe(true);
+    const r = addSource(named.timeline, { source: source("v1", 300), timelineIn: 0 });
+    expect(r.changed).toBe(true);
+    // 少这个条件的表现是"我改了名字，导入一个素材，名字被改回去了"
+    expect(r.timeline.name).toBe("婚礼粗剪");
+  });
+
+  it("导入被拒时名字不动", () => {
+    const r = addSource(emptyLayout(), { source: source("v1", 300), timelineIn: -1 });
+    expect(r.changed).toBe(false);
+    expect(r.timeline.name).toBeUndefined();
+  });
+
+  it("重命名去掉首尾空白；空白名拒绝而不是清空", () => {
+    const ok = renameProject(emptyLayout(), "  成片 v2  ");
+    expect(ok.changed).toBe(true);
+    expect(ok.timeline.name).toBe("成片 v2");
+
+    const blank = renameProject(emptyLayout(), "   ");
+    expect(blank.changed).toBe(false);
+    expect(blank.reason).toContain("空白");
+  });
+
+  it("重命名成同一个名字是'值没变'，不进撤销栈也不算失败", () => {
+    const named = renameProject(emptyLayout(), "成片").timeline;
+    const again = renameProject(named, "成片");
+    expect(again.changed).toBe(false);
+    expect(again.reason).toBeUndefined();
+  });
+
+  it("把自动取的名原样确认一遍也算一次编辑：从此它是用户给的", () => {
+    const auto = addSource(emptyLayout(), { source: source("v1", 300), timelineIn: 0 }).timeline;
+    const confirmed = renameProject(auto, "v1.mp4");
+    // 名字字符串没变，但 namedByUser 变了——这次提交护住"以后不再自动改名"
+    expect(confirmed.changed).toBe(true);
+    expect(confirmed.timeline.namedByUser).toBe(true);
   });
 });

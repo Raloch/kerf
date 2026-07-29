@@ -399,6 +399,20 @@ export interface Track {
 
 /** 一个项目的完整可渲染状态。不可变——改动产生新对象，以便撤销栈直接持有快照。 */
 export interface Timeline {
+  /**
+   * 项目名。**没有这个字段 = 还没被取过名**，界面显示「未命名项目」。
+   *
+   * 不给缺省字符串：`name === undefined` 就是「自动取名还没发生」的判据本身
+   * （`addSource` 在导入第一个素材时用素材名填它，之后不再动），存一个
+   * 「未命名项目」字符串反而得靠比对文案去猜——同「改回缺省值要把字段整个删掉」。
+   */
+  readonly name?: string;
+  /**
+   * 名字是不是用户自己给的（重命名过）。**是标志，不靠"名字等不等于素材名"去猜**
+   * （D37）：猜的写法在用户恰好把项目改名成素材名时会误判成"还没取过名"。
+   * 只在用户重命名时置位；自动取名和「制作副本」都不算。
+   */
+  readonly namedByUser?: true;
   readonly fps: Rational;
   readonly width: number;
   readonly height: number;

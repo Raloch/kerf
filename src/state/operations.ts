@@ -1308,10 +1308,16 @@ export function addSource(timeline: Timeline, options: AddSourceOptions): AddSou
   }
 
   const empty = timeline.tracks.every((t) => t.clips.length === 0);
-  const conformed: Timeline =
+  let conformed: Timeline =
     empty && source.kind === "av"
       ? { ...timeline, fps: source.fps, width: source.width, height: source.height }
       : timeline;
+  // 自动取名只做一次：`name` 还不存在（= 没自动取过也没重命名过）才用素材名填上。
+  // `namedByUser` 在 `name` 已存在时必然挡不上什么，但作为判据显式写出来——
+  // "用户重命名过之后不再自动"靠的是标志，不是猜（D37）
+  if (conformed.name === undefined && conformed.namedByUser !== true) {
+    conformed = { ...conformed, name: source.name };
+  }
   /**
    * 片段初始有多长。
    *
@@ -1365,6 +1371,20 @@ export function addSource(timeline: Timeline, options: AddSourceOptions): AddSou
     clipIds.push(clip.id);
   }
   return { ...ok(next), clipIds };
+}
+
+/**
+ * 重命名项目。**这是"用户给名字"的唯一入口**，所以 `namedByUser` 在这里置位——
+ * 之后 `addSource` 的自动取名就永远不再发生（D37：改了名字再导入素材，名字不能被改回去）。
+ *
+ * 空白名拒绝而不是清空：清空会把项目送回"待自动取名"状态，下一次导入素材
+ * 名字就悄悄变了，用户看到的是"我删了名字，它自己起了一个"。
+ */
+export function renameProject(timeline: Timeline, rawName: string): EditResult {
+  const name = rawName.trim();
+  if (name.length === 0) return reject(timeline, "项目名不能是空白");
+  if (timeline.name === name && timeline.namedByUser === true) return unchanged(timeline);
+  return ok({ ...timeline, name, namedByUser: true });
 }
 
 /**

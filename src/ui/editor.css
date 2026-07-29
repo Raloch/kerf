@@ -108,6 +108,7 @@
   flex-direction: column;
   line-height: 1.25;
   min-width: 0;
+  position: relative;
 }
 .ed .proj .name {
   font-size: 12.5px;
@@ -116,6 +117,89 @@
 .ed .proj .sub {
   font-size: 10.5px;
   color: var(--tx-faint);
+  padding-left: 4px;
+}
+/* 顶栏第二行说的是**存盘状态**：失败是这行字存在的全部理由（D37），红字是常驻读数 */
+.ed .proj .sub.bad {
+  color: #e0938d;
+}
+.ed .proj .pbtn {
+  font: inherit;
+  background: transparent;
+  border: 0;
+  padding: 2px 6px 2px 4px;
+  margin-left: -4px;
+  border-radius: 4px;
+  cursor: pointer;
+  color: inherit;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.ed .proj .pbtn:hover {
+  background: var(--panel-2);
+}
+.ed .proj .caret {
+  width: 11px;
+  height: 11px;
+  color: var(--tx-faint);
+  flex: none;
+}
+.ed .proj .menu {
+  position: absolute;
+  left: 0;
+  top: 40px;
+  z-index: 40;
+  min-width: 152px;
+  background: var(--panel-3);
+  border: 1px solid var(--line-2);
+  border-radius: 6px;
+  padding: 4px;
+  box-shadow: 0 14px 34px -12px rgba(0, 0, 0, 0.7);
+}
+.ed .proj .menu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  color: var(--tx-dim);
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  padding: 7px 9px;
+  cursor: pointer;
+}
+.ed .proj .menu button:hover {
+  background: var(--panel-2);
+  color: var(--tx);
+}
+.ed .proj .menu button.danger:hover {
+  color: #e0938d;
+}
+.ed .proj .menu hr {
+  border: 0;
+  border-top: 1px solid var(--line);
+  margin: 4px 2px;
+}
+.ed .proj .menu svg {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 auto;
+}
+.ed .proj .rename input {
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--tx);
+  background: var(--ink);
+  border: 1px solid var(--kerf-soft);
+  border-radius: 4px;
+  padding: 2px 7px;
+  width: 190px;
+  outline: none;
 }
 .ed .spacer {
   flex: 1 1 auto;

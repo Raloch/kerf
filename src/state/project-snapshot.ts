@@ -37,6 +37,7 @@ import type {
   Track,
 } from "../edl/types";
 import { clipSourceId } from "../edl/types";
+import type { Rational } from "../time/rational";
 import { withNormalizedTracks } from "./operations";
 
 /**
@@ -46,8 +47,17 @@ import { withNormalizedTracks } from "./operations";
  * `Timeline` 在类型上过不去，但从 IndexedDB 出来的东西没有类型，会一路流到
  * 合成器里才炸，而那时早已看不出是快照的问题。版本不认就当没有存过（见
  * `readSnapshot` 的调用方），代价是丢一次未保存的编辑，比恢复出一个半坏的项目好。
+ *
+ * 这一轮 4 → 5：`Timeline` 加了 `name` / `namedByUser`，存法也从单键 `current`
+ * 换成按项目 id 存（D37）。旧的 `current` 记录版本不认、自动不可见，不迁移。
  */
-export const SNAPSHOT_VERSION = 4;
+export const SNAPSHOT_VERSION = 5;
+
+/** 项目 id。存储层的概念，不进 EDL——`Timeline` 自己不知道也不需要知道它是哪个项目。 */
+export type ProjectId = string;
+
+/** 界面显示"还没取过名"的项目用的名字。数据层的判据是 `name === undefined`，不是这串文案。 */
+export const UNNAMED_PROJECT = "未命名项目";
 
 /**
  * 素材在快照里的样子：除 `file` 之外的一切。文件本身单独存一份，见 `project-store.ts`。
@@ -271,12 +281,124 @@ export function fromSnapshot(snapshot: ProjectSnapshot, assets: RestoreAssets): 
 }
 
 /**
- * 这份快照里有没有值得恢复的东西。
- *
- * 空项目也会被存（用户可能只是打开过页面），而拿一个空时间轴去问"要不要恢复上次编辑"
- * 只会让人困惑。判据是**有没有片段**，不是有没有素材：导入了素材但一个片段都没放，
- * 恢复它等于什么都没恢复。
+ * 这个值是不是一份本版本认得的快照。**列项目时的过滤器**：`meta` store 里可能躺着
+ * 旧版本的记录（比如单项目时代的 `current` 键，v4），版本不认的直接不出现在列表里
+ * ——同 `fromSnapshot` 那条"恢复一个半坏的项目比不恢复更坏"，只是这里连问都不问。
  */
-export function snapshotHasWork(snapshot: ProjectSnapshot): boolean {
-  return snapshot.timeline.tracks.some((t) => t.clips.length > 0);
+export function isSnapshotUsable(value: unknown): value is ProjectSnapshot {
+  if (typeof value !== "object" || value === null) return false;
+  const snapshot = value as Partial<ProjectSnapshot>;
+  const timeline = snapshot.timeline as Partial<SnapshotTimeline> | undefined;
+  return (
+    snapshot.version === SNAPSHOT_VERSION &&
+    typeof snapshot.savedAt === "number" &&
+    typeof snapshot.playhead === "number" &&
+    typeof timeline === "object" &&
+    timeline !== null &&
+    Array.isArray(timeline.tracks) &&
+    Array.isArray(timeline.sources)
+  );
+}
+
+/** 带画面的素材在快照里的样子。首页抽封面帧只认它——纯音频和图片项目退回类型图标（D37）。 */
+export type AvSourceMeta = Extract<SourceMeta, { kind: "av" }>;
+
+export interface PosterTarget {
+  readonly source: AvSourceMeta;
+  /** 那个片段的入点（源片栅格帧号）。封面抽的是"第一个视频片段的首帧"，不是源片第 0 帧。 */
+  readonly sourceIn: number;
+}
+
+/**
+ * 首页卡片封面该抽哪一帧："第一个视频片段的首帧"（D37）。
+ *
+ * 只认引用 `av` 素材的 `media` 片段：图片没有"抽帧"这回事，纯音频没有画面。
+ * 同一帧起点时取更靠下的轨（主视频在最底下）——那是用户眼里"打底"的那一层。
+ */
+export function posterTarget(timeline: SnapshotTimeline): PosterTarget | null {
+  const avById = new Map<SourceId, AvSourceMeta>();
+  for (const meta of timeline.sources) {
+    if (meta.kind === "av") avById.set(meta.id, meta);
+  }
+  let best: PosterTarget | null = null;
+  let bestAt = Infinity;
+  let bestTrack = -1;
+  for (let index = 0; index < timeline.tracks.length; index++) {
+    const track = timeline.tracks[index]!;
+    if (track.kind !== "video") continue;
+    for (const clip of track.clips) {
+      if (clip.kind !== "media") continue;
+      const meta = avById.get(clip.sourceId);
+      if (!meta) continue;
+      if (clip.timelineIn < bestAt || (clip.timelineIn === bestAt && index > bestTrack)) {
+        best = { source: meta, sourceIn: clip.sourceIn };
+        bestAt = clip.timelineIn;
+        bestTrack = index;
+      }
+    }
+  }
+  return best;
+}
+
+/** 首页一张卡片要显示的一切。从快照算出来，不需要资产库。 */
+export interface ProjectSummary {
+  readonly id: ProjectId;
+  /** `null` = 还没取过名，界面显示 `UNNAMED_PROJECT`。 */
+  readonly name: string | null;
+  readonly savedAt: number;
+  readonly fps: Rational;
+  readonly width: number;
+  readonly height: number;
+  readonly durationFrames: number;
+  readonly clipCount: number;
+  /** 素材元数据，供"离线素材"惰性检查用（文件本身在资产库里）。 */
+  readonly sources: readonly SourceMeta[];
+  readonly poster: PosterTarget | null;
+}
+
+export function summarizeProject(id: ProjectId, snapshot: ProjectSnapshot): ProjectSummary {
+  const { timeline } = snapshot;
+  return {
+    id,
+    name: timeline.name ?? null,
+    savedAt: snapshot.savedAt,
+    fps: timeline.fps,
+    width: timeline.width,
+    height: timeline.height,
+    durationFrames: timeline.durationFrames,
+    clipCount: timeline.tracks.reduce((n, t) => n + t.clips.length, 0),
+    sources: timeline.sources,
+    poster: posterTarget(timeline),
+  };
+}
+
+/**
+ * 重命名后的快照（首页那条路：项目没装进 store，直接改快照）。
+ *
+ * `namedByUser` 在这里置位，同 `operations.ts` 的 `renameProject`——两条路都是
+ * "用户给名字"的入口。名字的校验（去空白、拒空）归调用方，这里只管形状。
+ */
+export function renamedSnapshot(
+  snapshot: ProjectSnapshot,
+  name: string,
+  savedAt: number,
+): ProjectSnapshot {
+  return { ...snapshot, savedAt, timeline: { ...snapshot.timeline, name, namedByUser: true } };
+}
+
+/**
+ * 制作副本：同一份时间轴换个名字。
+ *
+ * **`sources` 原样保留（两个项目共享 `sourceId`）——这是对的**：`File` 是磁盘引用，
+ * 复制毫无意义。它的代价是"删掉副本绝不能顺手删 assets"（D37），清理只能走
+ * "全项目引用集合 + 够老"那条路。`namedByUser` 摘掉：「X 副本」是系统起的名字，
+ * 不是用户给的。
+ */
+export function duplicatedSnapshot(snapshot: ProjectSnapshot, savedAt: number): ProjectSnapshot {
+  const { namedByUser: _named, ...timeline } = snapshot.timeline;
+  return {
+    ...snapshot,
+    savedAt,
+    timeline: { ...timeline, name: `${snapshot.timeline.name ?? UNNAMED_PROJECT} 副本` },
+  };
 }
