@@ -322,15 +322,26 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
       */}
       {recover && (
         <div className={`ed-recover${recoverable === 0 ? " warn" : ""}`}>
+          {/*
+            **不要说"上次没有正常结束"。** 判据只是"IndexedDB 里有一份带片段的快照"，
+            而正常关标签页同样会落盘（`autosave.ts` 的 `pagehide` 那一路），所以那句话
+            对每一次正常关闭都成立——用户每次关掉再打开都会被告知程序崩过。
+
+            我们**判不出**崩没崩：那需要一个"正常离开时置位"的标志，而唯一能写它的
+            时机是 `pagehide`，而它在 iOS 上不一定来（同一处已经在 `autosave.ts` 里
+            记着）。于是那个标志会漏写，表现成"正常关闭也报崩溃"——和现在一样，只是
+            多了一个字段。假警告比没有警告更坏（同 D24），所以**只陈述事实**：
+            上次编辑到什么时候、有多少片段，要不要接着。
+          */}
           {recoverable === 0 ? (
             /*
-              一个片段都救不回来时**不能还问"要不要恢复"**：按下去得到一个空时间轴，
-              而提示刚说过"上次的编辑没有正常结束"，读起来像恢复失败了。这一支照样
-              要说清楚原因——静默丢掉才是最坏的，用户既失去了项目也不知道为什么。
+              一个片段都救不回来时**不能还问"要不要接着编"**：按下去得到一个空时间轴，
+              而提示刚说过上次编辑到什么时候，读起来像操作失败了。这一支照样要说清楚
+              原因——静默丢掉才是最坏的，用户既失去了项目也不知道为什么。
             */
             <>
               <span>
-                上次的编辑（{new Date(recover.savedAt).toLocaleString()}）恢复不了：
+                上次编辑到 {new Date(recover.savedAt).toLocaleString()}，但接不下去了：
                 {lostNames.length > 0
                   ? `用到的素材已经找不到了（${lostNames.join("、")}）`
                   : "里面已经没有片段了"}
@@ -342,15 +353,14 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
           ) : (
             <>
               <span>
-                上次的编辑没有正常结束（{new Date(recover.savedAt).toLocaleString()}，
-                {recoverable} 个片段）
-                {lostNames.length > 0 && ` · 其中有素材找不回来了，恢复时会说明`}
+                上次编辑到 {new Date(recover.savedAt).toLocaleString()}（{recoverable} 个片段）
+                {lostNames.length > 0 && ` · 其中有素材找不回来了，接着编时会说明`}
               </span>
               <button type="button" className="btn-primary" onClick={acceptRecover}>
-                恢复
+                接着编
               </button>
               <button type="button" className="chip-btn" onClick={discardRecover}>
-                不恢复
+                重新开始
               </button>
             </>
           )}
