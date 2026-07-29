@@ -386,3 +386,169 @@
   font-size: 11px;
   color: var(--tx-faint);
 }
+
+/* ---------- 指认素材（D37 第 2 刀） ---------- */
+.hm .ib {
+  font: inherit;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--tx-dim);
+  border-radius: var(--r);
+  padding: 5px;
+  cursor: pointer;
+  display: inline-flex;
+}
+.hm .ib svg {
+  width: 15px;
+  height: 15px;
+}
+.hm .ib:hover {
+  background: var(--panel-2);
+  color: var(--tx);
+}
+
+.hm .reid {
+  max-width: 860px;
+}
+.hm .reid-hd {
+  max-width: 70ch;
+}
+.hm .reid-hd h2 {
+  margin: 0 0 10px;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--tx);
+}
+.hm .reid-hd p {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.62;
+  color: var(--tx-dim);
+}
+
+.hm .reid-list {
+  margin: 20px 0 0;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  overflow: hidden;
+}
+.hm .reid-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 13px;
+  background: var(--panel);
+}
+.hm .reid-row + .reid-row {
+  border-top: 1px solid var(--line);
+}
+.hm .reid-row .ic {
+  width: 26px;
+  height: 26px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+}
+.hm .reid-row .ic svg {
+  width: 14px;
+  height: 14px;
+}
+.hm .reid-row.v .ic {
+  background: #33586a;
+  color: #ddeaf0;
+}
+.hm .reid-row.a .ic {
+  background: #46614f;
+  color: #deede3;
+}
+.hm .reid-row .txt {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.hm .reid-row .nm {
+  display: block;
+  font-size: 13px;
+  color: var(--tx);
+}
+.hm .reid-row .nm b {
+  color: var(--tx);
+  font-weight: 600;
+}
+.hm .reid-row .sub {
+  display: block;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10.5px;
+  color: var(--tx-faint);
+  margin-top: 3px;
+}
+/* 指认完的行退到背景里：注意力该留在还没指认的那些上 */
+.hm .reid-row.done {
+  background: var(--panel-2);
+}
+.hm .reid-row.done .nm {
+  color: var(--tx-dim);
+}
+.hm .reid-row .tick {
+  color: var(--ok, #57a87a);
+  flex: 0 0 auto;
+  display: inline-flex;
+}
+.hm .reid-row .tick svg {
+  width: 14px;
+  height: 14px;
+}
+/* 不匹配是**警告不是拦阻**（也许真换了一版素材），所以用强调色而不是红 */
+.hm .reid-row .mismatch {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 5px;
+  font-size: 11.5px;
+  color: var(--kerf);
+}
+.hm .reid-row .mismatch svg {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 auto;
+}
+/* 种类不一致是真的拦住了，那一条才是红的 */
+.hm .reid-row .mismatch.bad {
+  color: #e0938d;
+}
+
+.hm .reid-row .file-pick {
+  position: relative;
+  overflow: hidden;
+  flex: 0 0 auto;
+}
+.hm .reid-row .file-pick input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.hm .reid-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 16px;
+  flex-wrap: wrap;
+}
+.hm .reid-foot .note {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+  color: var(--tx-faint);
+}
+/* 指认完之后的「换一个」退成次要按钮：对勾才是这一行的结论 */
+.hm .reid-row .file-pick.again {
+  background: transparent;
+  border-color: var(--line);
+  color: var(--tx-faint);
+}
+.hm .reid-row .file-pick.again:hover {
+  color: var(--tx-dim);
+  border-color: var(--line-2);
+}

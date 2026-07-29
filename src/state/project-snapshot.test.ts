@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { FPS } from "../time/rational";
 import type {
+  AvSource,
   Clip,
   FontSource,
   LutSource,
@@ -12,6 +13,7 @@ import type {
 } from "../edl/types";
 import { computeDuration } from "./operations";
 import {
+  countClipsBySource,
   duplicatedSnapshot,
   fromSnapshot,
   isSnapshotUsable,
@@ -20,8 +22,10 @@ import {
   SNAPSHOT_VERSION,
   summarizeProject,
   toSnapshot,
+  withReplacedSources,
   type ProjectSnapshot,
   type RestoreAssets,
+  type SourceMeta,
 } from "./project-snapshot";
 
 // ---- 夹具 ----
@@ -484,5 +488,132 @@ describe("重命名与副本", () => {
 
   it("没取过名的项目，副本叫「未命名项目 副本」", () => {
     expect(duplicatedSnapshot(base(), 0).timeline.name).toBe("未命名项目 副本");
+  });
+});
+
+describe("每个素材被多少片段引用（指认页的「用在 N 个片段」）", () => {
+  const imageSource = (id: string): MediaSource => ({
+    id,
+    kind: "image",
+    name: `${id}.png`,
+    file: new File([`${id}`], `${id}.png`),
+    hasAudio: false,
+    width: 800,
+    height: 400,
+    mimeType: "image/png",
+    frameCount: 1,
+    audioCodec: null,
+  });
+  const imageClip = (id: string, sourceId: string, timelineIn: number): Clip => ({
+    id,
+    kind: "image",
+    sourceId,
+    timelineIn,
+    timelineOut: timelineIn + 30,
+    name: id,
+  });
+
+  it("按 sourceId 分别计数，没被用到的报 0", () => {
+    const other = { ...source("src-other"), id: "src-other" };
+    const snapshot = toSnapshot(
+      timeline(
+        [
+          { id: "V1", kind: "video", clips: [clip("a", 0, 10), clip("b", 10, 20)] },
+          { id: "A1", kind: "audio", clips: [clip("c", 0, 10)] },
+        ],
+        [source("src"), other],
+      ),
+      0,
+      0,
+    );
+    const counts = countClipsBySource(snapshot.timeline);
+    expect(counts.get("src")).toBe(3);
+    // 导入了但一个片段都没放：**要报 0 而不是不出现**——"没用到"和"丢了三段"是两个结论
+    expect(counts.get("src-other")).toBe(0);
+  });
+
+  it("图片片段也算进去（问 clipSourceId，不是判 kind 是不是 media）", () => {
+    const snapshot = toSnapshot(
+      timeline(
+        [{ id: "V1", kind: "video", clips: [imageClip("i1", "src-img", 0), imageClip("i2", "src-img", 40)] }],
+        [imageSource("src-img")],
+      ),
+      0,
+      0,
+    );
+    // 漏掉图片的表现是"跳过之后又多丢了几个片段，而提示里没提这张图"
+    expect(countClipsBySource(snapshot.timeline).get("src-img")).toBe(2);
+  });
+
+  it("文字片段不引用素材，不计入任何一个", () => {
+    const snapshot = toSnapshot(
+      timeline([{ id: "T1", kind: "video", clips: [textClip("t1")] }], [source("src")]),
+      0,
+      0,
+    );
+    expect(countClipsBySource(snapshot.timeline).get("src")).toBe(0);
+  });
+});
+
+describe("换掉指认到的素材元数据", () => {
+  const three = () => {
+    const a = { ...source("src-a"), id: "src-a", name: "a.mp4" };
+    const b = { ...source("src-b"), id: "src-b", name: "b.mp4" };
+    const c = { ...source("src-c"), id: "src-c", name: "c.mp4" };
+    return toSnapshot(
+      timeline([{ id: "V1", kind: "video", clips: [clip("x", 0, 10, "src-a")] }], [a, b, c]),
+      0,
+      0,
+    );
+  };
+  const metaOf = (s: MediaSource) => {
+    const { file: _f, ...meta } = s;
+    return meta as SourceMeta;
+  };
+
+  it("**按 sourceId 配对，不按顺序**", () => {
+    const snapshot = three();
+    // 用户先指了 C 再指了 A——插入顺序刻意和 sources 的顺序不一致。
+    // 按下标配对的写法会把 C 的文件配给 A、A 的配给 B，而那表现为"画面全错"且不报错
+    const overrides = new Map<string, SourceMeta>([
+      ["src-c", metaOf({ ...source("src-c"), id: "src-c", name: "c-new.mp4" })],
+      ["src-a", metaOf({ ...source("src-a"), id: "src-a", name: "a-new.mp4" })],
+    ]);
+    const next = withReplacedSources(snapshot, overrides);
+    expect(next.timeline.sources.map((s) => s.name)).toEqual(["a-new.mp4", "b.mp4", "c-new.mp4"]);
+    // id 一个都不能变：EDL 引用的是 id
+    expect(next.timeline.sources.map((s) => s.id)).toEqual(["src-a", "src-b", "src-c"]);
+  });
+
+  it("换的是描述文件本身的字段（帧率 / 尺寸 / 时长）", () => {
+    const snapshot = three();
+    // `source()` 的返回类型是联合，展开后再加字段会撞上多余属性检查——
+    // 收窄成 AvSource 再改，本来要测的就是"带画面的素材换了一版"
+    const replaced = metaOf({
+      ...(source("src-a", 999) as AvSource),
+      fps: FPS.pal25,
+      width: 1280,
+      height: 720,
+    });
+    const next = withReplacedSources(snapshot, new Map([["src-a", replaced]]));
+    const meta = next.timeline.sources[0]!;
+    expect(meta.kind === "av" && meta.width).toBe(1280);
+    expect(meta.kind === "av" && meta.durationFrames).toBe(999);
+    expect(meta.kind === "av" && meta.fps).toEqual(FPS.pal25);
+  });
+
+  it("没有指认结果时原样返回（同一个对象）", () => {
+    const snapshot = three();
+    expect(withReplacedSources(snapshot, new Map())).toBe(snapshot);
+  });
+
+  it("片段一个都不动——指认换的是素材，不是编辑", () => {
+    const snapshot = three();
+    const next = withReplacedSources(
+      snapshot,
+      new Map([["src-a", metaOf({ ...source("src-a"), id: "src-a", name: "n.mp4" })]]),
+    );
+    expect(next.timeline.tracks).toEqual(snapshot.timeline.tracks);
+    expect(next.playhead).toBe(snapshot.playhead);
   });
 });

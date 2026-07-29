@@ -41,13 +41,16 @@ import type {
   SourceId,
   Timeline,
 } from "../edl/types";
+import type { Rational } from "../time/rational";
 import {
+  countClipsBySource,
   duplicatedSnapshot,
   fromSnapshot,
   isSnapshotUsable,
   renamedSnapshot,
   summarizeProject,
   toSnapshot,
+  withReplacedSources,
   type ProjectId,
   type ProjectSnapshot,
   type ProjectSummary,
@@ -55,6 +58,7 @@ import {
   type RestoreResult,
   type SourceMeta,
 } from "./project-snapshot";
+import type { MissingSource, Reidentified } from "./reidentify";
 
 const DB_NAME = "kerf";
 const DB_VERSION = 1;
@@ -223,18 +227,31 @@ export async function readSourceFile(id: SourceId): Promise<File | null> {
 }
 
 /**
- * 这批素材里有几个已经读不动了（文件失效或压根没存上）。
+ * 这批素材里哪些已经读不动了（文件失效或压根没存上）。
+ *
+ * 首页卡片的「N 个素材找不到了」和指认页的名单是**同一个读数**，所以只有这一个
+ * 实现：两处各写一遍的话，卡片说"2 个找不到"而指认页列出 3 行是完全可能的，
+ * 而那种不一致没有任何东西会报错。
+ */
+export async function unreadableSourceIds(
+  sources: readonly SourceMeta[],
+): Promise<Set<SourceId>> {
+  const missing = new Set<SourceId>();
+  for (const meta of sources) {
+    const file = await readSourceFile(meta.id);
+    if (!file || !(await isReadable(file))) missing.add(meta.id);
+  }
+  return missing;
+}
+
+/**
+ * 这批素材里有几个已经读不动了。
  *
  * 首页卡片的「N 个素材找不到了」从这里来。**每个项目一次、卡片各自异步填**——
  * 全部项目 × 全部素材是 N×M 次读，同步等它会卡首屏（D37）。
  */
 export async function countUnreadableSources(sources: readonly SourceMeta[]): Promise<number> {
-  let unreadable = 0;
-  for (const meta of sources) {
-    const file = await readSourceFile(meta.id);
-    if (!file || !(await isReadable(file))) unreadable += 1;
-  }
-  return unreadable;
+  return (await unreadableSourceIds(sources)).size;
 }
 
 // ---------------------------------------------------------------- 项目
@@ -313,22 +330,108 @@ export interface StoredProject extends RestoreResult {
 }
 
 /**
+ * 打开之前先看一眼：这个项目有哪些素材读不动。**只读，一个字节都不写。**
+ *
+ * 拆成"先验一眼"和"带着指认结果装载"两步，是为了让离线素材有出路（D37）：
+ * `loadProject` 直接把读不动的素材连带片段丢掉，而**丢掉这件事在用户表态之前
+ * 不能发生**。这一步只报告，不装载、不落盘——所以"打开看一眼再退回首页"
+ * 一个片段都不会丢。
+ */
+export interface ProjectInspection {
+  readonly id: ProjectId;
+  readonly name: string | null;
+  readonly savedAt: number;
+  /** 项目帧率。纯音频素材的栅格是派生的，描述它的时长要用这个（`sourceGridFps`）。 */
+  readonly fps: Rational;
+  /** 读不动的素材，连带它牵着多少片段。空数组 = 可以直接打开。 */
+  readonly missing: readonly MissingSource[];
+}
+
+export async function inspectProject(id: ProjectId): Promise<ProjectInspection | null> {
+  const snapshot = await readSnapshot(id);
+  if (!snapshot) return null;
+  const missingIds = await unreadableSourceIds(snapshot.timeline.sources);
+  const counts = countClipsBySource(snapshot.timeline);
+  return {
+    id,
+    name: snapshot.timeline.name ?? null,
+    savedAt: snapshot.savedAt,
+    fps: snapshot.timeline.fps,
+    missing: snapshot.timeline.sources
+      .filter((meta) => missingIds.has(meta.id))
+      .map((meta) => ({ meta, clips: counts.get(meta.id) ?? 0 })),
+  };
+}
+
+/**
+ * 把指认结果落盘。**文件和元数据成对写，而且先写快照再写文件。**
+ *
+ * 成对：只换文件不换元数据会留下一个陈旧的第二真值来源，错起来是静默的
+ * （见 `state/reidentify.ts` 文件头）。所以两者要么都写上，要么都别写。
+ *
+ * 顺序：写一半时，"新元数据 + 老（读不动的）文件"仍然落在**离线**这个安全的桶里
+ * ——下次打开照样问一遍。反过来"新文件 + 老元数据"才是危险的那半，会静默取错帧。
+ * 所以先快照后文件，让部分失败落在安全的那一侧。
+ *
+ * 只在**用户明确指认**之后调用；「跳过」一个字节都不写（那是破坏性的，留给
+ * 第一次编辑去写死）。
+ */
+export async function commitReidentified(
+  id: ProjectId,
+  replacements: ReadonlyMap<SourceId, Reidentified>,
+): Promise<boolean> {
+  if (replacements.size === 0) return true;
+  const snapshot = await readSnapshot(id);
+  if (!snapshot) return false;
+  const metas = new Map<SourceId, SourceMeta>();
+  for (const [sourceId, next] of replacements) metas.set(sourceId, next.meta);
+  try {
+    await run(META_STORE, "readwrite", (s) => s.put(withReplacedSources(snapshot, metas), id));
+    for (const [sourceId, next] of replacements) {
+      await run(ASSET_STORE, "readwrite", (s) => s.put(wrapAsset(next.file), `source:${sourceId}`));
+    }
+    lastSaveError = null;
+    return true;
+  } catch (error) {
+    lastSaveError = error instanceof Error ? error.message : String(error);
+    return false;
+  }
+}
+
+/**
  * 读回一个项目。没有或版本不认时返回 null（**按"没存过"处理**：恢复一个半坏的
  * 时间轴比不恢复更坏，理由见 `project-snapshot.ts` 文件头）。
  *
  * 素材验的是**真读一个字节**；读不动的素材，其片段由 `fromSnapshot` 移除并记在
  * `droppedSources` 里——**必须报给用户**。被移除的结果只在用户第一次编辑落盘时
  * 才写回去，所以"打开看一眼再关掉"不会把丢片段写死（指认页靠的正是这一点）。
+ *
+ * `replacements` 是指认结果（按 `sourceId`，**不按顺序**）：它同时换掉文件和元数据，
+ * 于是那些素材不再算"找不回来"，片段留住。落盘归 `commitReidentified`，两件事分开
+ * 是刻意的——装载是每次打开都做的，落盘只在用户明确指认过之后做。
  */
-export async function loadProject(id: ProjectId): Promise<StoredProject | null> {
-  const snapshot = await readSnapshot(id);
-  if (!snapshot) return null;
+export async function loadProject(
+  id: ProjectId,
+  replacements?: ReadonlyMap<SourceId, Reidentified>,
+): Promise<StoredProject | null> {
+  const stored = await readSnapshot(id);
+  if (!stored) return null;
+  // 元数据先换（`id` 不变），后面读资产、拼时间轴用的就都是新文件的帧率和尺寸
+  const metas = new Map<SourceId, SourceMeta>();
+  for (const [sourceId, next] of replacements ?? []) metas.set(sourceId, next.meta);
+  const snapshot = withReplacedSources(stored, metas);
 
   const files = new Map<SourceId, File>();
   const luts = new Map<LutId, Float32Array>();
   const fonts = new Map<FontFamily, ArrayBuffer>();
   try {
     for (const meta of snapshot.timeline.sources) {
+      // 指认进来的文件直接用：它刚被用户挑出来、探针也刚读过，比再验一遍可靠
+      const replaced = replacements?.get(meta.id);
+      if (replaced) {
+        files.set(meta.id, replaced.file);
+        continue;
+      }
       const file = await readSourceFile(meta.id);
       // 存在**且读得动**才算拿回来了，见 `isReadable`
       if (file && (await isReadable(file))) files.set(meta.id, file);

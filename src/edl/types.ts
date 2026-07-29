@@ -216,6 +216,23 @@ export interface ImageSource extends SourceBase {
  */
 export type MediaSource = AvSource | AudioOnlySource | ImageSource;
 
+/**
+ * **分配式 `Omit`。** `Omit<A | B, K>` 会先把联合塌成"两边共有的字段"再去掉 K，
+ * 而那会让 `MediaSource` 只剩 id / name / kind / hasAudio / audioCodec——帧率、
+ * 尺寸、时长全部消失，且**不报错**。理由展开见 `project-snapshot.ts` 的 `SourceMeta`。
+ */
+export type DistributiveOmit<T, K extends keyof never> = T extends unknown ? Omit<T, K> : never;
+
+/**
+ * 素材去掉文件之后的样子——快照里存的就是它（`SourceMeta`）。
+ *
+ * 帧栅格的派生（`sourceGridFps` / `sourceDurationFrames`）**只认判别字段和时长，
+ * 不需要文件**，所以那两个函数收这个更宽的类型：指认页要在文件还读不回来的时候
+ * 说出"这个素材应该是 1:12"，而抄一份换算式就等于给那条派生开了第二个真值来源
+ * （CLAUDE.md：纯音频素材的帧栅格是派生的、不存）。
+ */
+export type SourceFacts = DistributiveOmit<MediaSource, "file">;
+
 /** 这个素材有画面吗（视频或图片）。画面轨上只放得下这两种。 */
 export function sourceHasPicture(source: MediaSource): source is AvSource | ImageSource {
   return source.kind !== "audio";
@@ -228,7 +245,7 @@ export function sourceHasPicture(source: MediaSource): source is AvSource | Imag
  * `AudioOnlySource` 的文件头。**凡是把 `sourceIn` 换算成时间的地方都要问这个函数**，
  * 直接读 `source.fps` 在纯音频素材上编译不过（那正是这个联合想要的效果）。
  */
-export function sourceGridFps(source: MediaSource, timelineFps: Rational): Rational {
+export function sourceGridFps(source: SourceFacts, timelineFps: Rational): Rational {
   return source.kind === "av" ? source.fps : timelineFps;
 }
 
@@ -249,7 +266,7 @@ export const IMAGE_SOURCE_FRAMES = Number.POSITIVE_INFINITY;
  * 纯音频素材用 `floor` 而不是 `round`：宁可少报一帧，也不能报出一帧解不出内容的
  * 位置（那会让裁到末尾的片段末帧静音，而静音在波形上看着就像素材本身如此）。
  */
-export function sourceDurationFrames(source: MediaSource, timelineFps: Rational): number {
+export function sourceDurationFrames(source: SourceFacts, timelineFps: Rational): number {
   if (source.kind === "av") return source.durationFrames;
   if (source.kind === "image") return IMAGE_SOURCE_FRAMES;
   return Math.max(

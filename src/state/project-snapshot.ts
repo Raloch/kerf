@@ -31,6 +31,7 @@ import type {
   LutId,
   LutSource,
   MediaSource,
+  SourceFacts,
   SourceId,
   TextClip,
   Timeline,
@@ -68,8 +69,7 @@ export const UNNAMED_PROJECT = "未命名项目";
  * 写进 IndexedDB），读回来拼 `{...meta, file}` 才编译不过；真正坏的形态是它**编译
  * 得过**的那一天——快照少一半字段，恢复出来的素材没有时长。
  */
-type DistributiveOmit<T, K extends keyof never> = T extends unknown ? Omit<T, K> : never;
-export type SourceMeta = DistributiveOmit<MediaSource, "file">;
+export type SourceMeta = SourceFacts;
 /** LUT 在快照里的样子：除查表数据之外的一切。 */
 export type LutMeta = Omit<LutSource, "rgb">;
 /**
@@ -298,6 +298,46 @@ export function isSnapshotUsable(value: unknown): value is ProjectSnapshot {
     Array.isArray(timeline.tracks) &&
     Array.isArray(timeline.sources)
   );
+}
+
+/**
+ * 每个素材被多少个片段引用。指认页要显示"用在 4 个片段"——**跳过它就丢这么多**。
+ *
+ * 问 `clipSourceId()` 而不是判 `kind === "media"`：图片片段同样带 `sourceId`，
+ * 漏掉它的表现是"跳过之后又多丢了几个片段，而提示里没提这张图"。
+ */
+export function countClipsBySource(timeline: SnapshotTimeline): Map<SourceId, number> {
+  const counts = new Map<SourceId, number>();
+  for (const meta of timeline.sources) counts.set(meta.id, 0);
+  for (const track of timeline.tracks) {
+    for (const clip of track.clips) {
+      const sourceId = clipSourceId(clip);
+      if (sourceId === null) continue;
+      counts.set(sourceId, (counts.get(sourceId) ?? 0) + 1);
+    }
+  }
+  return counts;
+}
+
+/**
+ * 把指认到的新文件的元数据换进快照。**按 `sourceId` 查表，所以顺序无关**——
+ * 这正是"指认结果不按顺序配对"那条判据的落点（D37）。
+ *
+ * 换的是帧率 / 尺寸 / 时长这些**描述文件本身**的字段，`id` 由调用方保住（见
+ * `reidentifiedFrom`）。为什么必须换而不是只换文件，见 `state/reidentify.ts` 文件头。
+ */
+export function withReplacedSources(
+  snapshot: ProjectSnapshot,
+  overrides: ReadonlyMap<SourceId, SourceMeta>,
+): ProjectSnapshot {
+  if (overrides.size === 0) return snapshot;
+  return {
+    ...snapshot,
+    timeline: {
+      ...snapshot.timeline,
+      sources: snapshot.timeline.sources.map((meta) => overrides.get(meta.id) ?? meta),
+    },
+  };
 }
 
 /** 带画面的素材在快照里的样子。首页抽封面帧只认它——纯音频和图片项目退回类型图标（D37）。 */

@@ -12,16 +12,22 @@
  */
 
 import { lazy, Suspense, useCallback, useEffect, useState } from "react";
+import type { SourceId } from "../edl/types";
 import type { ProjectId } from "../state/project-snapshot";
+import type { ProjectInspection } from "../state/project-store";
+import type { Reidentified } from "../state/reidentify";
 import { EMPTY_TIMELINE, useTimeline } from "../state/timeline-store";
 import { Editor } from "./Editor";
 import { Home } from "./Home";
+import { Reidentify } from "./Reidentify";
 
 const M0Panel = lazy(() => import("./M0Panel").then((m) => ({ default: m.M0Panel })));
 
 type View =
   | { readonly kind: "home" }
   | { readonly kind: "editor"; readonly note: string | null }
+  /** 打开项目时有素材读不动：停在指认页，**装进 store 之前**（离线永不进 EDL）。 */
+  | { readonly kind: "reidentify"; readonly inspection: ProjectInspection }
   | { readonly kind: "selfcheck" };
 
 export function App() {
@@ -34,19 +40,52 @@ export function App() {
     if (view.kind === "home") useTimeline.getState().closeProject();
   }, [view]);
 
-  const openProject = useCallback(async (id: ProjectId) => {
-    const { loadProject } = await import("../state/project-store");
-    const found = await loadProject(id);
-    if (!found) {
-      // 打不开（版本不认/记录没了）留在首页。静默什么都不发生比报错更难排查，
-      // 但首页的提示条归 Home 管；这里最少要把项目从"看起来能打开"里去掉
-      window.alert("这个项目打不开了（记录已损坏或版本不认），它不会被修改。");
-      return;
-    }
-    // id 和时间轴在同一次 set 里换（openProject 内部保证），autosave 不可能串写
-    useTimeline.getState().openProject(id, found.timeline, found.playhead);
-    setView({ kind: "editor", note: openNote(found) });
-  }, []);
+  /**
+   * 真正把项目装进 store。`replacements` 是指认结果（按 `sourceId`，不按顺序）。
+   *
+   * **指认成功要落盘，跳过一个字节都不写**：前者是用户明确动作（而且文件和元数据
+   * 必须成对写，见 `commitReidentified`），后者是破坏性的，留给第一次编辑去写死。
+   */
+  const enterProject = useCallback(
+    async (id: ProjectId, replacements?: ReadonlyMap<SourceId, Reidentified>) => {
+      const { commitReidentified, loadProject } = await import("../state/project-store");
+      const found = await loadProject(id, replacements);
+      if (!found) {
+        // 打不开（版本不认/记录没了）留在首页。静默什么都不发生比报错更难排查
+        window.alert("这个项目打不开了（记录已损坏或版本不认），它不会被修改。");
+        setView({ kind: "home" });
+        return;
+      }
+      if (replacements && replacements.size > 0) await commitReidentified(id, replacements);
+      // id 和时间轴在同一次 set 里换（openProject 内部保证），autosave 不可能串写
+      useTimeline.getState().openProject(id, found.timeline, found.playhead);
+      setView({ kind: "editor", note: openNote(found) });
+    },
+    [],
+  );
+
+  /**
+   * 点开一个项目：**先只验一眼**有没有素材读不动，有就停在指认页。
+   *
+   * 装载会把读不动的素材连带片段丢掉（`fromSnapshot`），而**丢掉这件事在用户表态
+   * 之前不能发生**——所以这里不能直接 `loadProject`。`inspectProject` 只读不写。
+   */
+  const openProject = useCallback(
+    async (id: ProjectId) => {
+      const { inspectProject } = await import("../state/project-store");
+      const inspection = await inspectProject(id);
+      if (!inspection) {
+        window.alert("这个项目打不开了（记录已损坏或版本不认），它不会被修改。");
+        return;
+      }
+      if (inspection.missing.length > 0) {
+        setView({ kind: "reidentify", inspection });
+        return;
+      }
+      await enterProject(id);
+    },
+    [enterProject],
+  );
 
   const createProject = useCallback(async () => {
     const { newProjectId, saveProject } = await import("../state/project-store");
@@ -76,6 +115,12 @@ export function App() {
       onOpen={(id) => void openProject(id)}
       onCreate={() => void createProject()}
       onOpenSelfCheck={() => setView({ kind: "selfcheck" })}
+    />
+  ) : view.kind === "reidentify" ? (
+    <Reidentify
+      inspection={view.inspection}
+      onOpen={(replacements) => void enterProject(view.inspection.id, replacements)}
+      onBack={() => setView({ kind: "home" })}
     />
   ) : (
     <Suspense
