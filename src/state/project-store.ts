@@ -8,7 +8,7 @@
  * **快照每次编辑都要重写，素材一辈子只写一次。** 混在一条记录里的话，拖一下片段
  * 就要把几百 MB 的 `File` 连带重写一遍——自动存盘会变成整个编辑器最慢的东西，
  * 而且 iOS 上那是最容易被系统杀掉的时刻。所以：`meta` 存快照（几十 KB，随便写），
- * `assets` 按 `sourceId` / `lutId` 存原始数据（导入时写一次，之后只读）。
+ * `assets` 按 `sourceId` / `lutId` / 字体族名存原始数据（导入时写一次，之后只读）。
  *
  * ## `File` 存进 IndexedDB 靠得住吗
  *
@@ -25,7 +25,16 @@
  * 静默失败在这里是可接受的降级：用户没有丢任何东西，只是失去了崩溃恢复。
  */
 
-import type { LutId, LutSource, MediaSource, SourceId, Timeline } from "../edl/types";
+import { registerFont } from "../compose/font-registry";
+import type {
+  FontFamily,
+  FontSource,
+  LutId,
+  LutSource,
+  MediaSource,
+  SourceId,
+  Timeline,
+} from "../edl/types";
 import {
   fromSnapshot,
   snapshotHasWork,
@@ -139,6 +148,16 @@ export async function putLutAsset(lut: LutSource): Promise<boolean> {
   }
 }
 
+export async function putFontAsset(font: FontSource): Promise<boolean> {
+  try {
+    await run(ASSET_STORE, "readwrite", (s) => s.put(font.data, `font:${font.family}`));
+    return true;
+  } catch (error) {
+    lastSaveError = error instanceof Error ? error.message : String(error);
+    return false;
+  }
+}
+
 /**
  * 真读一个字节，确认这个 `File` 还指向一个能读的文件。
  *
@@ -182,6 +201,7 @@ export async function loadProject(): Promise<StoredProject | null> {
 
   const files = new Map<SourceId, File>();
   const luts = new Map<LutId, Float32Array>();
+  const fonts = new Map<FontFamily, ArrayBuffer>();
   try {
     for (const meta of snapshot.timeline.sources) {
       const file = await run<File | undefined>(ASSET_STORE, "readonly", (s) =>
@@ -196,12 +216,27 @@ export async function loadProject(): Promise<StoredProject | null> {
       );
       if (rgb instanceof Float32Array) luts.set(meta.id, rgb);
     }
+    for (const meta of snapshot.timeline.fonts ?? []) {
+      const data = await run<ArrayBuffer | undefined>(ASSET_STORE, "readonly", (s) =>
+        s.get(`font:${meta.family}`),
+      );
+      if (!(data instanceof ArrayBuffer) || data.byteLength === 0) continue;
+      // **读回来就当场注册**，装不上的当"拿不回来"。同 `File` 那条"真读一个字节"：
+      // 字节存在不等于它还是个字体，而不注册就把它放进时间轴的话，渲染时
+      // `rasterizeText` 会抛（见 compose/font-registry.ts 文件头那条纪律）
+      try {
+        await registerFont({ ...meta, data });
+        fonts.set(meta.family, data);
+      } catch (error) {
+        lastSaveError = error instanceof Error ? error.message : String(error);
+      }
+    }
   } catch {
     // 资产读到一半失败：剩下的当"找不回来"，由 fromSnapshot 收拾并报出来，
     // 比整份放弃好——已经拿回来的那些片段仍然是用户的编辑成果
   }
 
-  const assets: RestoreAssets = { files, luts };
+  const assets: RestoreAssets = { files, luts, fonts };
   try {
     const restored = fromSnapshot(snapshot, assets);
     return { ...restored, savedAt: snapshot.savedAt };

@@ -15,6 +15,7 @@ import type { AnimatableProperty, Easing } from "../anim/keyframes";
 import type {
   Clip,
   ClipId,
+  FontSource,
   LutId,
   LutSource,
   MediaSource,
@@ -44,6 +45,7 @@ import {
   removeClip,
   removeKeyframe,
   addLut,
+  addFont,
   rippleDeleteClip,
   setClipColor,
   setClipLut,
@@ -135,6 +137,12 @@ export interface TimelineState {
   addLut: (lut: LutSource) => void;
   /** 给片段挂上 / 摘掉 LUT。传 undefined 表示摘掉。 */
   setClipLut: (clipId: ClipId, lutId?: LutId) => void;
+  /**
+   * 把一个**已经注册好**的字体加进项目库。
+   *
+   * 调用方要先 `await registerFont(font)` 再调它，见 `compose/font-registry.ts`。
+   */
+  addFont: (font: FontSource) => void;
   /**
    * 给片段的入点设置（或摘掉）转场。
    *
@@ -362,6 +370,10 @@ export const useTimeline = create<TimelineState>((set, get) => {
 
     setClipLut(clipId, lutId) {
       apply(setClipLut(get().timeline(), clipId, lutId), lutId ? "套用 LUT" : "移除 LUT");
+    },
+
+    addFont(font) {
+      apply(addFont(get().timeline(), font), `导入字体 ${font.name}`);
     },
 
     setTransition(clipId, transition) {

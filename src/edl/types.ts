@@ -20,6 +20,25 @@ export type SourceId = string;
 export type ClipId = string;
 export type TrackId = string;
 export type LutId = string;
+export type FontFamily = string;
+
+/**
+ * 导入的一个字体文件。**存字节**——注册 `FontFace` 只能用原始字节，
+ * 没有"解析结果"可存（对比 `LutSource`）。
+ *
+ * `family` 由我们生成，**同时就是这个字体在项目里的 id**：文字样式里本来就有
+ * `TextStyle.fontFamily`，再给片段加一个 `fontId` 就有了两个"这个片段用哪个字体"
+ * 的真值来源，而"两个都设了听谁的"错了不报错，只表现成"选了 A 拿到 B"（硬规则 10）。
+ * 族名不取自字体文件里的名字：同名不同版本会互相顶掉，表现为"改了一个片段的字体，
+ * 另一个片段也跟着变了"。生成规则和"这个族名是不是我们管的"见 `compose/font-registry.ts`。
+ */
+export interface FontSource {
+  readonly family: FontFamily;
+  /** 显示名，取自文件名。 */
+  readonly name: string;
+  /** 字体文件字节。 */
+  readonly data: ArrayBuffer;
+}
 
 /**
  * 导入的一张 3D LUT。**存的是解析结果，不是文件**。
@@ -255,6 +274,8 @@ export interface Timeline {
   readonly sources: readonly MediaSource[];
   /** 导入过的 LUT。片段用 `lutId` 引用，缺省为空数组。 */
   readonly luts?: readonly LutSource[];
+  /** 导入过的字体。文字片段用 `style.fontFamily` 引用，缺省为空数组。 */
+  readonly fonts?: readonly FontSource[];
 }
 
 /** 导出范围，帧号，左闭右开。 */
@@ -321,6 +342,11 @@ export function clipsUsingEffects(timeline: Timeline): Clip[] {
 /** 取一张 LUT；找不到返回 null（引用了已删除的 LUT 时不该整条渲染崩掉）。 */
 export function findLut(timeline: Timeline, id: LutId): LutSource | null {
   return timeline.luts?.find((l) => l.id === id) ?? null;
+}
+
+/** 取一个字体；找不到返回 null。同 `findLut`：引用一个不在的字体不该让渲染崩掉。 */
+export function findFont(timeline: Timeline, family: FontFamily): FontSource | null {
+  return timeline.fonts?.find((f) => f.family === family) ?? null;
 }
 
 /** 把时间轴帧号换算成源片帧号。 */

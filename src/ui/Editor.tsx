@@ -145,7 +145,10 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
     ? recover.droppedSources.filter((d) => d.clips > 0).map((d) => d.name)
     : [];
 
-  /** 接受恢复。素材已经在 `loadProject()` 里验过读得动了，这里只是装回 store。 */
+  /**
+   * 接受恢复。素材已经在 `loadProject()` 里验过读得动、字体也在那边注册过了，
+   * 这里只是装回 store——所以它可以是同步的，不用等任何异步。
+   */
   const acceptRecover = useCallback(() => {
     if (!recover) return;
     restoreProject(recover.timeline, recover.playhead);
@@ -156,6 +159,9 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
       ...lost.map((d) => `${d.name} 找不到了，用到它的 ${d.clips} 个片段已移除`),
       ...(recover.droppedLuts.length > 0
         ? [`${recover.droppedLuts.join("、")} 这几张 LUT 没读回来，相关片段的调色已退回不上表`]
+        : []),
+      ...(recover.droppedFonts.length > 0
+        ? [`${recover.droppedFonts.join("、")} 这几个字体没装回来，相关文字已退回默认字体`]
         : []),
     ];
     setRecoverNote(notes.length > 0 ? notes.join("；") : null);

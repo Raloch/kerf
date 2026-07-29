@@ -29,12 +29,15 @@ import {
 } from "../anim/keyframes";
 import type { ColorAdjust } from "../compose/color";
 import type { LayerTransform } from "../compose/compositor";
+import { isManagedFamily } from "../compose/font-registry";
 import type { TextStyle } from "../compose/text-raster";
 import {
   clipDuration,
+  findFont,
   transitionFitsTrack,
   type Clip,
   type ClipId,
+  type FontSource,
   type LutId,
   type LutSource,
   type TextClip,
@@ -697,6 +700,18 @@ export function addLut(timeline: Timeline, lut: LutSource): EditResult {
 }
 
 /**
+ * 把一个**已经在本上下文注册好**的字体加进项目。
+ *
+ * 顺序是纪律不是习惯：注册在前、进 EDL 在后。反过来的话中间那一瞬 EDL 里有一个
+ * 本上下文用不了的族名，而预览随时可能在那一瞬渲染——`rasterizeText` 会抛。
+ * 完整理由见 `compose/font-registry.ts` 文件头。
+ */
+export function addFont(timeline: Timeline, font: FontSource): EditResult {
+  if (timeline.fonts?.some((f) => f.family === font.family)) return unchanged(timeline);
+  return ok({ ...timeline, fonts: [...(timeline.fonts ?? []), font] });
+}
+
+/**
  * 给片段挂上（或摘掉）一张 LUT。`lutId` 传 `undefined` 表示摘掉。
  *
  * 摘掉时**不动 `color.lutIntensity`**：用户常常是"先摘下来看看原片、再挂回去"，
@@ -1077,6 +1092,16 @@ export function setTextStyle(
 ): EditResult {
   const found = requireText(timeline, clipId);
   if (isEditResult(found)) return found;
+
+  // 引用一个不在项目里的自定义字体要**当场拒掉**，同 `setClipLut`。放过去的话
+  // 渲染时 `rasterizeText` 会抛（那道断言是刻意的），而用户看到的是预览整个崩
+  if (
+    patch.fontFamily !== undefined &&
+    isManagedFamily(patch.fontFamily) &&
+    !findFont(timeline, patch.fontFamily)
+  ) {
+    return reject(timeline, `项目里没有这个字体：${patch.fontFamily}`);
+  }
 
   const merged: Record<string, unknown> = { ...found.clip.style };
   for (const [key, raw] of Object.entries(patch)) {

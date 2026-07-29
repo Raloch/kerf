@@ -1,6 +1,15 @@
 import { describe, expect, it } from "vitest";
 import { FPS } from "../time/rational";
-import type { Clip, LutSource, MediaClip, MediaSource, Timeline, Track } from "../edl/types";
+import type {
+  Clip,
+  FontSource,
+  LutSource,
+  MediaClip,
+  MediaSource,
+  TextClip,
+  Timeline,
+  Track,
+} from "../edl/types";
 import { computeDuration } from "./operations";
 import {
   fromSnapshot,
@@ -36,7 +45,30 @@ function lut(id: string, size = 5): LutSource {
   return { id, name: `${id}.cube`, size, rgb: new Float32Array(size ** 3 * 3).fill(0.5) };
 }
 
-function timeline(tracks: Track[], sources = [source("src")], luts?: LutSource[]): Timeline {
+function font(family: string, name = `${family}.ttf`): FontSource {
+  return { family, name, data: new Uint8Array([1, 2, 3, 4]).buffer };
+}
+
+function textClip(id: string, fontFamily?: string, extra?: Record<string, unknown>): TextClip {
+  return {
+    id,
+    kind: "text",
+    timelineIn: 0,
+    timelineOut: 100,
+    name: id,
+    text: "字幕",
+    ...(fontFamily !== undefined || extra !== undefined
+      ? { style: { ...(fontFamily !== undefined ? { fontFamily } : {}), ...extra } }
+      : {}),
+  };
+}
+
+function timeline(
+  tracks: Track[],
+  sources = [source("src")],
+  luts?: LutSource[],
+  fonts?: FontSource[],
+): Timeline {
   return {
     fps: FPS.ndf2997,
     width: 1920,
@@ -45,18 +77,20 @@ function timeline(tracks: Track[], sources = [source("src")], luts?: LutSource[]
     tracks,
     sources,
     ...(luts !== undefined ? { luts } : {}),
+    ...(fonts !== undefined ? { fonts } : {}),
   };
 }
 
-/** 把所有素材和 LUT 都完好交回来。 */
+/** 把所有素材、LUT 和字体都完好交回来。 */
 function allAssets(t: Timeline): RestoreAssets {
   return {
     files: new Map(t.sources.map((s) => [s.id, s.file])),
     luts: new Map((t.luts ?? []).map((l) => [l.id, l.rgb])),
+    fonts: new Map((t.fonts ?? []).map((f) => [f.family, f.data])),
   };
 }
 
-const NO_ASSETS: RestoreAssets = { files: new Map(), luts: new Map() };
+const NO_ASSETS: RestoreAssets = { files: new Map(), luts: new Map(), fonts: new Map() };
 
 describe("快照往返", () => {
   const original = timeline(
@@ -126,6 +160,7 @@ describe("素材找不回来", () => {
   const partial: RestoreAssets = {
     files: new Map([["kept", source("kept").file]]),
     luts: new Map(),
+    fonts: new Map(),
   };
 
   it("引用它的片段被移除，其余片段留下", () => {
@@ -206,7 +241,11 @@ describe("LUT 找不回来（和素材不对称）", () => {
     [lut("L1")],
   );
   const snap = toSnapshot(t, 0, 0);
-  const noLut: RestoreAssets = { files: new Map([["src", source("src").file]]), luts: new Map() };
+  const noLut: RestoreAssets = {
+    files: new Map([["src", source("src").file]]),
+    luts: new Map(),
+    fonts: new Map(),
+  };
 
   it("片段保留，只清掉 lutId", () => {
     const r = fromSnapshot(snap, noLut);
@@ -228,6 +267,91 @@ describe("LUT 找不回来（和素材不对称）", () => {
     expect(r.droppedLuts).toEqual(["L1.cube"]);
     // 一张都没剩时 luts 字段整个不存在
     expect("luts" in r.timeline).toBe(false);
+  });
+});
+
+describe("字体找不回来（同 LUT 那条不对称，但必须清）", () => {
+  const t = timeline(
+    [
+      {
+        id: "T1",
+        kind: "video",
+        clips: [textClip("t1", "KerfFont-1", { color: "#ff0000" }), textClip("t2", "KerfFont-1")],
+      },
+    ],
+    [source("src")],
+    undefined,
+    [font("KerfFont-1")],
+  );
+  const snap = toSnapshot(t, 0, 0);
+  const noFont: RestoreAssets = {
+    files: new Map([["src", source("src").file]]),
+    luts: new Map(),
+    fonts: new Map(),
+  };
+
+  it("存下来的快照里没有字体字节", () => {
+    // 快照每次编辑都重写，而一个 CJK 字体动辄 10–20MB
+    expect(snap.timeline.fonts?.[0]).not.toHaveProperty("data");
+    expect(snap.timeline.fonts?.[0]?.name).toBe("KerfFont-1.ttf");
+  });
+
+  it("资产齐全时逐字段恢复原样", () => {
+    expect(fromSnapshot(snap, allAssets(t)).timeline).toEqual(t);
+  });
+
+  it("片段保留，但 fontFamily **必须**清掉", () => {
+    const r = fromSnapshot(snap, noFont);
+    const clips = r.timeline.tracks[0]?.clips ?? [];
+    expect(clips.map((c) => c.id)).toEqual(["t1", "t2"]);
+    // 留着的话渲染时 rasterizeText 会抛（那道断言是刻意的），
+    // 表现成"恢复完预览就崩"——这是它和 lutId 唯一的差别
+    expect((clips[0] as TextClip).style?.fontFamily).toBeUndefined();
+  });
+
+  it("样式里其余项留着，清掉的是字段本身", () => {
+    const t1 = fromSnapshot(snap, noFont).timeline.tracks[0]?.clips[0] as TextClip;
+    expect(t1.style?.color).toBe("#ff0000");
+    expect("fontFamily" in (t1.style ?? {})).toBe(false);
+  });
+
+  it("样式里只有字体时，style 整个删掉而不是留一个空对象", () => {
+    const t2 = fromSnapshot(snap, noFont).timeline.tracks[0]?.clips[1] as TextClip;
+    // 同状态层那条"改回缺省值要把字段整个删掉"：留 `{}` 会让
+    // "这个片段动过样式没有"在数据层看不出来
+    expect("style" in t2).toBe(false);
+  });
+
+  it("报出丢了哪个字体，一个都没剩时字段整个不存在", () => {
+    const r = fromSnapshot(snap, noFont);
+    expect(r.droppedFonts).toEqual(["KerfFont-1.ttf"]);
+    expect("fonts" in r.timeline).toBe(false);
+  });
+
+  it("LUT 和字体同时丢了，两条规则都要生效", () => {
+    // 一条命中就 continue 的写法会让先判的那条把另一条挡掉，而且不报错
+    const both = timeline(
+      [{ id: "T1", kind: "video", clips: [{ ...textClip("t1", "KerfFont-1"), lutId: "L1" }] }],
+      [source("src")],
+      [lut("L1")],
+      [font("KerfFont-1")],
+    );
+    const r = fromSnapshot(toSnapshot(both, 0, 0), noFont);
+    const t1 = r.timeline.tracks[0]?.clips[0] as TextClip;
+    expect("lutId" in t1).toBe(false);
+    expect("style" in t1).toBe(false);
+    expect(r.droppedLuts).toEqual(["L1.cube"]);
+    expect(r.droppedFonts).toEqual(["KerfFont-1.ttf"]);
+  });
+
+  it("系统字体族不受影响", () => {
+    const sys = timeline(
+      [{ id: "T1", kind: "video", clips: [textClip("t1", '"PingFang SC", sans-serif')] }],
+      [source("src")],
+    );
+    const t1 = fromSnapshot(toSnapshot(sys, 0, 0), noFont).timeline.tracks[0]?.clips[0] as TextClip;
+    // 系统族名不需要注册，也就不存在"找不回来"
+    expect(t1.style?.fontFamily).toBe('"PingFang SC", sans-serif');
   });
 });
 

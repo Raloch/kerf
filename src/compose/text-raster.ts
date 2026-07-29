@@ -30,19 +30,25 @@
  *
  * ## 字体
  *
- * 只支持**系统字体族**。栅格化在主线程（预览）和 Worker（导出）里各跑一次，
- * 自定义 web 字体得在两个上下文里分别注册 `FontFace`，否则导出会静默回退到
- * 默认字体——那正是"预览和导出不一致"的经典形态。要支持自定义字体，
- * 必须先把字体文件同时喂给两边，再来放开这里。
+ * 系统字体族直接写进 `fontFamily`；**导入的字体**在 EDL 里是一个我们生成的族名
+ * （`KerfFont-…`），必须先在本上下文注册过 `FontFace` 才能用。栅格化在主线程（预览）
+ * 和 Worker（导出）里各跑一次，而 `FontFaceSet` 每个上下文一份——漏了一边的表现是
+ * **静默回退到兜底字体**：预览里是用户选的字，成片里不是，两边都不抛错。所以这里
+ * 对没注册过的族名**抛错**（`cssFontFamily`），把那个静默回退变成一次崩。
+ * 注册纪律和"为什么不用 `fonts.check()` 当判据"见 `font-registry.ts` 文件头。
  */
 
+import { isFontRegistered, isManagedFamily } from "./font-registry";
 import { RasterCache } from "./raster-cache";
 
 /** 文字样式。所有尺寸都是**占输出高度的比例**，理由见文件头。 */
 export interface TextStyle {
   /** 字号 ÷ 输出高度。0.08 在 1080p 上约等于 86px。 */
   readonly fontSizeRatio?: number;
-  /** 系统字体族。见文件头："只支持系统字体"。 */
+  /**
+   * 字体族。系统族名（`"PingFang SC", sans-serif` 这类）直接写；导入的字体写
+   * `Timeline.fonts` 里那个 `family`，见文件头。
+   */
   readonly fontFamily?: string;
   readonly fontWeight?: number;
   readonly color?: string;
@@ -229,6 +235,29 @@ function trailingForbidden(line: string): string {
   return chars.slice(i).join("");
 }
 
+/**
+ * 把样式里的族名变成 `ctx.font` 用的那一段。
+ *
+ * 两件事：
+ *
+ * 1. **没注册过的自定义族名要抛错。** 这是唯一能拦住"预览一种字、成片另一种字"的
+ *    地方——`ctx.font` 认不出族名时不报错，只是换成兜底字体接着画。抛在这里而不是
+ *    交给调用方检查，是因为调用方有两条（预览引擎、导出管道），将来还会有第三条。
+ *    正常路径上它永远不开火：字体先注册、后进 EDL（见 `font-registry.ts` 文件头）。
+ * 2. **自定义字体要接一段兜底。** 拉丁字体没有汉字字形，不接兜底时中文会变成方框。
+ *    接的是同一份默认族名，所以两个上下文接出来的字符串完全相同——一致性不受影响。
+ */
+export function cssFontFamily(family: string): string {
+  if (!isManagedFamily(family)) return family;
+  if (!isFontRegistered(family)) {
+    throw new Error(
+      `字体 ${family} 没在这个上下文注册过，画出来会静默换成别的字体。` +
+        `渲染前先调 registerFonts(timeline.fonts)——见 compose/font-registry.ts 文件头`,
+    );
+  }
+  return `"${family}", ${TEXT_STYLE_DEFAULTS.fontFamily}`;
+}
+
 /** 栅格化结果。`canvas` 尺寸等于输出尺寸，所以合成层的默认摆位就是 1:1。 */
 export interface TextRaster {
   readonly canvas: OffscreenCanvas;
@@ -283,7 +312,7 @@ export function rasterizeText(
   const ctx = canvas.getContext("2d");
   if (!ctx) return null;
 
-  const font = `${s.fontWeight} ${fontSize}px ${s.fontFamily}`;
+  const font = `${s.fontWeight} ${fontSize}px ${cssFontFamily(s.fontFamily)}`;
   ctx.font = font;
   const lines = wrapText(text, s.maxWidthRatio * outWidth, (str) => ctx.measureText(str).width);
 

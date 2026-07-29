@@ -43,6 +43,7 @@ import { measureEncoderDelay, type EncoderDelay } from "../audio/encoder-delay";
 import type { MixChunk, MixHeader } from "../audio/mixdown";
 import { createCompositor, type CompositorBackend } from "../compose/backend";
 import type { ComposeLayer, ComposeSourceLayer, Compositor } from "../compose/compositor";
+import { registerFonts } from "../compose/font-registry";
 import { residency, ResidencyTracker } from "./residency";
 import { rasterizeText, textRasterCacheBytes } from "../compose/text-raster";
 import { videoTracksInDrawOrder, visibleVideoClips, type VisibleClip } from "../edl/sampling";
@@ -148,6 +149,12 @@ export async function runExport(
   };
 
   report("prepare", 0);
+
+  // **自定义字体要在逐帧循环之前装进这个 Worker。** `FontFaceSet` 每个上下文一份，
+  // 主线程注册过不算——漏了这一步的表现是成片里的字**静默换成兜底字体**，
+  // 而预览里是对的。装不上就在这里失败，不要写出半份文件（见 font-registry.ts 文件头）
+  step("register-fonts", "prepare", 0);
+  await registerFonts(timeline.fonts);
 
   // 能力探测放在建 Output 之前：编码器不可用要在写出任何字节之前就失败
   step("probe-capabilities", "prepare", 0);

@@ -12,6 +12,7 @@ import type {
   Transition,
 } from "../edl/types";
 import {
+  addFont,
   addLut,
   addTextClip,
   clearKeyframes,
@@ -735,6 +736,47 @@ describe("静态调色", () => {
     expect(got.color).toEqual({ brightness: 1.8 });
     expect("transform" in got).toBe(false);
     expect("keyframes" in got).toBe(false);
+  });
+});
+
+describe("字体", () => {
+  const bytes = (): ArrayBuffer => new Uint8Array([0, 1, 2, 3]).buffer;
+  const one = () =>
+    timeline([{ id: "T1", kind: "video", clips: [textClip("t", 0, 100)] }]);
+
+  it("导入后进 timeline.fonts", () => {
+    const t = addFont(one(), { family: "KerfFont-1", name: "Impact.ttf", data: bytes() }).timeline;
+    expect(t.fonts?.map((f) => f.name)).toEqual(["Impact.ttf"]);
+  });
+
+  it("同族名重复导入不产生历史条目", () => {
+    const f = { family: "KerfFont-1", name: "Impact.ttf", data: bytes() };
+    const t = addFont(one(), f).timeline;
+    expect(addFont(t, f).changed).toBe(false);
+  });
+
+  it("挂一个项目里没有的自定义字体会被拒绝", () => {
+    // 放过去的话渲染时 `rasterizeText` 会抛（那道断言是刻意的），
+    // 而用户看到的是预览整个崩。同 `setClipLut` 那条
+    const r = setTextStyle(one(), "t", { fontFamily: "KerfFont-nope" });
+    expect(r.changed).toBe(false);
+    expect(r.reason).toContain("没有这个字体");
+  });
+
+  it("系统字体族不受那道校验影响", () => {
+    // 系统族名不需要注册，也就不该被"项目里有没有这个字体"卡住
+    const r = setTextStyle(one(), "t", { fontFamily: '"Songti SC", serif' });
+    expect(r.changed).toBe(true);
+    expect((r.timeline.tracks[0]!.clips[0] as TextClip).style?.fontFamily).toBe('"Songti SC", serif');
+  });
+
+  it("导入之后就能挂上，片段只存族名不存字节", () => {
+    let t = addFont(one(), { family: "KerfFont-1", name: "Impact.ttf", data: bytes() }).timeline;
+    t = setTextStyle(t, "t", { fontFamily: "KerfFont-1" }).timeline;
+    const clip = t.tracks[0]!.clips[0] as TextClip;
+    expect(clip.style?.fontFamily).toBe("KerfFont-1");
+    // 字节存进片段会让撤销栈里每一步都拷一份几 MB，同 LUT 那条
+    expect(JSON.stringify(clip)).not.toContain("data");
   });
 });
 

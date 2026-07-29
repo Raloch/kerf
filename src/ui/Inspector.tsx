@@ -30,6 +30,7 @@
 
 import { useRef, useState } from "react";
 import { valueAt, type AnimatableProperty, type Easing } from "../anim/keyframes";
+import { newFontFamily, registerFont } from "../compose/font-registry";
 import { parseCubeLut } from "../compose/lut";
 import { TEXT_STYLE_DEFAULTS } from "../compose/text-raster";
 import {
@@ -778,6 +779,104 @@ const ALIGNS: readonly { readonly value: "left" | "center" | "right"; readonly l
 
 const WEIGHTS = [300, 400, 600, 800] as const;
 
+/**
+ * 可选的系统字体族。**存的是整条兜底链**，不是单个族名——列表里哪一款装在哪台机器上
+ * 说不准，写死一个族名会在别的系统上静默换成别的字。
+ */
+const SYSTEM_FONTS: readonly { readonly value: string; readonly label: string }[] = [
+  { value: TEXT_STYLE_DEFAULTS.fontFamily, label: "系统无衬线" },
+  { value: '"Songti SC", "Noto Serif CJK SC", "SimSun", serif', label: "系统衬线" },
+  { value: '"SF Mono", "Menlo", "Consolas", monospace', label: "系统等宽" },
+];
+
+/**
+ * 字体：系统族 + 导入的字体，同一个下拉框里选。
+ *
+ * 导入的顺序是纪律：**先 `registerFont()` 成功，再 `addFont()` 进 EDL，最后才
+ * 挂到片段上**。反过来的话中间那一瞬 EDL 里有一个本上下文用不了的族名，而预览随时
+ * 可能在那一瞬渲染——`rasterizeText` 会抛。完整理由见 `compose/font-registry.ts`。
+ *
+ * 字节单独收进资产库（快照里只留元信息）。那一份没存上的后果是崩溃恢复时字体装不
+ * 回来、相关文字退回默认字体，恢复面板会报出来。
+ */
+function FontRow({ clip }: { readonly clip: TextClip }) {
+  const timeline = useTimeline((s) => s.timeline());
+  const addFont = useTimeline((s) => s.addFont);
+  const setTextStyle = useTimeline((s) => s.setTextStyle);
+  const [error, setError] = useState<string | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  const current = clip.style?.fontFamily ?? TEXT_STYLE_DEFAULTS.fontFamily;
+  const fonts = timeline.fonts ?? [];
+
+  const load = async (file: File): Promise<void> => {
+    try {
+      const data = await file.arrayBuffer();
+      const font = { family: newFontFamily(Date.now()), name: file.name, data };
+      // 装不上就在这里抛（字节不是字体、或这个上下文没有 FontFaceSet），
+      // 于是 EDL 里永远不会出现一个用不了的族名
+      await registerFont(font);
+      addFont(font);
+      void import("../state/project-store").then(({ putFontAsset }) => putFontAsset(font));
+      setTextStyle(clip.id, { fontFamily: font.family });
+      setError(null);
+    } catch (e) {
+      // 读不了要就地说清楚：静默回退到默认字体正是这一整套要消灭的东西
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  return (
+    <>
+      <div className="f ctl wide3">
+        <label>字体</label>
+        <select
+          className="sel wide"
+          value={current}
+          title="导入的字体会被崩溃恢复保住；导出时它会装进导出线程，成片和预览用同一份字形"
+          onChange={(e) => setTextStyle(clip.id, { fontFamily: e.target.value })}
+        >
+          {SYSTEM_FONTS.map((f) => (
+            <option key={f.label} value={f.value}>
+              {f.label}
+            </option>
+          ))}
+          {fonts.map((f) => (
+            <option key={f.family} value={f.family}>
+              {f.name}
+            </option>
+          ))}
+          {/* 系统族之外、又不在项目字体里的值（比如手改过的 EDL）也要显示出来，
+              否则下拉框会看起来停在"系统无衬线"而实际不是 */}
+          {!SYSTEM_FONTS.some((f) => f.value === current) &&
+            !fonts.some((f) => f.family === current) && <option value={current}>{current}</option>}
+        </select>
+        <button
+          type="button"
+          className="mini"
+          title="导入 .ttf / .otf / .woff2"
+          onClick={() => fileRef.current?.click()}
+        >
+          导入…
+        </button>
+        <input
+          ref={fileRef}
+          type="file"
+          accept=".ttf,.otf,.ttc,.woff,.woff2,font/*"
+          hidden
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            // 清掉 value，否则连着选同一个文件不触发 change
+            e.target.value = "";
+            if (file) void load(file);
+          }}
+        />
+      </div>
+      {error && <p className="hint err">字体装不上：{error}</p>}
+    </>
+  );
+}
+
 function TextSection({ clip }: { readonly clip: TextClip }) {
   const setTextContent = useTimeline((s) => s.setTextContent);
   const setTextStyle = useTimeline((s) => s.setTextStyle);
@@ -808,6 +907,7 @@ function TextSection({ clip }: { readonly clip: TextClip }) {
             onCommit={(v) => setTextStyle(clip.id, { fontSizeRatio: v / 100 })}
           />
         </div>
+        <FontRow clip={clip} />
         <div className="f">
           <label>字重</label>
           <select
