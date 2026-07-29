@@ -25,8 +25,13 @@ import {
   waveformSettled,
 } from "../media/waveform";
 import { proxyManager } from "../media/proxy-client";
-import { resolveVolume } from "../anim/keyframes";
-import { PROPERTY_RANGES } from "../state/operations";
+import {
+  ANIMATABLE_PROPERTIES,
+  resolveVolume,
+  type AnimatableProperty,
+  type Keyframe,
+} from "../anim/keyframes";
+import { PROPERTY_LABELS, PROPERTY_RANGES } from "../state/operations";
 import { IconCut, IconEye, IconFilm, IconLock, IconMagnet, IconMute, IconPlus, IconText, IconTrash, IconVolume, IconWave } from "./icons";
 
 /** 片段内缩略图条高度，与 .strip 的 CSS 保持一致。 */
@@ -41,6 +46,14 @@ const WAVE_HEIGHT = 30;
 const WAVE_COLOR = "rgba(150, 235, 190, 0.55)";
 const ENVELOPE_COLOR = "rgba(255, 214, 102, 0.95)";
 const ENVELOPE_REF_COLOR = "rgba(255, 255, 255, 0.18)";
+
+/**
+ * 拖关键帧的启动阈值（像素），与 `use-clip-drag` 的 `DRAG_THRESHOLD_PX` 同值。
+ *
+ * 低于它算**点击**（跳到那一帧）。没有阈值的话，想点一下跳过去的手抖一像素
+ * 就变成了一次"移动关键帧"——而那是一次进撤销栈的编辑。
+ */
+const KF_DRAG_THRESHOLD_PX = 3;
 
 /** 缩放滑块的取值范围（每帧像素数 × 100）。 */
 const ZOOM_MIN = 8;
@@ -300,13 +313,37 @@ function TrackRow({
 }) {
   const isAudio = track.kind === "audio";
   const ghost = ghostForTrack(drag.ghost, track.id);
+  // 关键帧轨只给**这条轨上被选中的那个片段**展开：全都展开的话，一条有动画的
+  // 字幕轨能顶出十几行，而用户此刻只在编辑一个片段
+  const selected = track.clips.find((c) => c.id === selectedClipId);
+  const animatedProps = selected ? animatedPropertiesOf(selected) : [];
+  const [lanesOpen, setLanesOpen] = useState(true);
+
   return (
+    <>
     <div className={`trk h-${track.kind}`}>
       <div className="th">
         <div className="lb">
           <div className="k">{track.id}</div>
           <div className="d">{track.label ?? ""}</div>
         </div>
+        {/* 没有动画时这个按钮根本不出现：给每条轨挂一个永远点不出东西的开关，
+            比没有开关更让人困惑 */}
+        {animatedProps.length > 0 && (
+          <button
+            type="button"
+            className="ib sm kft"
+            aria-pressed={lanesOpen}
+            title={
+              lanesOpen
+                ? "收起关键帧轨"
+                : `展开关键帧轨（${animatedProps.length} 个属性有动画）`
+            }
+            onClick={() => setLanesOpen((v) => !v)}
+          >
+            <Diamond />
+          </button>
+        )}
         <button
           type="button"
           className="ib sm"
@@ -359,8 +396,187 @@ function TrackRow({
         {ghost && <GhostView ghost={ghost} pxPerFrame={pxPerFrame} />}
       </div>
     </div>
+    {selected && lanesOpen && (
+      <KeyframeLanes clip={selected} properties={animatedProps} pxPerFrame={pxPerFrame} />
+    )}
+    </>
   );
 }
+
+/** 这个片段有哪些属性打了关键帧。顺序取自 `ANIMATABLE_PROPERTIES`，于是行序稳定。 */
+function animatedPropertiesOf(clip: Clip): AnimatableProperty[] {
+  const channels = clip.keyframes;
+  if (!channels) return [];
+  return ANIMATABLE_PROPERTIES.filter((p) => (channels[p]?.length ?? 0) > 0);
+}
+
+/** 拖动中的落点。`valid` 为 false = 那一帧已经有关键帧，松手不提交。 */
+interface KeyframeDrag {
+  readonly property: AnimatableProperty;
+  /** 片段内偏移，拖动的起点。 */
+  readonly from: number;
+  readonly to: number;
+  readonly valid: boolean;
+}
+
+/**
+ * 关键帧轨：一个属性一行，钻石可以横向拖动改时间。
+ *
+ * 三件事是刻意的：
+ *
+ * - **只画选中片段的关键帧。** 关键帧属于片段，而"这一轨上所有片段的动画"叠在一行
+ *   里根本读不出来（两个片段可以在同一个偏移上各有一个点）。
+ * - **拖动中只画落点、松手才提交**，同 `use-clip-drag`。于是一次拖拽只进一条历史，
+ *   不需要"带关键帧身份的合并键"——而关键帧的身份只有偏移，拖动中它一直在变，
+ *   那种键根本立不住（D10 的重新评估条款当时担心的正是"边拖边提交"那种写法）。
+ * - **落点夹回片段范围内。** 片段之外的偏移在数据上是合法的（裁入点之后还能拖回来，
+ *   见 D10），但让**拖动**产生一个片段外的点，等于把它拖到用户看不见的地方。
+ */
+function KeyframeLanes({
+  clip,
+  properties,
+  pxPerFrame,
+}: {
+  clip: Clip;
+  properties: readonly AnimatableProperty[];
+  pxPerFrame: number;
+}) {
+  const moveKeyframeAt = useTimeline((s) => s.moveKeyframeAt);
+  const setPlayhead = useTimeline((s) => s.setPlayhead);
+  const setDragHint = useTimeline((s) => s.setDragHint);
+  const [drag, setDrag] = useState<KeyframeDrag | null>(null);
+  const session = useRef<{
+    property: AnimatableProperty;
+    from: number;
+    startX: number;
+    series: readonly Keyframe[];
+  } | null>(null);
+  const moved = useRef(false);
+
+  const length = clipDuration(clip);
+
+  const onDiamondDown = (
+    event: ReactPointerEvent<HTMLElement>,
+    property: AnimatableProperty,
+    frame: number,
+  ): void => {
+    if (event.button !== 0) return;
+    // 不冒泡到片段：否则按下钻石会连带开始拖片段
+    event.stopPropagation();
+    const target = event.currentTarget;
+    target.setPointerCapture(event.pointerId);
+    session.current = {
+      property,
+      from: frame,
+      startX: event.clientX,
+      series: clip.keyframes?.[property] ?? [],
+    };
+    moved.current = false;
+
+    const compute = (e: PointerEvent): KeyframeDrag => {
+      const s = session.current!;
+      const delta = Math.round((e.clientX - s.startX) / pxPerFrame);
+      const to = Math.max(0, Math.min(length - 1, s.from + delta));
+      const occupied = to !== s.from && s.series.some((k) => k.frame === to);
+      return { property: s.property, from: s.from, to, valid: !occupied };
+    };
+
+    const finish = (): void => {
+      target.removeEventListener("pointermove", onMove);
+      target.removeEventListener("pointerup", onUp);
+      target.removeEventListener("pointercancel", finish);
+      session.current = null;
+      setDrag(null);
+      setDragHint(null);
+    };
+
+    const onMove = (e: PointerEvent): void => {
+      if (!session.current) return;
+      if (!moved.current) {
+        if (Math.abs(e.clientX - session.current.startX) < KF_DRAG_THRESHOLD_PX) return;
+        moved.current = true;
+      }
+      const next = compute(e);
+      setDrag(next);
+      setDragHint(
+        next.valid
+          ? `移到第 ${next.to} 帧`
+          : `第 ${next.to} 帧已经有一个关键帧了`,
+      );
+    };
+
+    const onUp = (e: PointerEvent): void => {
+      const s = session.current;
+      if (s) {
+        if (!moved.current) {
+          // 没拖动就是"点一下跳过去"，同检查器里那条迷你关键帧条
+          setPlayhead(clip.timelineIn + s.from);
+        } else {
+          const next = compute(e);
+          if (next.valid) {
+            moveKeyframeAt(
+              clip.id,
+              s.property,
+              clip.timelineIn + next.from,
+              clip.timelineIn + next.to,
+            );
+          }
+        }
+      }
+      finish();
+    };
+
+    target.addEventListener("pointermove", onMove);
+    target.addEventListener("pointerup", onUp);
+    target.addEventListener("pointercancel", finish);
+  };
+
+  return (
+    <>
+      {properties.map((property) => {
+        const series = clip.keyframes?.[property] ?? [];
+        return (
+          <div className="trk kfl" key={`kfl-${property}`}>
+            <div className="th kfh">
+              <span>{PROPERTY_LABELS[property]}</span>
+            </div>
+            <div className="lane">
+              {series.map((k) => {
+                // 裁入点之后落到片段外的关键帧保留着（`shiftKeyframes` 不删），
+                // 要看得出它现在不生效，否则用户会以为动画坏了
+                const outside = k.frame < 0 || k.frame >= length;
+                const dragging = drag?.property === property && drag.from === k.frame;
+                return (
+                  <button
+                    key={k.frame}
+                    type="button"
+                    className={`kfd${outside ? " out" : ""}${dragging ? " src" : ""}`}
+                    style={{ left: `${(clip.timelineIn + k.frame) * pxPerFrame}px` }}
+                    title={
+                      outside
+                        ? `第 ${k.frame} 帧（已在片段之外，裁回去还能用）`
+                        : `第 ${k.frame} 帧 · 拖动改时间，点一下跳过去`
+                    }
+                    onPointerDown={(e) => onDiamondDown(e, property, k.frame)}
+                  />
+                );
+              })}
+              {drag?.property === property && moved.current && (
+                <div
+                  className={`kfd drop${drag.valid ? "" : " invalid"}`}
+                  style={{ left: `${(clip.timelineIn + drag.to) * pxPerFrame}px` }}
+                />
+              )}
+            </div>
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
+/** 关键帧那个菱形。和检查器里的 `.kfm` 同形，用 CSS 旋转，不用 SVG。 */
+const Diamond = () => <span className="kfi" />;
 
 /**
  * 落点预览。只用颜色区分合法/非法——非法原因由状态栏显示，

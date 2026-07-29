@@ -20,6 +20,7 @@ import {
   findClip,
   junctionInfo,
   moveClip,
+  moveKeyframe,
   removeClip,
   removeKeyframe,
   rippleDeleteClip,
@@ -934,6 +935,72 @@ describe("关键帧编辑", () => {
 
   it("删不存在的关键帧要给出原因，不静默", () => {
     expect(removeKeyframe(one(), "a", "x", 10).reason).toContain("没有关键帧");
+  });
+
+  describe("移动关键帧（D10 留下的那笔债）", () => {
+    const two = () => {
+      let t = setKeyframe(one(), "a", "x", 10, 50, "ease-in").timeline;
+      t = setKeyframe(t, "a", "x", 60, 200).timeline;
+      return t;
+    };
+
+    it("值和缓动都跟着走", () => {
+      // 缓动归**左端**关键帧所有、管的是它右边那一段（D10），所以它是这个关键帧
+      // 自己的属性而不是位置的属性——留在原位就等于把两段曲线都改了
+      const t = moveKeyframe(two(), "a", "x", 10, 30).timeline;
+      expect(findClip(t, "a")!.clip.keyframes?.x).toEqual([
+        { frame: 30, value: 50, easing: "ease-in" },
+        { frame: 60, value: 200 },
+      ]);
+    });
+
+    it("挪过另一个关键帧之后仍按 frame 升序——valueAt 的前提", () => {
+      const t = moveKeyframe(two(), "a", "x", 10, 80).timeline;
+      expect(offsetsOf(t, "a")).toEqual([60, 80]);
+    });
+
+    it("目标位置已有关键帧时拒绝，不覆盖", () => {
+      // 覆盖会静默吃掉一个用户自己打的点，是"选了 A 拿到 B"
+      const r = moveKeyframe(two(), "a", "x", 10, 60);
+      expect(r.changed).toBe(false);
+      expect(r.reason).toContain("已经有一个关键帧");
+      expect(offsetsOf(r.timeline, "a")).toEqual([10, 60]);
+    });
+
+    it("原地不动是「值没变」，不是失败", () => {
+      // 给了 reason 的话，拖到边界后状态栏会一直闪红字
+      const r = moveKeyframe(two(), "a", "x", 10, 10);
+      expect(r.changed).toBe(false);
+      expect(r.reason).toBeUndefined();
+    });
+
+    it("源位置没有关键帧时给出原因", () => {
+      expect(moveKeyframe(two(), "a", "x", 11, 20).reason).toContain("没有关键帧");
+    });
+
+    it("拒绝非整数目标", () => {
+      expect(moveKeyframe(two(), "a", "x", 10, 20.5).reason).toContain("整数帧");
+    });
+
+    it("锁定轨道上拒绝", () => {
+      let t = two();
+      t = { ...t, tracks: t.tracks.map((tr) => ({ ...tr, locked: true })) };
+      expect(moveKeyframe(t, "a", "x", 10, 20).reason).toContain("锁定");
+    });
+
+    it("允许挪到片段之外——那种偏移在数据上是合法的", () => {
+      // D10 定的语义是片段外的关键帧保留不删、裁回去还能用。夹回范围是界面的事
+      const t = moveKeyframe(two(), "a", "x", 10, -5).timeline;
+      expect(offsetsOf(t, "a")).toEqual([-5, 60]);
+    });
+
+    it("只动被指名的那条通道", () => {
+      let t = setKeyframe(two(), "a", "opacity", 10, 0.5).timeline;
+      t = moveKeyframe(t, "a", "x", 10, 20).timeline;
+      const channels = findClip(t, "a")!.clip.keyframes;
+      expect(channels?.x?.map((k) => k.frame)).toEqual([20, 60]);
+      expect(channels?.opacity?.map((k) => k.frame)).toEqual([10]);
+    });
   });
 
   it("关闭动画时把当前值烘进静态变换，画面不跳走", () => {

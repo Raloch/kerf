@@ -44,6 +44,7 @@ import {
   moveClip,
   removeClip,
   removeKeyframe,
+  moveKeyframe,
   addLut,
   addFont,
   rippleDeleteClip,
@@ -159,6 +160,17 @@ export interface TimelineState {
     easing?: Easing,
   ) => void;
   removeKeyframeAt: (clipId: ClipId, property: AnimatableProperty, frame: number) => void;
+  /**
+   * 把关键帧从**时间轴帧号** `fromFrame` 挪到 `toFrame`；内部换算成片段内偏移。
+   *
+   * 目标位置已有关键帧时会被拒（不覆盖），原因走 `lastRejection` 报到状态栏。
+   */
+  moveKeyframeAt: (
+    clipId: ClipId,
+    property: AnimatableProperty,
+    fromFrame: number,
+    toFrame: number,
+  ) => void;
   clearKeyframes: (clipId: ClipId, property: AnimatableProperty, bakeValue?: number) => void;
   setTextContent: (clipId: ClipId, text: string) => void;
   setTextStyle: (clipId: ClipId, patch: TextStylePatch) => void;
@@ -409,6 +421,23 @@ export const useTimeline = create<TimelineState>((set, get) => {
       apply(
         removeKeyframe(get().timeline(), clipId, property, frame - found.clip.timelineIn),
         "删除关键帧",
+      );
+    },
+
+    moveKeyframeAt(clipId, property, fromFrame, toFrame) {
+      const found = findClip(get().timeline(), clipId);
+      if (!found) {
+        set({ lastRejection: `找不到片段 ${clipId}` });
+        return;
+      }
+      const { timelineIn } = found.clip;
+      // **不给合并键。** 时间轴上拖关键帧走的是"拖动中只画落点、松手才提交"
+      // （同 `use-clip-drag`），所以一次拖拽本来就只产生一条历史。D10 的重新评估
+      // 条款担心的是"边拖边提交"那种写法，那时才需要一个带关键帧身份的合并键——
+      // 而关键帧的身份只有偏移，拖动中偏移一直在变，那个键根本立不住。
+      apply(
+        moveKeyframe(get().timeline(), clipId, property, fromFrame - timelineIn, toFrame - timelineIn),
+        "移动关键帧",
       );
     },
 

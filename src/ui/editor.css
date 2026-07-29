@@ -915,6 +915,71 @@
 .ed .trk.h-audio .lane, .ed .trk.h-audio .th {
   height: 44px;
 }
+/* ---------- 关键帧轨（选中片段的，一个属性一行） ---------- */
+/* 行高**不能**走上面那两条 h-* 规则：它们按轨道种类给高度，而关键帧轨不属于任何
+   种类。故意不加 h-* 类，靠这里单独给。 */
+.ed .trk.kfl {
+  border-bottom: 0;
+  background: rgba(255, 255, 255, 0.014);
+}
+.ed .trk.kfl .lane, .ed .trk.kfl .th {
+  height: 17px;
+}
+.ed .th.kfh {
+  justify-content: flex-end;
+  padding: 0 8px 0 9px;
+  font-size: 10px;
+  color: var(--tx-faint);
+  white-space: nowrap;
+  overflow: hidden;
+}
+/* 头部那个展开开关里的菱形，与检查器的 .kfm 同形 */
+.ed .ib.kft .kfi {
+  display: block;
+  width: 7px;
+  height: 7px;
+  margin: auto;
+  background: currentColor;
+  transform: rotate(45deg);
+}
+.ed .ib.kft[aria-pressed="true"] {
+  color: var(--kerf);
+}
+/* 钻石。`margin-left: -4px` 让它的中心落在帧的左边界上——播放头也画在那里
+   （`left: playhead * --pxf`），不对齐的话"拖到播放头"看起来永远差半格 */
+.ed .kfd {
+  position: absolute;
+  top: 4px;
+  width: 9px;
+  height: 9px;
+  margin-left: -4.5px;
+  padding: 0;
+  background: var(--kerf);
+  border: 1px solid rgba(0, 0, 0, 0.5);
+  transform: rotate(45deg);
+  cursor: ew-resize;
+  z-index: 2;
+}
+.ed .kfd:hover {
+  background: #fff;
+}
+.ed .kfd.out {
+  background: var(--tx-faint);
+}
+/* 正在被拖的那个原地留一个淡影：只画落点的话，钻石会"跳"到手指下面，
+   而用户需要看见自己是从哪儿拖过来的 */
+.ed .kfd.src {
+  opacity: 0.3;
+}
+.ed .kfd.drop {
+  background: var(--kerf);
+  box-shadow: 0 0 6px rgba(232, 163, 61, 0.7);
+  pointer-events: none;
+}
+.ed .kfd.drop.invalid {
+  background: var(--bad);
+  box-shadow: none;
+}
 .ed .clip {
   position: absolute;
   top: 3px;

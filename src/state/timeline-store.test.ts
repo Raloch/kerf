@@ -335,6 +335,36 @@ describe("变换与关键帧的 store 动作", () => {
     useTimeline.getState().setKeyframeAt("src1-v", "x", 50, 100);
     expect(useTimeline.getState().history.past.length).toBe(before + 2);
   });
+
+  it("移动关键帧同样按时间轴帧号定位", () => {
+    useTimeline.getState().moveClip("src1-v", 100);
+    useTimeline.getState().setKeyframeAt("src1-v", "opacity", 150, 0.5);
+    useTimeline.getState().moveKeyframeAt("src1-v", "opacity", 150, 180);
+    const kfs = findClip(useTimeline.getState().timeline(), "src1-v")!.clip.keyframes?.opacity;
+    // 两个端点都要减 timelineIn，只减一个的表现是"拖一格跳一百格"
+    expect(kfs).toEqual([{ frame: 80, value: 0.5 }]);
+  });
+
+  it("一次拖拽只进一条历史，撤销一次就回到原位", () => {
+    // 界面侧是"拖动中只画落点、松手才提交"，所以这里不需要合并键。
+    // 真正会咬人的是反过来：边拖边提交而键里带偏移，那时一次拖拽会碎成几十步
+    useTimeline.getState().setKeyframeAt("src1-v", "x", 10, 0);
+    const before = useTimeline.getState().history.past.length;
+    useTimeline.getState().moveKeyframeAt("src1-v", "x", 10, 40);
+    expect(useTimeline.getState().history.past.length).toBe(before + 1);
+    useTimeline.getState().undo();
+    const kfs = findClip(useTimeline.getState().timeline(), "src1-v")!.clip.keyframes?.x;
+    expect(kfs?.map((k) => k.frame)).toEqual([10]);
+  });
+
+  it("落点被占时报原因、不改数据", () => {
+    useTimeline.getState().setKeyframeAt("src1-v", "x", 10, 0);
+    useTimeline.getState().setKeyframeAt("src1-v", "x", 40, 100);
+    useTimeline.getState().moveKeyframeAt("src1-v", "x", 10, 40);
+    expect(useTimeline.getState().lastRejection).toContain("已经有一个关键帧");
+    const kfs = findClip(useTimeline.getState().timeline(), "src1-v")!.clip.keyframes?.x;
+    expect(kfs?.map((k) => k.frame)).toEqual([10, 40]);
+  });
 });
 
 describe("新建文字片段", () => {

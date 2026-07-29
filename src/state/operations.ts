@@ -1005,6 +1005,47 @@ export function removeKeyframe(
 }
 
 /**
+ * 把一个关键帧从 `fromOffset` 挪到 `toOffset`（值和缓动都跟着走）。
+ *
+ * 这是 D10 留下的那笔债：在此之前"改关键帧的时间"只能删了重打，而那是两步撤销、
+ * 中间还有一瞬间动画少一个点。缓动跟着走是对的——它归**左端**关键帧所有、管的是
+ * 它右边那一段（见 keyframes.ts），所以它是这个关键帧自己的属性，不是位置的属性。
+ *
+ * **目标位置已经有关键帧时拒绝，不覆盖。** 覆盖会静默吃掉一个用户自己打的点，
+ * 是硬规则 10 那类"选了 A 拿到 B"；拒绝则由界面把落点画成非法、并把原因报到状态栏。
+ *
+ * 偏移**允许落在片段之外**（同 `setKeyframe`）：D10 定的语义是片段外的关键帧保留
+ * 不删、裁回去还能用。夹回片段范围是界面的事，不是这一层的事。
+ */
+export function moveKeyframe(
+  timeline: Timeline,
+  clipId: ClipId,
+  property: AnimatableProperty,
+  fromOffset: number,
+  toOffset: number,
+): EditResult {
+  if (!Number.isInteger(toOffset)) return reject(timeline, "关键帧位置必须是整数帧");
+
+  const found = findClip(timeline, clipId);
+  if (!found) return reject(timeline, `找不到片段 ${clipId}`);
+  if (found.track.locked) return reject(timeline, "轨道已锁定");
+
+  const series = found.clip.keyframes?.[property] ?? [];
+  const moving = series.find((k) => k.frame === fromOffset);
+  if (!moving) return reject(timeline, "这一帧上没有关键帧");
+  // 没挪动不是失败，所以不给 reason——拖到边界后会一直发同一个值
+  if (fromOffset === toOffset) return unchanged(timeline);
+  if (series.some((k) => k.frame === toOffset)) {
+    return reject(timeline, `第 ${toOffset} 帧已经有一个关键帧了`);
+  }
+
+  const merged = [...series.filter((k) => k.frame !== fromOffset), { ...moving, frame: toOffset }].sort(
+    (a, b) => a.frame - b.frame,
+  );
+  return ok(replaceClip(timeline, found.track.id, withChannel(found.clip, property, merged)));
+}
+
+/**
  * 关掉某个属性的动画：删光它的关键帧。
  *
  * `bakeValue` 是"关掉动画时停在哪个值"——不传的话属性会跳回静态变换里那个
