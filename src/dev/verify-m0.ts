@@ -271,6 +271,11 @@ export async function verifyM0(options: VerifyOptions = {}): Promise<VerifyResul
   // ---- 5. 音频交叉淡化 ----
   checks.push(...(await verifyCrossfade()));
 
+  // ---- 6. 预览听到的 == 成片里的（D26 欠的那条护栏）----
+  // 用 M0 那条素材的时间轴：缺省的 `beeps` 每秒一声、其余静音，那个静音 → 有声的
+  // 沿正是对齐要用的东西（见 `verifyPreviewAudio` 的"对齐用起始沿"）
+  checks.push(...(await verifyPreviewAudio(singleClipTimeline(probe.source))));
+
   return {
     checks,
     passed: checks.every((c) => c.pass),
@@ -668,6 +673,192 @@ async function verifyMixResidency(source: MediaSource, clipFrames: number): Prom
 }
 
 /** 把整条时间轴按指定段长混完，拼成完整 PCM。段长大于片长就是"不分段"。 */
+/**
+ * 预览要抓多少秒。**够长到跨过几个混音段**（预览段长 1 秒），又不至于把自检拖慢。
+ * 抓 3 秒、比对 2 秒，留 1 秒给起播余量和尾部。
+ */
+const PREVIEW_CAPTURE_SECONDS = 3;
+const PREVIEW_COMPARE_SECONDS = 2;
+
+/**
+ * 预览听到的 == 成片里的。**D26 欠的那条护栏**。
+ *
+ * ## 它补的是什么
+ *
+ * 预览不是"用同样的算法自己混一遍"，而是跑同一个 `createMixer`、播它产出的同一段
+ * PCM——所以淡化曲线、等功率还是等增益、片段音量都不可能分叉，**因为没有第二份
+ * 实现**。但那个结构性保证有一处覆盖不到：**把这些段排到实时时钟上**那一步
+ * （`pump()` + `audio-schedule.ts`）。排期把某一段放错了位置、漏排一段、或者
+ * 重复排一段，声音就错了而结构性论证一句话都不会变。
+ *
+ * 单测已经钉住 `audio-schedule.ts` 那三个纯函数，这里钉的是**集成**：真的把声音
+ * 排进一个真的 `AudioContext`，把**图的输出**无损抓下来，和导出会写进成片的那份
+ * PCM 逐样本对拍。
+ *
+ * ## 对齐用起始沿，不用互相关
+ *
+ * 采集是从插节点那一刻开始的，而声音从 `originTime`（第一次 tick + 起播余量）才响，
+ * 所以两条 PCM 之间有一个未知的整数偏移。互相关在这里**没法用**：被测信号是 1kHz
+ * 正弦，自相关每 48 个样本一个同样高的峰，"最佳偏移"根本不唯一。缺省的 `beeps`
+ * 素材每秒一声、其余静音，那个**静音 → 有声的沿**在搜索窗里是唯一的，直接拿它对齐。
+ *
+ * ## 为什么还要断言"错开一个样本就不一致"
+ *
+ * 逐样本相等这条断言有一个不易发现的失效方式：**两边都是静音**。素材没解出来、
+ * 采集没接上、增益被静音，读数都是"最大差 0"，全绿。所以另外三条护栏：参照 PCM
+ * 里必须有信号、采集到的必须有信号、以及**把偏移挪一个样本之后必须显著不一致**
+ * ——最后这条同时证明"对齐是唯一的"和"比的不是两段静音"。
+ */
+async function verifyPreviewAudio(timeline: Timeline): Promise<Check[]> {
+  const checks: Check[] = [];
+  const range = { inFrame: 0, outFrame: timeline.durationFrames };
+
+  // 参照：导出会写进成片的那份 PCM（缺省段长，和导出走同一条路）
+  const reference = await mixWholeTimeline(timeline, range, 10);
+  const refPeak = channelPeak(reference.planes);
+
+  const { createPreviewAudio, START_LEAD_SECONDS } = await import("../preview/audio-engine");
+  const { tapAudioOutput, firstOnset, diffAt } = await import("./audio-capture");
+
+  const captureState: {
+    tap: Awaited<ReturnType<typeof tapAudioOutput>> | null;
+    context: AudioContext | null;
+    graphs: number;
+  } = { tap: null, context: null, graphs: 0 };
+  const engine = createPreviewAudio({
+    onGraph: async (context, output) => {
+      captureState.graphs++;
+      captureState.context = context;
+      captureState.tap = await tapAudioOutput(context, output, {
+        channelCount: MIX_CHANNELS,
+        seconds: PREVIEW_CAPTURE_SECONDS + 1,
+      });
+    },
+  });
+
+  try {
+    const started = await engine.start(timeline, 0);
+    const { tap, context } = captureState;
+    checks.push(check("预览音频：起得来（混音器 + 采集节点都建上了）", true, started && tap !== null));
+    if (!started || !tap || !context) return checks;
+    const contextRate = context.sampleRate;
+
+    // 主时钟：墙上时间 × 帧率，和 `Preview.tsx` 那个 rAF 一样
+    const fps = toNumber(timeline.fps);
+    const wallStart = performance.now();
+    const need = Math.ceil(contextRate * PREVIEW_CAPTURE_SECONDS);
+    for (;;) {
+      const elapsed = (performance.now() - wallStart) / 1000;
+      engine.tick(Math.round(elapsed * fps));
+      if (tap.captured() >= need) break;
+      if (elapsed > PREVIEW_CAPTURE_SECONDS * 3 + 5) break; // 兜底，别无限等
+      await new Promise((r) => setTimeout(r, 16));
+    }
+
+    const captured = await tap.dump();
+    // 状态是**当场读的**，不是写死的常量。`suspended` 时下面几条会全红，而原因
+    // 只在这一行里：没有用户手势的页面（`?autorun=`）要用
+    // `--autoplay-policy=no-user-gesture-required` 起浏览器
+    const contextState = context.state;
+    const capPeak = channelPeak(captured.channels);
+
+    checks.push(
+      check("预览音频：AudioContext 在跑", "running", contextState),
+      check("预览音频：采样率与混音器一致（没有重采样）", MIX_SAMPLE_RATE, contextRate),
+      /*
+        **采集期间一次都不许重新对齐。** 重排会关掉这个 context 并重建混音器
+        （要重探解码器，几百毫秒），声音每秒一顿。这条正是建这套自检时抓到的那个
+        bug 的回归护栏：起播余量没从漂移判据里减掉，于是偏差恒定 50ms、
+        吃掉 80ms 容差的六成，实测 125ms 就越界、之后被限流成 1 次/秒。
+      */
+      check(
+        "预览音频：采集期间没有重新对齐",
+        "1 次建图",
+        `${captureState.graphs} 次`,
+        captureState.graphs === 1,
+      ),
+      check("预览音频：抓回来了（worklet 没有失联）", true, !captured.timedOut),
+      check("预览音频：参照 PCM 里有信号", "峰值 > 0.05", refPeak.toFixed(4), refPeak > 0.05),
+      // 两边都是静音时"最大差 0"照样全绿，所以这一条是必须的
+      check("预览音频：抓到的声音里有信号", "峰值 > 0.05", capPeak.toFixed(4), capPeak > 0.05),
+    );
+    if (captured.timedOut) return checks;
+
+    const refOnset = firstOnset(reference.planes[0]!);
+    const capOnset = firstOnset(captured.channels[0]!);
+    const offset = capOnset - refOnset;
+    /*
+      **偏移必须落在起播余量上，不能只判"是个合理的数"。**
+
+      这一条是反向验证逼出来的：第一版只判 `0 ≤ 偏移 < 1 秒`，而"把每一段都推迟
+      50ms"这个注入**全绿**——因为按起始沿对齐会把任何**整体**平移原样吸收掉，
+      之后逐样本自然一致。整体平移正是音画不同步，所以这里要钉住绝对位置：
+      采集从插节点那一刻开始、锚定发生在紧接着的第一次 tick，所以偏移应当就是
+      起播余量本身。容差 20ms 留给这两件事之间的那点间隔。
+    */
+    const expectedOffset = Math.round(START_LEAD_SECONDS * contextRate);
+    const offsetSlack = Math.round(0.02 * contextRate);
+    checks.push(
+      check(
+        "预览音频：起始沿落在起播余量上（整体平移就是音画不同步）",
+        `${expectedOffset} ± ${offsetSlack} 个样本`,
+        `${offset}（参照第 ${refOnset} 个样本、采集第 ${capOnset} 个；余量 ${START_LEAD_SECONDS}s）`,
+        refOnset >= 0 && capOnset >= 0 && Math.abs(offset - expectedOffset) <= offsetSlack,
+      ),
+    );
+    if (refOnset < 0 || capOnset < 0 || offset < 0 || offset >= contextRate) return checks;
+
+    const length = Math.min(
+      Math.ceil(contextRate * PREVIEW_COMPARE_SECONDS),
+      reference.frameCount,
+      captured.channels[0]!.length - offset,
+    );
+    const aligned = diffAt(reference.planes, captured.channels, offset, length);
+    const shifted = diffAt(reference.planes, captured.channels, offset + 1, length - 1);
+
+    checks.push(
+      check(
+        "预览音频：比对区间够长",
+        `≥ ${Math.round(contextRate)} 个样本`,
+        `${length} 个（${(length / contextRate).toFixed(2)} 秒）`,
+        length >= contextRate,
+      ),
+      check(
+        "预览音频：预览听到的与成片逐样本一致",
+        `最大差 < ${PREVIEW_MATCH_TOLERANCE}`,
+        `${aligned.worst.toExponential(2)}（第 ${aligned.worstAt} 个样本，共比 ${aligned.compared} 个）` +
+          ` · context ${contextState}`,
+        aligned.worst < PREVIEW_MATCH_TOLERANCE,
+      ),
+      // 这一条同时证明"对齐是唯一的"和"比的不是两段静音"——挪一个样本就该明显不同
+      check(
+        "预览音频：错开一个样本就不一致（说明对齐唯一、且不是在比静音）",
+        `最大差 > ${PREVIEW_MATCH_TOLERANCE}`,
+        shifted.worst.toExponential(2),
+        shifted.worst > PREVIEW_MATCH_TOLERANCE,
+      ),
+    );
+    return checks;
+  } finally {
+    captureState.tap?.dispose();
+    engine.dispose();
+  }
+}
+
+/** 预览抓到的和参照 PCM 之间的容差。 */
+const PREVIEW_MATCH_TOLERANCE = 1e-6;
+
+function channelPeak(planes: readonly Float32Array[]): number {
+  let peak = 0;
+  for (const plane of planes) {
+    for (let i = 0; i < plane.length; i++) {
+      const v = Math.abs(plane[i]!);
+      if (v > peak) peak = v;
+    }
+  }
+  return peak;
+}
+
 async function mixWholeTimeline(
   timeline: Timeline,
   range: { readonly inFrame: number; readonly outFrame: number },

@@ -73,6 +73,19 @@ const MIN_RESYNC_INTERVAL_MS = 1_000;
  */
 const MAX_RESUME_ATTEMPTS = 3;
 
+/**
+ * 起播余量（秒）：原点定在"现在 + 这么多"，好让第一段有时间混出来再响。
+ *
+ * **它必须同时出现在漂移判据里**，否则声音天生就比主时钟晚这么多，而那个偏差是
+ * 恒定的、不会自己消掉。实测过它的后果（这条自检建起来时抓到的）：余量 50ms 吃掉
+ * 80ms 容差的六成，只剩 30ms 给帧号取整（±16.7ms）和时钟抖动——于是**正常播放时
+ * 每秒都会触发一次重新对齐**，而重新对齐要重建 AudioContext 和混音器（要重探解码器，
+ * 几百毫秒）。表现是声音每秒一次停顿，听起来像素材本身有问题；而且那正是 D22 记着的
+ * "AudioContext 风暴"，只是被 `MIN_RESYNC_INTERVAL_MS` 限流成了 1 次/秒，所以没崩、
+ * 只是一直难听。
+ */
+export const START_LEAD_SECONDS = 0.05;
+
 export interface PreviewAudio {
   /**
    * 从某一帧开始出声。已经在播就先停掉再重排。
@@ -129,7 +142,21 @@ interface Session {
   readonly sources: AudioBufferSourceNode[];
 }
 
-export function createPreviewAudio(): PreviewAudio {
+export interface PreviewAudioOptions {
+  /**
+   * 图建好、还没排任何声音之前的钩子。**只给自检用**，生产路径不传。
+   *
+   * 存在的理由是 D26 欠的那条护栏："预览听到的 == 成片里的"。要断言它就必须拿到
+   * **真的排出去的那些字节**，而那只能在 `gain → destination` 之间插一个采集节点，
+   * 从外面拿不到这个图。同"把测量塞进已经会跑的路径"——不传钩子时一行开销都没有。
+   *
+   * 允许返回 promise（注册 AudioWorklet 模块是异步的），但**必须 settle**：
+   * 这里 await 它，挂住就等于 `startAt` 永远不返回，正是上面 `resume()` 那个坑。
+   */
+  readonly onGraph?: (context: AudioContext, output: GainNode) => void | Promise<void>;
+}
+
+export function createPreviewAudio(options: PreviewAudioOptions = {}): PreviewAudio {
   let session: Session | null = null;
   let volume = 1;
   let muted = false;
@@ -251,10 +278,22 @@ export function createPreviewAudio(): PreviewAudio {
     if (!mixer) return false;
 
     const context = new AudioContext({ sampleRate: mixer.header.sampleRate });
-    // 自动播放策略：点播放是用户手势，但 context 可能仍以 suspended 出生
-    await context.resume().catch(() => undefined);
+    /*
+      自动播放策略：点播放是用户手势，但 context 可能仍以 suspended 出生。
+
+      **不要 await 这个 resume。** 实测（Chrome 150）：没有用户手势时它返回一个
+      **永不 settle** 的 promise——`state` 停在 `suspended`，promise 既不 resolve
+      也不 reject，`currentTime` 一动不动。await 它就等于 `startAt` 永远不返回：
+      session 建不出来、`start()` 的 promise 也不会 resolve，而下面 tick 里那套
+      "试几次就放弃"的闸门**根本轮不到执行**（它判的是 session 上的 context）。
+      更坏的是走 tick 重排那条路时 `restarting` 会永远停在 true，这一页从此不再出声。
+      发出去就不管，能不能响交给 tick 里读 `state` 决定。
+    */
+    void context.resume().catch(() => undefined);
     const gain = context.createGain();
     gain.connect(context.destination);
+    // 自检在这里插采集节点，见 `PreviewAudioOptions.onGraph`
+    await options.onGraph?.(context, gain);
 
     session = {
       mixer,
@@ -324,14 +363,20 @@ export function createPreviewAudio(): PreviewAudio {
       if (!s.anchored) {
         s.anchored = true;
         s.startFrame = frame;
-        // 留一点起播余量，让第一段有时间混出来再响
-        s.originTime = s.context.currentTime + 0.05;
+        // 留一点起播余量，让第一段有时间混出来再响。**下面的漂移判据要把它减掉**
+        s.originTime = s.context.currentTime + START_LEAD_SECONDS;
         void pump();
         return;
       }
 
-      // 声音是被动跟随的一方，同 video 元素的漂移纠正
-      const expected = frameToSeconds(frame - s.startFrame, s.fps);
+      /*
+        声音是被动跟随的一方，同 video 元素的漂移纠正。
+
+        **减掉起播余量**：原点定在"锚定那一刻 + 余量"，所以主时钟走到第 `frame` 帧时，
+        声音**本该**只播到 `(frame - startFrame)/fps - 余量` 秒。不减的话这个偏差
+        恒定存在、判据一直读到它，于是每秒重新对齐一次（见 `START_LEAD_SECONDS`）。
+      */
+      const expected = frameToSeconds(frame - s.startFrame, s.fps) - START_LEAD_SECONDS;
       const audioSeconds = s.context.currentTime - s.originTime;
       if (audioSeconds > 0 && driftedTooFar(expected, audioSeconds)) {
         // 重排有下限：没有它，任何持续性的偏差都会变成 AudioContext 风暴
