@@ -23,7 +23,6 @@ import type {
   TrackId,
   Transition,
 } from "../edl/types";
-import { singleClipTimeline } from "../edl/types";
 import { FPS } from "../time/rational";
 import {
   canRedo as histCanRedo,
@@ -38,6 +37,7 @@ import {
   type History,
 } from "./history";
 import {
+  addSource,
   addTextClip,
   clearKeyframes,
   findClip,
@@ -112,7 +112,12 @@ export interface TimelineState {
   redoLabel: () => string | null;
 
   // ---- 编辑（都会进撤销栈）----
-  loadSource: (source: MediaSource) => void;
+  /**
+   * 把素材加进项目并在时间轴上放好片段。**追加，不覆盖**——见 `addSource()`。
+   *
+   * `timelineIn` 不传则放在播放头。放不下会走 `lastRejection` 提示，不静默换位置。
+   */
+  addSource: (source: MediaSource, timelineIn?: number) => void;
   /**
    * 用崩溃恢复读回来的项目替掉当前状态。**历史从这里重新开始。**
    *
@@ -220,37 +225,23 @@ export const useTimeline = create<TimelineState>((set, get) => {
     undoLabel: () => histUndoLabel(get().history),
     redoLabel: () => histRedoLabel(get().history),
 
-    loadSource(source) {
-      // M0 的 singleClipTimeline 只铺单轨；M1 把它放进完整轨道布局里
-      const single = singleClipTimeline(source);
-      const videoClip = single.tracks.find((t) => t.kind === "video")?.clips[0];
-      const audioClip = single.tracks.find((t) => t.kind === "audio")?.clips[0];
-
-      const named = (clip: Clip | undefined, suffix: string): Clip[] =>
-        clip ? [{ ...clip, id: `${source.id}${suffix}`, name: source.name }] : [];
-
-      const next: Timeline = {
-        ...EMPTY_TIMELINE,
-        fps: source.fps,
-        width: source.width,
-        height: source.height,
-        durationFrames: single.durationFrames,
-        sources: [source],
-        tracks: EMPTY_TIMELINE.tracks.map((track) => {
-          if (track.id === "V1") return { ...track, clips: named(videoClip, "-v") };
-          if (track.id === "A1") return { ...track, clips: named(audioClip, "-a") };
-          return track;
-        }),
-      };
-
-      set((state) => ({
-        history: commit(state.history, next, {
+    addSource(source, timelineIn) {
+      const state = get();
+      const at = timelineIn ?? state.playhead;
+      const result = addSource(state.timeline(), { source, timelineIn: at });
+      if (!result.changed) {
+        set({ lastRejection: result.reason ?? null });
+        return;
+      }
+      set((s) => ({
+        history: commit(s.history, result.timeline, {
           label: `导入 ${source.name}`,
           coalesceKey: null,
           at: now(),
         }),
-        playhead: 0,
-        selectedClipId: videoClip ? `${source.id}-v` : null,
+        // 选中新片段（画面在前）。**不动播放头**：导入配乐时用户正停在某一处，
+        // 把它拨回 0 等于让"在播放头处插入"这件事自己失效
+        selectedClipId: result.clipIds?.[0] ?? null,
         lastRejection: null,
       }));
     },

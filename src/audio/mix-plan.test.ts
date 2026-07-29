@@ -33,6 +33,7 @@ const US = 5;
 function source(id: string, durationFrames = 1000): MediaSource {
   return {
     id,
+    kind: "av",
     name: `${id}.mp4`,
     file: new File([], `${id}.mp4`),
     fps: FPS.ndf2997,

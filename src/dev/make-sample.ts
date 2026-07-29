@@ -43,6 +43,80 @@ export interface GeneratedSample {
   readonly hasAudio: boolean;
 }
 
+export interface AudioSampleOptions {
+  readonly seconds?: number;
+  readonly sampleRate?: number;
+  /** 声道数。默认 2——配乐通常是立体声，而混流要把它下混到输出声道数。 */
+  readonly channels?: number;
+  /**
+   * 波形。语义与 `SampleOptions.audioShape` 相同。
+   *
+   * 判"取到了源片哪一刻"**只能用 `beeps`**：`tone` 全程都在响，从哪里取样听起来
+   * 都一样，于是"裁过入点的片段取错了内容"这种错在连续音上完全测不出来。
+   */
+  readonly shape?: "tone" | "beeps";
+}
+
+export interface GeneratedAudioSample {
+  readonly file: File;
+  readonly seconds: number;
+  readonly sampleRate: number;
+  readonly channels: number;
+}
+
+/**
+ * 生成一个**只有音轨**的素材（配乐 / 旁白）。
+ *
+ * 单独一个函数而不是给 `makeSampleVideo` 加个 `withVideo:false`：那样"生成的东西
+ * 到底有没有画面"就成了参数的函数，而返回类型说不出来，调用方得自己记着。
+ *
+ * 全程等幅 1kHz 连续音，幅度与 `audioShape:"tone"` 相同（0.25），于是两种素材量到的
+ * RMS 可以直接互相当参照。**起点是精确的静音 → 有声沿**（前 20ms 静音），
+ * 自检靠它判"配乐被放到了第几帧"，见 `firstOnsetAfter`。
+ */
+export async function makeSampleAudio(
+  options: AudioSampleOptions = {},
+): Promise<GeneratedAudioSample> {
+  const seconds = options.seconds ?? 2;
+  const sampleRate = options.sampleRate ?? 44_100;
+  const channels = options.channels ?? 2;
+
+  const audioCodec = await getFirstEncodableAudioCodec(["aac", "opus"]);
+  if (!audioCodec) throw new Error("本机没有可用的音频编码器，无法生成纯音频素材");
+
+  const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+  const audioSource = new AudioBufferSource({ codec: audioCodec, bitrate: 128e3 });
+  output.addAudioTrack(audioSource);
+  await output.start();
+
+  const length = Math.ceil(seconds * sampleRate);
+  const audioCtx = new OfflineAudioContext({ numberOfChannels: channels, sampleRate, length });
+  const buffer = audioCtx.createBuffer(channels, length, sampleRate);
+  // 前 20ms 留静音：起始沿要是**素材自己的**，而不是"文件第一个样本"——
+  // 后者会被编码器的 priming 爬升糊掉，量出来的位置偏早且偏移量不稳
+  const leadSamples = Math.round(0.02 * sampleRate);
+  const shape = options.shape ?? "tone";
+  for (let ch = 0; ch < channels; ch++) {
+    const data = buffer.getChannelData(ch);
+    for (let n = leadSamples; n < length; n++) {
+      const t = n / sampleRate;
+      const on = shape === "tone" || t % 1 < 0.08;
+      data[n] = on ? Math.sin(2 * Math.PI * 1000 * t) * 0.25 : 0;
+    }
+  }
+  await audioSource.add(buffer);
+
+  audioSource.close();
+  const mimeType = await output.getMimeType();
+  await output.finalize();
+
+  const bytes = (output.target as BufferTarget).buffer;
+  if (!bytes) throw new Error("纯音频素材生成失败：没有输出数据");
+
+  const file = new File([new Uint8Array(bytes)], `kerf-music-${seconds}s.mp4`, { type: mimeType });
+  return { file, seconds, sampleRate, channels };
+}
+
 export async function makeSampleVideo(options: SampleOptions = {}): Promise<GeneratedSample> {
   const width = options.width ?? 640;
   const height = options.height ?? 360;

@@ -136,20 +136,83 @@ export interface Transition {
   readonly frames: number;
 }
 
-/** 导入的素材。M0 直接持有 File；M1 起改为 OPFS 句柄 + 代理文件。 */
-export interface MediaSource {
+/** 所有素材共有的部分。 */
+interface SourceBase {
   readonly id: SourceId;
   readonly name: string;
   readonly file: File;
+  /** 有没有**能解**的音轨。没有的话混流会整段跳过它（见 `audio/mix-plan.ts`）。 */
+  readonly hasAudio: boolean;
+  readonly audioCodec: string | null;
+}
+
+/** 带画面的素材（可能同时带声音）。 */
+export interface AvSource extends SourceBase {
+  readonly kind: "av";
   /** 源片自身的帧率，已吸附成有理数。 */
   readonly fps: Rational;
   readonly width: number;
   readonly height: number;
   /** 源片总帧数（按 fps 换算）。 */
   readonly durationFrames: number;
-  readonly hasAudio: boolean;
   readonly videoCodec: string | null;
-  readonly audioCodec: string | null;
+}
+
+/**
+ * 只有声音的素材——配乐、旁白。
+ *
+ * **刻意不给它 `fps` / `durationFrames` / `width` / `height`**，而不是填 0 或者
+ * 编一个帧率进去。理由是 `sourceIn` 的单位不是自由的：裁入点把**时间轴帧号的增量**
+ * 直接加到 `sourceIn` 上（见 `state/operations.ts` 的 `trimClip`），所以那个栅格
+ * 必须就是项目帧率。存一个"导入时的项目帧率"就成了会陈旧的第二真值来源，
+ * 而陈旧的表现是"裁一帧变成裁 1.2 帧"且不报错。
+ *
+ * 所以栅格是**派生**的，见 `sourceGridFps()`；这条派生成立的前提是项目帧率在
+ * 时间轴上有片段之后不再改动，由 `addSource()` 保证。
+ */
+export interface AudioOnlySource extends SourceBase {
+  readonly kind: "audio";
+  /** 音轨解得动才让它进来，所以这里恒为 true——留着字段是让混流侧不必分岔。 */
+  readonly hasAudio: true;
+  /** 源片时长（整数微秒）。没有帧栅格，所以不能用帧数表达。 */
+  readonly durationMicros: number;
+  readonly sampleRate: number;
+  readonly channels: number;
+}
+
+/**
+ * 导入的素材。
+ *
+ * 用**判别联合**而不是"`width` / `height` 填 0"，理由同 `Clip`（见 D8）：填 0
+ * 的代价是每个用到画面尺寸的地方都要先判"这个素材到底有没有画面"，而漏掉一处
+ * 不会报错——代理转码会去转一个没有视频轨的文件、缩略图会画出一条空白带、
+ * 而合成器会拿到一个 0×0 的图层。
+ */
+export type MediaSource = AvSource | AudioOnlySource;
+
+/**
+ * 这个素材的 `sourceIn` 用哪个帧栅格。
+ *
+ * 带画面的素材用它自己的帧率；纯音频素材没有帧率，用**项目帧率**——见
+ * `AudioOnlySource` 的文件头。**凡是把 `sourceIn` 换算成时间的地方都要问这个函数**，
+ * 直接读 `source.fps` 在纯音频素材上编译不过（那正是这个联合想要的效果）。
+ */
+export function sourceGridFps(source: MediaSource, timelineFps: Rational): Rational {
+  return source.kind === "av" ? source.fps : timelineFps;
+}
+
+/**
+ * 这个素材在自己的栅格里有多少帧——裁切的"还有没有更多素材"就是拿它判的。
+ *
+ * 纯音频素材用 `floor` 而不是 `round`：宁可少报一帧，也不能报出一帧解不出内容的
+ * 位置（那会让裁到末尾的片段末帧静音，而静音在波形上看着就像素材本身如此）。
+ */
+export function sourceDurationFrames(source: MediaSource, timelineFps: Rational): number {
+  if (source.kind === "av") return source.durationFrames;
+  return Math.max(
+    1,
+    Math.floor((source.durationMicros * timelineFps.num) / (timelineFps.den * 1_000_000)),
+  );
 }
 
 /**
@@ -361,7 +424,7 @@ export function toSourceFrame(clip: MediaClip, timelineFrame: number): number {
  * 保证管道验证的是纯粹的 decode → compose → encode → mux。
  */
 export function singleClipTimeline(
-  source: MediaSource,
+  source: AvSource,
   range?: Partial<RenderRange>,
 ): Timeline {
   const inFrame = Math.max(0, range?.inFrame ?? 0);

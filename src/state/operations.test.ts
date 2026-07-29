@@ -3,6 +3,8 @@ import { FPS } from "../time/rational";
 import { clipsUsingEffects } from "../edl/types";
 import type { LutSource } from "../edl/types";
 import type {
+  AudioOnlySource,
+  AvSource,
   Clip,
   MediaClip,
   MediaSource,
@@ -14,6 +16,7 @@ import type {
 import {
   addFont,
   addLut,
+  addSource,
   addTextClip,
   clearKeyframes,
   computeDuration,
@@ -45,6 +48,7 @@ import {
 function source(id: string, durationFrames = 1000): MediaSource {
   return {
     id,
+    kind: "av",
     name: `${id}.mp4`,
     file: new File([], `${id}.mp4`),
     fps: FPS.ndf2997,
@@ -1364,5 +1368,192 @@ describe("junctionInfo", () => {
   it("没有前驱时给出 previous:null，界面据此禁掉添加", () => {
     const tl = timeline([{ id: "V1", kind: "video", clips: [clip("a", 0, 100)] }]);
     expect(junctionInfo(tl, "a")).toMatchObject({ previous: null, transition: null });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 导入素材
+// ---------------------------------------------------------------------------
+
+describe("导入素材", () => {
+  /** 空项目的轨道布局，顺序与 `EMPTY_TIMELINE` 一致（T1 在最上）。 */
+  const emptyLayout = (): Timeline => ({
+    fps: FPS.ndf2997,
+    width: 1920,
+    height: 1080,
+    durationFrames: 0,
+    tracks: [
+      { id: "T1", kind: "video", clips: [] },
+      { id: "V2", kind: "video", clips: [] },
+      { id: "V1", kind: "video", clips: [] },
+      { id: "A1", kind: "audio", clips: [] },
+      { id: "A2", kind: "audio", clips: [] },
+    ],
+    sources: [],
+  });
+
+  const video = (id: string, over: Partial<AvSource> = {}): AvSource => ({
+    ...source(id, 300),
+    ...over,
+  }) as AvSource;
+
+  const music = (id: string, over: Partial<AudioOnlySource> = {}): AudioOnlySource => ({
+    id,
+    kind: "audio",
+    name: `${id}.mp3`,
+    file: new File([], `${id}.mp3`),
+    hasAudio: true,
+    audioCodec: "mp3",
+    durationMicros: 10_000_000,
+    sampleRate: 44_100,
+    channels: 2,
+    ...over,
+  });
+
+  const trackClips = (tl: Timeline, id: string) => tl.tracks.find((t) => t.id === id)!.clips;
+
+  it("带音轨的画面素材同时铺到 V1 和 A1，两个片段起点相同", () => {
+    const r = addSource(emptyLayout(), { source: video("v1"), timelineIn: 0 });
+    expect(r.changed).toBe(true);
+    expect(trackClips(r.timeline, "V1")).toHaveLength(1);
+    expect(trackClips(r.timeline, "A1")).toHaveLength(1);
+    expect(trackClips(r.timeline, "V1")[0]!.timelineIn).toBe(
+      trackClips(r.timeline, "A1")[0]!.timelineIn,
+    );
+    // **画面轨的候选顺序是自下而上**：素材该落在 V1，不是最上面的字幕轨
+    expect(trackClips(r.timeline, "T1")).toHaveLength(0);
+    expect(r.clipIds).toEqual(["v1-v", "v1-a"]);
+  });
+
+  it("纯音频素材只铺音频轨，一个画面片段都不产生", () => {
+    const r = addSource(emptyLayout(), { source: music("m1"), timelineIn: 0 });
+    expect(r.changed).toBe(true);
+    expect(trackClips(r.timeline, "A1")).toHaveLength(1);
+    expect(trackClips(r.timeline, "V1")).toHaveLength(0);
+    expect(r.clipIds).toEqual(["m1-a"]);
+    // 长度按项目帧率派生：10 秒 × 30000/1001 = 299 帧
+    expect(trackClips(r.timeline, "A1")[0]!.timelineOut).toBe(299);
+  });
+
+  it("第二次导入是**追加**，不会把第一次的编辑清掉", () => {
+    const first = addSource(emptyLayout(), { source: video("v1"), timelineIn: 0 });
+    const second = addSource(first.timeline, { source: music("m1"), timelineIn: 0 });
+    expect(second.changed).toBe(true);
+    expect(second.timeline.sources.map((s) => s.id)).toEqual(["v1", "m1"]);
+    // 视频的画面和声音都还在原处
+    expect(trackClips(second.timeline, "V1")).toHaveLength(1);
+    expect(trackClips(second.timeline, "A1")).toHaveLength(1);
+    // 配乐落到 A2（A1 被视频的音轨占了），而不是顶掉它
+    expect(trackClips(second.timeline, "A2")).toHaveLength(1);
+    expect(trackClips(second.timeline, "A2")[0]!.id).toBe("m1-a");
+  });
+
+  it("放在播放头处：起点就是传进来的那一帧", () => {
+    const r = addSource(emptyLayout(), { source: music("m1"), timelineIn: 120 });
+    expect(trackClips(r.timeline, "A1")[0]!.timelineIn).toBe(120);
+    expect(trackClips(r.timeline, "A1")[0]!.timelineOut).toBe(120 + 299);
+  });
+
+  it("空时间轴时项目帧率和画布跟着画面素材走", () => {
+    const r = addSource(emptyLayout(), {
+      source: video("v1", { fps: FPS.film24, width: 640, height: 360 }),
+      timelineIn: 0,
+    });
+    expect(r.timeline.fps).toEqual(FPS.film24);
+    expect(r.timeline.width).toBe(640);
+    expect(r.timeline.height).toBe(360);
+  });
+
+  it("时间轴上已经有片段时**绝不**改项目帧率——那会把所有音频片段的入点重新解释一遍", () => {
+    const first = addSource(emptyLayout(), { source: music("m1"), timelineIn: 0 });
+    const second = addSource(first.timeline, {
+      source: video("v1", { fps: FPS.film24, width: 640, height: 360 }),
+      timelineIn: 0,
+    });
+    expect(second.timeline.fps).toEqual(FPS.ndf2997);
+    expect(second.timeline.width).toBe(1920);
+    // 配乐的占位一帧都没动
+    expect(trackClips(second.timeline, "A1")[0]!.timelineOut).toBe(299);
+  });
+
+  it("纯音频素材不会改项目帧率，哪怕时间轴是空的", () => {
+    const r = addSource(emptyLayout(), { source: music("m1"), timelineIn: 0 });
+    expect(r.timeline.fps).toEqual(FPS.ndf2997);
+    expect(r.timeline.width).toBe(1920);
+  });
+
+  it("音频放不下时整体拒绝，不允许「画面放下了、声音挪到别处」", () => {
+    const tl = emptyLayout();
+    const blocked: Timeline = {
+      ...tl,
+      tracks: tl.tracks.map((t) =>
+        t.kind === "audio" ? { ...t, clips: [clip(`${t.id}-old`, 0, 400)] } : t,
+      ),
+      sources: [source("src", 1000)],
+    };
+    const r = addSource(blocked, { source: video("v1"), timelineIn: 0 });
+    expect(r.changed).toBe(false);
+    expect(r.reason).toContain("音频轨");
+    // 画面片段和素材都不能留下——半成品比失败更坏
+    expect(trackClips(r.timeline, "V1")).toHaveLength(0);
+    expect(r.timeline.sources.map((s) => s.id)).toEqual(["src"]);
+  });
+
+  it("同一个素材 id 不能进两次", () => {
+    const first = addSource(emptyLayout(), { source: video("v1"), timelineIn: 0 });
+    const again = addSource(first.timeline, { source: video("v1"), timelineIn: 400 });
+    expect(again.changed).toBe(false);
+    expect(again.reason).toContain("已经在项目里");
+  });
+
+  it("起点必须是非负整数帧", () => {
+    expect(addSource(emptyLayout(), { source: music("m"), timelineIn: -1 }).reason).toContain(
+      "非负整数帧",
+    );
+    expect(addSource(emptyLayout(), { source: music("m"), timelineIn: 1.5 }).reason).toContain(
+      "非负整数帧",
+    );
+  });
+
+  it("锁定的轨道会被跳过", () => {
+    const tl = emptyLayout();
+    const locked: Timeline = {
+      ...tl,
+      tracks: tl.tracks.map((t) => (t.id === "A1" ? { ...t, locked: true } : t)),
+    };
+    const r = addSource(locked, { source: music("m1"), timelineIn: 0 });
+    expect(trackClips(r.timeline, "A2")).toHaveLength(1);
+    expect(trackClips(r.timeline, "A1")).toHaveLength(0);
+  });
+});
+
+describe("裁切纯音频片段", () => {
+  const withMusic = (): Timeline => ({
+    fps: FPS.ntsc30,
+    width: 1920,
+    height: 1080,
+    durationFrames: 100,
+    tracks: [{ id: "A1", kind: "audio", clips: [clip("m", 0, 100)] }],
+    sources: [
+      {
+        id: "src",
+        kind: "audio",
+        name: "m.mp3",
+        file: new File([], "m.mp3"),
+        hasAudio: true,
+        audioCodec: "mp3",
+        // 5 秒，30fps 下正好 150 帧
+        durationMicros: 5_000_000,
+        sampleRate: 44_100,
+        channels: 2,
+      },
+    ],
+  });
+
+  it("出点最多拉到派生出来的源片末尾（5 秒 × 30fps = 150 帧）", () => {
+    expect(trimClip(withMusic(), "m", "out", 50).changed).toBe(true);
+    const over = trimClip(withMusic(), "m", "out", 51);
+    expect(over.changed).toBe(false);
+    expect(over.reason).toContain("源片末尾");
   });
 });

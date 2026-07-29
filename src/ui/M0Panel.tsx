@@ -6,7 +6,7 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { probeFile, wasFpsSnapped, type ProbeResult } from "../media/probe";
+import { probeAvFile, wasFpsSnapped, type AvProbeResult } from "../media/probe";
 import { describeCapabilities, type ExportCapabilities } from "../media/capability";
 import { probeCapabilities } from "../media/capability-probe";
 import { singleClipTimeline } from "../edl/types";
@@ -37,7 +37,7 @@ type Status =
   | { kind: "error"; text: string };
 
 export function M0Panel({ onBack }: { readonly onBack: () => void }) {
-  const [probe, setProbe] = useState<ProbeResult | null>(null);
+  const [probe, setProbe] = useState<AvProbeResult | null>(null);
   const [caps, setCaps] = useState<ExportCapabilities | null>(null);
   const [container, setContainer] = useState<"mp4" | "webm">("mp4");
   const [inFrame, setInFrame] = useState(0);
@@ -76,7 +76,7 @@ export function M0Panel({ onBack }: { readonly onBack: () => void }) {
   const loadFile = useCallback(async (file: File) => {
     setStatus({ kind: "busy", label: "读取素材…" });
     try {
-      const result = await probeFile(file);
+      const result = await probeAvFile(file);
       setProbe(result);
       setInFrame(0);
       setOutFrame(result.source.durationFrames);

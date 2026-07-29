@@ -35,12 +35,15 @@ import type { TextStyle } from "../compose/text-raster";
 import {
   clipDuration,
   findFont,
+  sourceDurationFrames,
   transitionFitsTrack,
   type Clip,
   type ClipId,
   type FontSource,
   type LutId,
   type LutSource,
+  type MediaClip,
+  type MediaSource,
   type TextClip,
   type Timeline,
   type Track,
@@ -365,7 +368,11 @@ export function trimClip(
     if (newOut <= clip.timelineIn) return reject(timeline, "片段至少要保留 1 帧");
     if (clip.kind === "media") {
       const source = timeline.sources.find((s) => s.id === clip.sourceId);
-      const sourceLimit = source?.durationFrames ?? Number.MAX_SAFE_INTEGER;
+      // 纯音频素材的帧数按项目帧率派生——**这就是裁切必须和 `sourceIn` 同栅格的地方**，
+      // 见 `AudioOnlySource` 的文件头
+      const sourceLimit = source
+        ? sourceDurationFrames(source, timeline.fps)
+        : Number.MAX_SAFE_INTEGER;
       const usedSourceFrames = clip.sourceIn + (newOut - clip.timelineIn);
       if (usedSourceFrames > sourceLimit) return reject(timeline, "已经到源片末尾，没有更多素材");
     }
@@ -849,7 +856,8 @@ export function junctionInfo(timeline: Timeline, clipId: ClipId): JunctionInfo |
 /** 片段引用的源片有多少帧。文字片段没有源片，返回 0（它永远不会定格）。 */
 function sourceFramesOf(timeline: Timeline, clip: Clip): number {
   if (clip.kind !== "media") return 0;
-  return timeline.sources.find((s) => s.id === clip.sourceId)?.durationFrames ?? 0;
+  const source = timeline.sources.find((s) => s.id === clip.sourceId);
+  return source ? sourceDurationFrames(source, timeline.fps) : 0;
 }
 
 /** 转场种类的显示名。加新种类时这里会因为 Record 缺项而编译报错。 */
@@ -1246,6 +1254,124 @@ export function addTextClip(timeline: Timeline, options: AddTextOptions): AddCli
     };
   }
   return reject(timeline, options.trackId ? lastReason : `所有画面轨在这个位置都放不下：${lastReason}`);
+}
+
+// ---------------------------------------------------------------------------
+// 导入素材
+// ---------------------------------------------------------------------------
+
+export interface AddSourceOptions {
+  readonly source: MediaSource;
+  /** 片段放在哪一帧起。通常是播放头。 */
+  readonly timelineIn: number;
+}
+
+export interface AddSourceResult extends EditResult {
+  /** 新建出来的片段 id，画面在前。UI 用它选中新片段。 */
+  readonly clipIds?: readonly ClipId[];
+}
+
+/**
+ * 把一个素材加进项目，并在时间轴上放好它的片段。
+ *
+ * ## 为什么是"追加"而不是"载入"
+ *
+ * 这个函数取代了原来那个把整条时间轴换掉的 `loadSource`。**配乐这件事本身就要求
+ * 追加**：用户必然是先导入画面、再导入音乐，覆盖式载入会让第二次导入把第一次的
+ * 编辑全部扔掉（而且是静默扔掉，撤销栈里只留下"导入"这一条）。
+ *
+ * ## 项目帧率和画布只在时间轴还空着的时候跟着素材走
+ *
+ * 这不是"能省事就省事"，而是 `AudioOnlySource` 那条派生栅格成立的前提：纯音频
+ * 素材的 `sourceIn` 按**项目帧率**解释，一旦项目帧率能在已经有片段之后被改掉，
+ * 所有音频片段的入点就会同时被重新解释一遍——表现是配乐整体错位，且不报错。
+ * 所以这里的判据是"一个片段都没有"，不是"没有画面素材"。
+ *
+ * 带音轨的画面素材要**同时**放画面片段和音频片段，两者起点必须相同；任一放不下
+ * 就整体拒绝，不允许"画面放下了、声音挪到了别处"——那是音画错位而不是失败。
+ */
+export function addSource(timeline: Timeline, options: AddSourceOptions): AddSourceResult {
+  const { source, timelineIn } = options;
+  if (!Number.isInteger(timelineIn) || timelineIn < 0) {
+    return reject(timeline, "起点必须是非负整数帧");
+  }
+  if (timeline.sources.some((s) => s.id === source.id)) {
+    return reject(timeline, `素材 ${source.name} 已经在项目里了`);
+  }
+
+  const empty = timeline.tracks.every((t) => t.clips.length === 0);
+  const conformed: Timeline =
+    empty && source.kind === "av"
+      ? { ...timeline, fps: source.fps, width: source.width, height: source.height }
+      : timeline;
+  // 帧数要在**定好项目帧率之后**再算：纯音频素材的帧数是按项目帧率派生的
+  const lengthFrames = sourceDurationFrames(source, conformed.fps);
+  const withSource: Timeline = {
+    ...conformed,
+    sources: [...conformed.sources, source],
+  };
+
+  /** 画面片段和音频片段共用同一份占位与 `sourceIn`，只是落在不同种类的轨上。 */
+  const clipFor = (suffix: string): MediaClip => ({
+    id: `${source.id}${suffix}`,
+    kind: "media",
+    sourceId: source.id,
+    name: source.name,
+    timelineIn,
+    timelineOut: timelineIn + lengthFrames,
+    sourceIn: 0,
+  });
+
+  const plan: { readonly clip: MediaClip; readonly kind: TrackKind }[] = [];
+  if (source.kind === "av") plan.push({ clip: clipFor("-v"), kind: "video" });
+  if (source.hasAudio) plan.push({ clip: clipFor("-a"), kind: "audio" });
+  if (plan.length === 0) {
+    // 探针不会产出这种素材（两条路都要求对应轨道解得动），所以这只是不信任它
+    return reject(timeline, `素材 ${source.name} 既没有画面也没有能解的声音`);
+  }
+
+  let next = withSource;
+  const clipIds: ClipId[] = [];
+  for (const { clip, kind } of plan) {
+    const placed = placeOnFirstFittingTrack(next, clip, kind);
+    if (!placed.changed) return reject(timeline, placed.reason ?? "放不下");
+    next = placed.timeline;
+    clipIds.push(clip.id);
+  }
+  return { ...ok(next), clipIds };
+}
+
+/**
+ * 在指定种类的轨道里挑第一条放得下的，把片段放进去。
+ *
+ * **画面轨的候选顺序是自下而上**（V1 → V2 → T1），和 `addTextClip` 相反：素材该
+ * 落在「主视频」轨上，而文字该落在最上面的「字幕 / 标题」轨上。两者共用一个顺序
+ * 的话，导入的第二个视频会跑到字幕轨顶上去。
+ */
+function placeOnFirstFittingTrack(
+  timeline: Timeline,
+  clip: MediaClip,
+  kind: TrackKind,
+): EditResult {
+  const candidates = timeline.tracks.filter((t) => t.kind === kind);
+  const ordered = kind === "video" ? [...candidates].reverse() : candidates;
+  if (ordered.length === 0) return reject(timeline, kind === "video" ? "没有画面轨" : "没有音频轨");
+
+  let lastReason = "";
+  for (const track of ordered) {
+    if (track.locked) {
+      lastReason = `${track.label ?? track.id} 已锁定`;
+      continue;
+    }
+    const hits = collisionsIn(track, clip);
+    if (hits.length > 0) {
+      lastReason = `与「${hits[0]!.name ?? hits[0]!.id}」重叠`;
+      continue;
+    }
+    return ok(mapTrack(timeline, track.id, (t) => withClips(t, [...t.clips, clip])));
+  }
+  const what = kind === "video" ? "画面轨" : "音频轨";
+  return reject(timeline, `所有${what}在这个位置都放不下：${lastReason}`);
 }
 
 // ---------------------------------------------------------------------------

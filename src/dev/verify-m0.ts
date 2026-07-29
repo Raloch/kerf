@@ -16,11 +16,19 @@ import {
   VideoSampleSink,
   type InputAudioTrack,
 } from "mediabunny";
-import { makeSampleVideo } from "./make-sample";
-import { probeFile } from "../media/probe";
+import { makeSampleAudio, makeSampleVideo } from "./make-sample";
+import { probeAvFile, probeFile } from "../media/probe";
 import { startExport } from "../export/client";
 import { readExportFile, removeExportFile } from "../export/write-target";
-import { singleClipTimeline, type Clip, type MediaSource, type Timeline } from "../edl/types";
+import {
+  singleClipTimeline,
+  sourceDurationFrames,
+  type AvSource,
+  type Clip,
+  type Timeline,
+} from "../edl/types";
+import { addSource } from "../state/operations";
+import { EMPTY_TIMELINE } from "../state/timeline-store";
 import { crossfadeGain } from "../audio/crossfade";
 import { createMixer, MIX_CHANNELS, MIX_SAMPLE_RATE } from "../audio/mixdown";
 import { formatBytes, residency } from "../export/residency";
@@ -75,7 +83,7 @@ export async function verifyM0(options: VerifyOptions = {}): Promise<VerifyResul
   const sample = await makeSampleVideo({ durationFrames: totalFrames, withAudio: true });
 
   // ---- 2. 探测 ----
-  const probe = await probeFile(sample.file);
+  const probe = await probeAvFile(sample.file);
   checks.push(check("探测帧率分子", 30000, probe.source.fps.num));
   checks.push(check("探测帧率分母", 1001, probe.source.fps.den));
   checks.push(
@@ -276,6 +284,9 @@ export async function verifyM0(options: VerifyOptions = {}): Promise<VerifyResul
   // 沿正是对齐要用的东西（见 `verifyPreviewAudio` 的"对齐用起始沿"）
   checks.push(...(await verifyPreviewAudio(singleClipTimeline(probe.source))));
 
+  // ---- 7. 纯音频素材（配乐）----
+  checks.push(...(await verifyAudioOnlySource()));
+
   return {
     checks,
     passed: checks.every((c) => c.pass),
@@ -283,6 +294,257 @@ export async function verifyM0(options: VerifyOptions = {}): Promise<VerifyResul
     exportedBytes: exported.bytesWritten,
     realtimeFactor,
   };
+}
+
+// ---------------------------------------------------------------------------
+// 纯音频素材（配乐）
+// ---------------------------------------------------------------------------
+
+const MUSIC_OUT = "kerf-verify-music.mp4";
+/** 配乐素材长度（秒）。每秒一声 1kHz，见 `MUSIC_TRIMMED_SOURCE_IN`。 */
+const MUSIC_SECONDS = 4;
+/** 整段配乐放在第几帧。刻意不是 0——放在 0 时"整体平移"和"没平移"给出同一个位置。 */
+const MUSIC_START_FRAME = 30;
+/**
+ * 第二个配乐片段的 `sourceIn`（帧，按项目帧率的栅格）。
+ *
+ * **这个片段存在的唯一理由是让帧栅格真正参与运算。** 第一版只有一个 `sourceIn:0`
+ * 的片段，而 `sourceMicrosAt` 是 `frameToMicros(sourceIn, 栅格) + …`——`sourceIn`
+ * 为 0 时**栅格被乘以零**，那条起始沿断言其实一次都没碰到 `sourceGridFps`。
+ * 同「挑用例时要先问被测的那个量在这里是不是恰好等于零/一」。
+ *
+ * 75 帧 ≈ 2.5 秒，**必须落在两声之间的静音里**：落在某一声内部的话
+ * `firstOnsetAfter` 会立刻在取样起点上找到"正在响"，量出来的位置就等于取样起点
+ * 本身、不含任何"取到了源片哪一刻"的信息（那时断言恒真）。
+ */
+const MUSIC_TRIMMED_SOURCE_IN = 75;
+/** 第二个片段放在第几帧，要和第一个错开不重叠。 */
+const MUSIC_TRIMMED_START_FRAME = 200;
+/** 整条时间轴（画面）长度，比配乐结束得晚，好让"之后是静音"有地方可量。 */
+const MUSIC_TOTAL_FRAMES = 300;
+/**
+ * 起始沿容差。
+ *
+ * 判据是"成片里的第一声 − 配乐被放的那一帧 == 配乐素材自己的第一声"，两边同口径，
+ * 所以容差可以收得和"导出没有移动音频"一样紧（5ms）。它要抓的是错一帧（33ms）和
+ * 栅格用错（29.97 与项目帧率的差会累积成上百毫秒），两者都远在容差之外。
+ */
+const MUSIC_ONSET_TOLERANCE = 0.005;
+
+/**
+ * 纯音频素材从导入到成片的整条链路。
+ *
+ * 这条护栏钉的是**静默失败**：配乐没进成片、或者进错了位置，导出侧一切正常
+ * （不抛错、泄漏为 0、帧数对得上），只有听才听得出来。三个真实的出错点是
+ * 排期用错帧栅格（`sourceGridFps`）、混流跳过它（`hasAudio`）、以及导出的逐帧
+ * 循环拿一个没有视频轨的文件去开解码游标。
+ *
+ * 画面素材刻意**不带音轨**（`withAudio:false`）：那样成片里的每一点声音都只能来自
+ * 配乐，"有没有信号"这个判据才是干净的。同「给音频断言做隔离」那条。
+ */
+async function verifyAudioOnlySource(): Promise<Check[]> {
+  const checks: Check[] = [];
+
+  const videoSample = await makeSampleVideo({
+    durationFrames: MUSIC_TOTAL_FRAMES,
+    withAudio: false,
+  });
+  // `beeps` 而不是 `tone`：连续音上"裁过入点的片段取错了内容"完全测不出来
+  const musicSample = await makeSampleAudio({ seconds: MUSIC_SECONDS, shape: "beeps" });
+  const video = (await probeAvFile(videoSample.file)).source;
+  const musicProbe = await probeFile(musicSample.file);
+  const music = musicProbe.source;
+
+  checks.push(
+    check(
+      "配乐：探针认出这是纯音频素材",
+      `kind:"audio" · ${musicSample.sampleRate}Hz · ${musicSample.channels} 声道`,
+      music.kind === "audio"
+        ? `kind:"audio" · ${music.sampleRate}Hz · ${music.channels} 声道`
+        : `kind:"${music.kind}"`,
+      music.kind === "audio" &&
+        music.sampleRate === musicSample.sampleRate &&
+        music.channels === musicSample.channels,
+    ),
+  );
+
+  // **走真正的编辑入口**，不手搓时间轴：那样"配乐落在哪条轨、长度按哪个帧率算"
+  // 也一起进了被测范围（手搓的话这两件事就是我自己写进去的答案）
+  const placedVideo = addSource(EMPTY_TIMELINE, { source: video, timelineIn: 0 });
+  const placed = addSource(placedVideo.timeline, {
+    source: music,
+    timelineIn: MUSIC_START_FRAME,
+  });
+  if (!placed.changed) throw new Error(`配乐自检放不下片段：${placed.reason ?? "未知原因"}`);
+
+  const expectedFrames = sourceDurationFrames(music, placed.timeline.fps);
+  // **第二个片段手搓**，因为它要有非零 `sourceIn`，而 `addSource` 只会整段放。
+  // 编辑入口本身由上面那次调用和 `operations.test.ts` 覆盖
+  const trimmed: Clip = {
+    id: "music-trimmed",
+    kind: "media",
+    sourceId: music.id,
+    name: "配乐（裁过入点）",
+    timelineIn: MUSIC_TRIMMED_START_FRAME,
+    timelineOut: MUSIC_TRIMMED_START_FRAME + expectedFrames - MUSIC_TRIMMED_SOURCE_IN,
+    sourceIn: MUSIC_TRIMMED_SOURCE_IN,
+  };
+  const timeline: Timeline = {
+    ...placed.timeline,
+    durationFrames: MUSIC_TOTAL_FRAMES,
+    tracks: placed.timeline.tracks.map((t) =>
+      t.id === "A1" ? { ...t, clips: [...t.clips, trimmed] } : t,
+    ),
+  };
+
+  const musicClip = timeline.tracks
+    .filter((t) => t.kind === "audio")
+    .flatMap((t) => t.clips.map((c) => ({ trackId: t.id, clip: c })))
+    .find((x) => x.clip.id === `${music.id}-a`);
+  checks.push(
+    check(
+      "配乐：落在第一条音频轨上，长度按项目帧率派生",
+      `A1 · ${expectedFrames} 帧`,
+      musicClip
+        ? `${musicClip.trackId} · ${musicClip.clip.timelineOut - musicClip.clip.timelineIn} 帧`
+        : "没放上去",
+      musicClip?.trackId === "A1" &&
+        musicClip.clip.timelineOut - musicClip.clip.timelineIn === expectedFrames,
+    ),
+  );
+  checks.push(
+    check(
+      "配乐：不产生画面片段（纯音频素材没有像素）",
+      "画面轨上只有那段视频",
+      `${timeline.tracks
+        .filter((t) => t.kind === "video")
+        .reduce((n, t) => n + t.clips.length, 0)} 个画面片段`,
+      timeline.tracks
+        .filter((t) => t.kind === "video")
+        .every((t) => t.clips.every((c) => c.kind === "media" && c.sourceId === video.id)),
+    ),
+  );
+
+  await removeExportFile(MUSIC_OUT);
+  const run = startExport(
+    {
+      timeline,
+      range: { inFrame: 0, outFrame: MUSIC_TOTAL_FRAMES },
+      container: "mp4",
+      videoBitrate: 4e6,
+      audioBitrate: 128e3,
+      includeAudio: true,
+      target: { kind: "opfs", name: MUSIC_OUT },
+      autoDownload: false,
+    },
+    () => undefined,
+  );
+  const done = await run.done;
+  if (!done) throw new Error("配乐自检的导出被取消");
+
+  const r = done.residency;
+  const leaked = r.leakedSamples + r.leakedCursors + r.leakedInputs;
+  checks.push(
+    check(
+      "配乐：导出没有为它开解码游标（泄漏为 0）",
+      "leaked 0",
+      `帧 ${r.leakedSamples} · 游标 ${r.leakedCursors} · Input ${r.leakedInputs}`,
+      leaked === 0,
+    ),
+  );
+
+  const file = await readExportFile(MUSIC_OUT);
+  const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(file) });
+  try {
+    const track = await input.getPrimaryAudioTrack();
+    // **不抛**：抛掉的话上面那几条读数一起丢，而"落在哪条轨、长度多少、泄漏多少"
+    // 正是查"为什么没进去"要看的东西。同「断言红了但没有诊断，等于只知道坏了」
+    if (!track) {
+      checks.push(check("配乐：成片里有音轨", true, false));
+      return checks;
+    }
+    const at = (frames: number) => frameToSeconds(frames, timeline.fps);
+    const audio = await decodeTrackToPcm(track, at(MUSIC_TOTAL_FRAMES) + 1);
+
+    // 素材自己那份 PCM——两侧的起始沿都拿它当参照
+    const srcInput = new Input({ formats: ALL_FORMATS, source: new BlobSource(musicSample.file) });
+    let srcAudio: { readonly pcm: Float32Array; readonly rate: number } | null = null;
+    try {
+      const srcTrack = await srcInput.getPrimaryAudioTrack();
+      if (srcTrack) srcAudio = await decodeTrackToPcm(srcTrack, MUSIC_SECONDS + 1);
+    } finally {
+      srcInput.dispose();
+    }
+
+    const startSeconds = at(MUSIC_START_FRAME);
+    const trimmedStart = at(MUSIC_TRIMMED_START_FRAME);
+    const peak = peakBetween(audio, startSeconds, trimmedStart);
+    checks.push(
+      check("配乐：成片里有声音", "峰值 > 0.2", peak.toFixed(4), peak > 0.2),
+    );
+
+    /**
+     * 两条起始沿断言共用的判据：**成片里的第一声 − 片段被放的位置 == 素材里
+     * 对应位置之后的第一声 − 那个位置**。两边同口径，所以编码器的 priming 和我
+     * 刻意留的静音前导都被约掉。
+     *
+     * 判据**必须是量出来的素材起始沿**，不能是理论上的帧号：素材是 AAC 编的、
+     * 自带约 48ms priming（2112/44100）。第一版拿理论值比，红了 67.9ms ≈
+     * 20（前导）+ 47.9（priming）——一个完全正确的产品被判成错。这正是
+     * "音画同步的两个操作数"那条记着的教训。
+     */
+    const onsetCheck = (
+      name: string,
+      placeSeconds: number,
+      sourceInSeconds: number,
+      searchFrom: number,
+    ): void => {
+      const out = firstOnsetAfter(audio, searchFrom);
+      const src = srcAudio === null ? null : firstOnsetAfter(srcAudio, sourceInSeconds);
+      const expected = src === null ? null : src - sourceInSeconds + placeSeconds;
+      const drift = out === null || expected === null ? null : out - expected;
+      checks.push(
+        check(
+          name,
+          `|Δ| < ${MUSIC_ONSET_TOLERANCE * 1000}ms`,
+          // **两个操作数都印出来**：只印差值时"素材那边量歪了"和"配乐真被挪了"
+          // 长得一模一样，而这两个的处置完全不同
+          `素材 ${src === null ? "?" : (src * 1000).toFixed(1)}ms` +
+            ` − 入点 ${(sourceInSeconds * 1000).toFixed(1)}ms` +
+            ` + 放置 ${(placeSeconds * 1000).toFixed(1)}ms` +
+            ` = 期望 ${expected === null ? "?" : (expected * 1000).toFixed(1)}ms` +
+            ` · 成片 ${out === null ? "整条静音" : `${(out * 1000).toFixed(1)}ms`}` +
+            ` · Δ ${drift === null ? "?" : (drift * 1000).toFixed(1)}ms`,
+          drift !== null && Math.abs(drift) < MUSIC_ONSET_TOLERANCE,
+        ),
+      );
+    };
+
+    // 整段放进来的那个：钉"配乐落在第几帧"。**只判"有信号"的话把它整体挪半秒
+    // 仍然全绿**——同 D34 那条"按起始沿对齐会把整体平移原样吸收掉"的教训。
+    // 顺带也钉住了"它之前是静音"：之前若有杂音，第一声会更早
+    onsetCheck("配乐：第一声落在它被放的那一帧上", startSeconds, 0, 0);
+    // 裁过入点的那个：钉**帧栅格换算**。取样起点落在两声之间的静音里，见
+    // `MUSIC_TRIMMED_SOURCE_IN`
+    onsetCheck(
+      "配乐：裁过入点的片段取到源片正确的位置（栅格换算）",
+      trimmedStart,
+      MUSIC_TRIMMED_SOURCE_IN / toNumber(timeline.fps),
+      trimmedStart,
+    );
+
+    // 尾巴钉一头：一段"一直响到底"的成片同样能通过上面两条
+    const tailFrom = MUSIC_TRIMMED_START_FRAME + expectedFrames - MUSIC_TRIMMED_SOURCE_IN;
+    const after = peakBetween(audio, at(tailFrom) + 0.1, at(MUSIC_TOTAL_FRAMES));
+    checks.push(
+      check("配乐：结束之后是静音", "峰值 < 0.02", after.toFixed(4), after < 0.02),
+    );
+  } finally {
+    input.dispose();
+  }
+  await removeExportFile(MUSIC_OUT);
+
+  return checks;
 }
 
 // ---------------------------------------------------------------------------
@@ -601,7 +863,7 @@ async function verifyVolume(timeline: Timeline, total: number): Promise<Check[]>
  */
 const RESIDENCY_SEGMENT_SECONDS = 2;
 
-async function verifyMixResidency(source: MediaSource, clipFrames: number): Promise<Check[]> {
+async function verifyMixResidency(source: AvSource, clipFrames: number): Promise<Check[]> {
   const build = (count: number): Timeline => ({
     fps: source.fps,
     width: source.width,
@@ -922,8 +1184,8 @@ async function verifyCrossfade(): Promise<Check[]> {
     audioShape: "tone",
   });
   const muteSample = await makeSampleVideo({ durationFrames: SEG, withAudio: false });
-  const tone = (await probeFile(toneSample.file)).source;
-  const mute = (await probeFile(muteSample.file)).source;
+  const tone = (await probeAvFile(toneSample.file)).source;
+  const mute = (await probeAvFile(muteSample.file)).source;
 
   const xfade = { kind: "xfade-power", frames: XFADE_FRAMES } as const;
   const timeline: Timeline = {
@@ -1130,6 +1392,27 @@ function rmsAround(
     count++;
   }
   return count === 0 ? 0 : Math.sqrt(sum / count);
+}
+
+/**
+ * 一段区间里的最大绝对值。
+ *
+ * 稀疏提示音上**不能用 RMS**：40ms 的窗口很可能整个落在两声之间的静音里，那时
+ * "有没有声音"这个判据会在正确的成片上给出 0。峰值对占空比免疫。
+ */
+function peakBetween(
+  audio: { readonly pcm: Float32Array; readonly rate: number },
+  fromSeconds: number,
+  toSeconds: number,
+): number {
+  const from = Math.max(0, Math.round(fromSeconds * audio.rate));
+  const to = Math.min(audio.pcm.length, Math.round(toSeconds * audio.rate));
+  let peak = 0;
+  for (let i = from; i < to; i++) {
+    const v = Math.abs(audio.pcm[i]!);
+    if (v > peak) peak = v;
+  }
+  return peak;
 }
 
 /** 高于这个绝对值就算"响了"。测试素材的提示音幅度 0.25，静音段是精确的 0。 */

@@ -25,6 +25,9 @@ import {
   clipAt,
   findLut,
   findSource,
+  sourceDurationFrames,
+  sourceGridFps,
+  type AvSource,
   type Clip,
   type MediaClip,
   type LutSource,
@@ -95,7 +98,14 @@ export interface VisibleMediaClip {
   readonly kind: "media";
   readonly trackId: string;
   readonly clip: MediaClip;
-  readonly source: MediaSource;
+  /**
+   * **只可能是带画面的素材。** 纯音频素材没有像素，被 `visibleFor` 挡在外面。
+   *
+   * 写成 `AvSource` 而不是 `MediaSource`，好处是下游（预览的 video 元素池、导出的
+   * 解码游标、合成器）读 `source.fps` / `source.width` 不必再判一次——那个判断
+   * 一旦散开就一定会有一处漏掉，而漏掉的表现是 `undefined` 一路流到解码器。
+   */
+  readonly source: AvSource;
   /** 该帧对应的源片时刻（整数微秒）。 */
   readonly sourceMicros: number;
   /**
@@ -326,6 +336,10 @@ function visibleFor(
   }
   const source = timeline.sources.find((s) => s.id === clip.sourceId);
   if (!source) return null;
+  // 纯音频素材没有像素，跳过它**就是**正确语义，不是"静默丢了一层"——没有 UI
+  // 能把它放到画面轨上（`moveClip` 不许跨轨道种类拖，`addSource` 按种类放），
+  // 所以这一行实际拦不到东西，留着是防将来新的编辑入口忘了分种类
+  if (source.kind !== "av") return null;
   return {
     kind: "media",
     trackId: track.id,
@@ -354,9 +368,28 @@ export function renderSourceMicros(
   source: MediaSource,
   inTransition: boolean,
 ): number {
-  const raw = sourceMicrosAt(clip, frame, timeline.fps, source.fps);
+  const grid = sourceGridFps(source, timeline.fps);
+  const raw = sourceMicrosAt(clip, frame, timeline.fps, grid);
   if (!inTransition) return raw;
-  return clampSourceMicros(raw, frameToMicros(source.durationFrames - 1, source.fps));
+  return clampSourceMicros(
+    raw,
+    frameToMicros(sourceDurationFrames(source, timeline.fps) - 1, grid),
+  );
+}
+
+/**
+ * 某一帧要混的一层声音。
+ *
+ * **不复用 `VisibleMediaClip`**：那个的 `source` 是 `AvSource`（图层必须有像素），
+ * 而声音这边恰恰相反——配乐就是纯音频素材。合成一个类型就得把 `source` 放宽成
+ * `MediaSource`，于是画面侧又要重新判一次"这个素材有没有画面"。
+ */
+export interface AudibleClip {
+  readonly trackId: string;
+  readonly clip: MediaClip;
+  readonly source: MediaSource;
+  /** 该帧对应的源片时刻（整数微秒）。 */
+  readonly sourceMicros: number;
 }
 
 /**
@@ -365,19 +398,23 @@ export function renderSourceMicros(
  * 文字片段没有声音，落到音频轨上也直接跳过——不变量是"轨道只管画面/声音的通道，
  * 片段类型由 `clip.kind` 定"，所以这个组合虽然没有 UI 能造出来，类型上仍然合法。
  */
-export function audioClipsAt(timeline: Timeline, frame: number): VisibleMediaClip[] {
-  const out: VisibleMediaClip[] = [];
+export function audioClipsAt(timeline: Timeline, frame: number): AudibleClip[] {
+  const out: AudibleClip[] = [];
   for (const track of timeline.tracks) {
     if (track.kind !== "audio" || track.muted) continue;
     const clip = clipAt(track, frame);
     if (!clip || clip.kind !== "media") continue;
     const source = findSource(timeline, clip.sourceId);
     out.push({
-      kind: "media",
       trackId: track.id,
       clip,
       source,
-      sourceMicros: sourceMicrosAt(clip, frame, timeline.fps, source.fps),
+      sourceMicros: sourceMicrosAt(
+        clip,
+        frame,
+        timeline.fps,
+        sourceGridFps(source, timeline.fps),
+      ),
     });
   }
   return out;

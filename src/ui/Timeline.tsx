@@ -9,7 +9,14 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
-import { clipDuration, type Clip, type Timeline as Tl, type Track, type TrackId } from "../edl/types";
+import {
+  clipDuration,
+  sourceGridFps,
+  type Clip,
+  type Timeline as Tl,
+  type Track,
+  type TrackId,
+} from "../edl/types";
 import { trackTransitionWindows } from "../edl/transition";
 import { TRANSITION_LABELS } from "../state/operations";
 import { framesToTimecode, secondsToFrameCount } from "../time/timebase";
@@ -629,9 +636,10 @@ function ClipView({
   const keyframes = clip.keyframes;
   const hasVolume = volumeBase !== undefined || (keyframes?.volume?.length ?? 0) > 0;
 
-  // 缩略图只画素材片段，且只在代理就绪后——从原片抽帧比转一遍代理还慢
+  // 缩略图只画素材片段，且只在代理就绪后——从原片抽帧比转一遍代理还慢。
+  // 纯音频素材没有画面也没有代理，`source.kind` 这一判同时给出类型收窄
   useEffect(() => {
-    if (kind !== "video" || !source) return;
+    if (kind !== "video" || source?.kind !== "av") return;
     const canvas = stripRef.current;
     if (!canvas || widthPx < 24) return;
 
@@ -698,8 +706,10 @@ function ClipView({
         drawWaveform(ctx, wave, {
           widthPx,
           heightPx: WAVE_HEIGHT,
-          // 源片时刻按**源片自己的帧率**换算；时间轴帧率换算的是片段有多长
-          sourceInSeconds: sourceInFrame / toNumber(source.fps),
+          // 源片时刻按**源片自己的栅格**换算；时间轴帧率换算的是片段有多长。
+          // 纯音频素材没有自己的帧率，栅格就是项目帧率（见 `sourceGridFps`），
+          // 两者混用不报错，只表现成波形整体拉伸
+          sourceInSeconds: sourceInFrame / toNumber(sourceGridFps(source, timeline.fps)),
           lengthSeconds: length / toNumber(timeline.fps),
           color: WAVE_COLOR,
         });

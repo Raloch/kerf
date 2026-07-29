@@ -13,7 +13,7 @@ import { useTimeline } from "../state/timeline-store";
 // 只要类型：`project-store` 本身走动态 import，别把 IndexedDB 那一层拖进首屏
 import type { StoredProject } from "../state/project-store";
 import { findClip } from "../state/operations";
-import { clipDuration } from "../edl/types";
+import { clipDuration, sourceDurationFrames } from "../edl/types";
 import { formatDuration, framesToTimecode } from "../time/timebase";
 import { formatFps } from "../time/rational";
 import { Inspector } from "./Inspector";
@@ -39,7 +39,7 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
   const selectedClipId = useTimeline((s) => s.selectedClipId);
   const lastRejection = useTimeline((s) => s.lastRejection);
   const dragHint = useTimeline((s) => s.dragHint);
-  const loadSource = useTimeline((s) => s.loadSource);
+  const addSource = useTimeline((s) => s.addSource);
   const restoreProject = useTimeline((s) => s.restoreProject);
   const setPlayhead = useTimeline((s) => s.setPlayhead);
   const undo = useTimeline((s) => s.undo);
@@ -181,14 +181,14 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
       try {
         const { probeFile, wasFpsSnapped } = await import("../media/probe");
         const result = await probeFile(file);
-        loadSource(result.source);
+        addSource(result.source);
         // 素材文件单独收进资产库，**导入时一次**——快照每次编辑都重写，把几百 MB
         // 的 File 混在里面会让自动存盘变成最慢的那一步（见 `project-store.ts`）
         void import("../state/project-store").then(({ putSourceAsset }) =>
           putSourceAsset(result.source),
         );
         void proxyManager.request(result.source);
-        if (wasFpsSnapped(result)) {
+        if (wasFpsSnapped(result) && result.source.kind === "av" && result.rawFps !== null) {
           // 帧率被吸附过要告知：它决定了后续所有帧运算
           setBusy(
             `已把探测帧率 ${result.rawFps.toFixed(4)} 吸附为 ${formatFps(result.source.fps)}`,
@@ -202,7 +202,7 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
         setError(e instanceof Error ? e.message : String(e));
       }
     },
-    [loadSource],
+    [addSource],
   );
 
   // 编辑相关快捷键。空格（播放/暂停）由 Preview 自己接，它持有播放状态
@@ -359,19 +359,34 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
           </div>
           <div className="pane-body">
             {timeline.sources.length === 0 ? (
-              <p className="empty">还没有素材。导入一个视频文件开始，或用顶栏的「M0 自检」生成测试素材。</p>
+              <p className="empty">
+                还没有素材。导入一个视频或音频文件开始，或用顶栏的「M0 自检」生成测试素材。
+              </p>
             ) : (
               <div className="assets">
                 {timeline.sources.map((source) => (
                   <button type="button" className="asset" key={source.id} title={source.name}>
-                    <span className="thumb">
-                      <IconFilm />
-                    </span>
+                    <span className="thumb">{source.kind === "av" ? <IconFilm /> : <IconWave />}</span>
                     <span>
                       <span className="nm">{source.name}</span>
                       <span className="meta">
-                        {source.width}×{source.height} · {formatFps(source.fps)} ·{" "}
-                        {formatDuration(source.durationFrames, source.fps)}
+                        {source.kind === "av" ? (
+                          <>
+                            {source.width}×{source.height} · {formatFps(source.fps)} ·{" "}
+                            {formatDuration(source.durationFrames, source.fps)}
+                          </>
+                        ) : (
+                          // 纯音频素材按项目帧率数帧（它没有自己的栅格，见 `sourceGridFps`），
+                          // 所以时长要用同一个帧率格式化，否则显示的秒数和时间轴上的占位不一致
+                          <>
+                            {(source.sampleRate / 1000).toFixed(1)}kHz ·{" "}
+                            {source.channels === 1 ? "单声道" : `${source.channels} 声道`} ·{" "}
+                            {formatDuration(
+                              sourceDurationFrames(source, timeline.fps),
+                              timeline.fps,
+                            )}
+                          </>
+                        )}
                       </span>
                       <ProxyBadge info={proxies[source.id]} />
                     </span>
@@ -386,7 +401,9 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
               导入素材
               <input
                 type="file"
-                accept="video/*"
+                // 音频也收：配乐和旁白是纯音频文件，而混流、波形、音量包络、
+                // 交叉淡化早就都能用了，此前缺的只有这个入口（见 `probeFile`）
+                accept="video/*,audio/*"
                 onChange={(e) => {
                   const file = e.target.files?.[0];
                   if (file) void importFile(file);

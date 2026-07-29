@@ -19,7 +19,7 @@
  * 用户一个"听起来对但实际不对"的预览。多轨音频预览要等独立的音频引擎。
  */
 
-import type { MediaSource, Timeline } from "../edl/types";
+import type { AvSource, Timeline } from "../edl/types";
 import { microsToSeconds, visibleVideoClips, type VisibleClip } from "../edl/sampling";
 import { createCompositor, type CompositorBackend } from "../compose/backend";
 import type { ComposeLayer, ComposeSourceLayer, Compositor } from "../compose/compositor";
@@ -41,7 +41,8 @@ const MAX_VIDEO_HANDLES = 6;
 
 /** 这一帧要对齐的一个 video 元素。`clipId` 是索引键，见 `handleFor`。 */
 interface ActiveSource {
-  readonly source: MediaSource;
+  /** 只可能是带画面的素材——它来自 `visibleVideoClips`，那里已经挡掉了纯音频素材。 */
+  readonly source: AvSource;
   readonly clipId: string;
   readonly seekSeconds: number;
 }
@@ -142,7 +143,7 @@ export async function createPreviewEngine(
    *
    * 代价是元素数量随片段数增长，所以配一个 LRU（见 `MAX_VIDEO_HANDLES`）。
    */
-  function handleFor(source: MediaSource, clipId: string): SourceHandle {
+  function handleFor(source: AvSource, clipId: string): SourceHandle {
     const existing = handles.get(clipId);
     if (existing) {
       // Map 保持插入序，删了再塞就是"移到最近使用"

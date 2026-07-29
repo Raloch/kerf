@@ -21,6 +21,7 @@ import {
 } from "./sampling";
 import {
   toSourceFrame,
+  type AvSource,
   type MediaClip,
   type MediaSource,
   type TextClip,
@@ -49,8 +50,9 @@ const textClip = (over: Partial<TextClip> = {}): TextClip => ({
   ...over,
 });
 
-const source = (over: Partial<MediaSource> = {}): MediaSource => ({
+const source = (over: Partial<AvSource> = {}): AvSource => ({
   id: "s1",
+  kind: "av",
   name: "a.mp4",
   file: new File([], "a.mp4"),
   fps: FPS.ntsc30,

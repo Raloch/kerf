@@ -190,6 +190,9 @@ export class VideoTrackReader {
   private async openCursor(clip: MediaClip): Promise<ClipCursor | null> {
     const source = this.timeline.sources.find((s) => s.id === clip.sourceId);
     if (!source) return null;
+    // 纯音频素材没有视频轨。这条和下面那道 `!videoTrack` 检查不重复：这一道在
+    // **借 Input 之前**就退出，否则每一帧都会借一次再还一次，白开 demuxer
+    if (source.kind !== "av") return null;
 
     const input = this.borrowInput(source.id, source.file);
     const videoTrack = await input.getPrimaryVideoTrack();

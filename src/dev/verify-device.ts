@@ -48,9 +48,9 @@ import { createCompositor } from "../compose/backend";
 import type { Compositor } from "../compose/compositor";
 import { startExport, type ExportHandle } from "../export/client";
 import type { ExportDone } from "../export/protocol";
-import { probeFile } from "../media/probe";
+import { probeAvFile } from "../media/probe";
 import { canPickSaveFile, readExportFile, removeExportFile } from "../export/write-target";
-import { singleClipTimeline, type MediaSource, type Timeline } from "../edl/types";
+import { singleClipTimeline, type AvSource, type Timeline } from "../edl/types";
 import { makeSampleVideo } from "./make-sample";
 
 const JOURNAL_KEY = "kerf.device-report.v1";
@@ -404,7 +404,7 @@ export async function runDeviceReport(
     durationFrames: LADDER_FRAMES,
     withAudio: true,
   });
-  const probe = await probeFile(sample.file);
+  const probe = await probeAvFile(sample.file);
 
   const ladder: LadderResult[] = [];
   for (const step of LADDER) {
@@ -612,7 +612,7 @@ export async function runLengthReport(
     durationFrames: LENGTH_CLIP_FRAMES,
     withAudio: true,
   });
-  const probe = await probeFile(sample.file);
+  const probe = await probeAvFile(sample.file);
   const source = probe.source;
   const fps = source.fps.num / source.fps.den;
   const cap = options?.maxSeconds ?? Number.POSITIVE_INFINITY;
@@ -919,7 +919,7 @@ function watchForStall(
 }
 
 /** 把同一个源片接成 `clips` 个首尾相连的片段，画面轨和音频轨各一条。 */
-function buildLongTimeline(source: MediaSource, clips: number): Timeline {
+function buildLongTimeline(source: AvSource, clips: number): Timeline {
   const make = (prefix: string) =>
     Array.from({ length: clips }, (_, i) => ({
       id: `${prefix}${i}`,

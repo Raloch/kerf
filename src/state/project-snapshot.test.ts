@@ -25,6 +25,7 @@ import {
 function source(id: string, durationFrames = 1000): MediaSource {
   return {
     id,
+    kind: "av",
     name: `${id}.mp4`,
     file: new File([`${id}`], `${id}.mp4`),
     fps: FPS.ndf2997,
@@ -107,8 +108,10 @@ describe("快照往返", () => {
     // 这两条是这一层存在的理由：文件和查表数据单独存，快照才能随便重写
     expect(snap.timeline.sources[0]).not.toHaveProperty("file");
     expect(snap.timeline.luts?.[0]).not.toHaveProperty("rgb");
-    // 元信息要全带上，否则恢复时得重新探针一遍
-    expect(snap.timeline.sources[0]?.durationFrames).toBe(1000);
+    // 元信息要全带上，否则恢复时得重新探针一遍。这一条顺带钉住 `SourceMeta` 是
+    // **分配式** Omit——塌成"联合共有字段"时这里根本读不到 durationFrames
+    const meta = snap.timeline.sources[0];
+    expect(meta?.kind === "av" && meta.durationFrames).toBe(1000);
     expect(snap.timeline.luts?.[0]?.size).toBe(5);
   });
 

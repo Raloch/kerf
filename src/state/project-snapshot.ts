@@ -46,10 +46,19 @@ import { withNormalizedTracks } from "./operations";
  * 合成器里才炸，而那时早已看不出是快照的问题。版本不认就当没有存过（见
  * `readSnapshot` 的调用方），代价是丢一次未保存的编辑，比恢复出一个半坏的项目好。
  */
-export const SNAPSHOT_VERSION = 2;
+export const SNAPSHOT_VERSION = 3;
 
-/** 素材在快照里的样子：除 `file` 之外的一切。文件本身单独存一份，见 `project-store.ts`。 */
-export type SourceMeta = Omit<MediaSource, "file">;
+/**
+ * 素材在快照里的样子：除 `file` 之外的一切。文件本身单独存一份，见 `project-store.ts`。
+ *
+ * **必须是分配式的 `Omit`。** `MediaSource` 是判别联合，而 `Omit<A | B, K>` 会先把
+ * 联合塌成"两边共有的字段"再去掉 K——于是 `SourceMeta` 里只剩 id / name / kind /
+ * hasAudio / audioCodec，帧率、尺寸、时长全部消失。存的时候不报错（多余字段照样
+ * 写进 IndexedDB），读回来拼 `{...meta, file}` 才编译不过；真正坏的形态是它**编译
+ * 得过**的那一天——快照少一半字段，恢复出来的素材没有时长。
+ */
+type DistributiveOmit<T, K extends keyof never> = T extends unknown ? Omit<T, K> : never;
+export type SourceMeta = DistributiveOmit<MediaSource, "file">;
 /** LUT 在快照里的样子：除查表数据之外的一切。 */
 export type LutMeta = Omit<LutSource, "rgb">;
 /**

@@ -35,6 +35,7 @@ import { clipRenderSpan, trackTransitionWindows } from "../edl/transition";
 import { microsToSeconds, sourceMicrosAt } from "../edl/sampling";
 import {
   isAudioTransition,
+  sourceGridFps,
   type ClipId,
   type RenderRange,
   type SourceId,
@@ -247,6 +248,8 @@ export function planAudioJobs(timeline: Timeline, range: RenderRange): AudioJob[
       if (clip.kind !== "media") continue;
       const source = timeline.sources.find((s) => s.id === clip.sourceId);
       if (!source || !source.hasAudio) continue;
+      // 纯音频素材没有自己的帧栅格，`sourceIn` 按项目帧率算，见 `sourceGridFps()`
+      const grid = sourceGridFps(source, timeline.fps);
 
       // 占位向两侧转场借出的部分要一起解，否则淡化只淡了一半
       const span = clipRenderSpan(track.clips, clip);
@@ -307,12 +310,8 @@ export function planAudioJobs(timeline: Timeline, range: RenderRange): AudioJob[
         clipId: clip.id,
         sourceId: clip.sourceId,
         whenSeconds: seconds(firstFrame - range.inFrame),
-        srcStartSeconds: microsToSeconds(
-          sourceMicrosAt(clip, firstFrame, timeline.fps, source.fps),
-        ),
-        srcEndSeconds: microsToSeconds(
-          sourceMicrosAt(clip, lastFrame, timeline.fps, source.fps),
-        ),
+        srcStartSeconds: microsToSeconds(sourceMicrosAt(clip, firstFrame, timeline.fps, grid)),
+        srcEndSeconds: microsToSeconds(sourceMicrosAt(clip, lastFrame, timeline.fps, grid)),
         baseGain,
         ramps,
         volume: clip.volume ?? 1,

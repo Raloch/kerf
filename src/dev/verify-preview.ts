@@ -26,7 +26,7 @@
 
 import { ALL_FORMATS, BlobSource, Input, VideoSampleSink } from "mediabunny";
 import { makeSampleVideo } from "./make-sample";
-import { probeFile } from "../media/probe";
+import { probeAvFile } from "../media/probe";
 import { runExport } from "../export/pipeline";
 import { readExportFile, removeExportFile } from "../export/write-target";
 import { createPreviewEngine } from "../preview/preview-engine";
@@ -233,7 +233,7 @@ export async function verifyPreviewMatchesExport(): Promise<PreviewVerifyResult>
 
   // ---- 准备素材与 EDL ----
   const sample = await makeSampleVideo({ durationFrames: 300, withAudio: false });
-  const probe = await probeFile(sample.file);
+  const probe = await probeAvFile(sample.file);
   const timeline = {
     ...singleClipTimeline(probe.source),
     width: OUT_SIZE,

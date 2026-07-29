@@ -17,12 +17,13 @@ import {
   type ProxyWorkerRequest,
   type ProxyWorkerResponse,
 } from "./proxy";
-import type { MediaSource } from "../edl/types";
+import type { AvSource, MediaSource } from "../edl/types";
 
 export type ProxyListener = (sourceId: string, info: ProxyInfo) => void;
 
 interface Job {
-  readonly source: MediaSource;
+  /** 纯音频素材不进队列，所以这里恒为带画面的素材（`request()` 挡在门口）。 */
+  readonly source: AvSource;
   readonly key: string;
 }
 
@@ -49,8 +50,16 @@ export class ProxyManager {
     for (const listener of this.listeners) listener(sourceId, info);
   }
 
-  /** 请求为某素材准备代理。已就绪或在队列里则无操作。 */
+  /**
+   * 请求为某素材准备代理。已就绪或在队列里则无操作。
+   *
+   * **纯音频素材直接返回。** 代理只服务预览的画面 seek，而它的转码配置正好把音轨
+   * 整个丢掉（`proxy.worker.ts` 的 `audio: { discard: true }`）——给一个只有声音的
+   * 文件转代理，产出的是一个空文件。挡在这一处而不是每个调用点各判一次：调用点
+   * 漏判不会报错，只会让素材面板上挂一个永远转不完的进度条。
+   */
   async request(source: MediaSource): Promise<void> {
+    if (source.kind !== "av") return;
     const current = this.infos.get(source.id);
     if (current && current.status !== "none" && current.status !== "failed") return;
 
