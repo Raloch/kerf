@@ -8,14 +8,28 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  GLITCH_BLOCKS,
+  GLITCH_SHIFT,
+  GLITCH_WINDOW,
+  hashUnit,
   isShaderTransition,
   mixTransition,
+  pcgHash,
   SHADER_TRANSITION_KINDS,
   TRANSITION_CODES,
   TRANSITION_FEATHER,
   TRANSITION_FRAGMENT,
   type Rgba,
 } from "./transition-shader";
+
+/**
+ * 剥掉行注释之后的 GLSL 源码。
+ *
+ * "GLSL 里不许出现 X" 这类断言必须看**代码**：第一版直接搜整份源码，结果被
+ * shader 里那句「不要换回 fract(sin(x)*43758.5453)」的注释命中——一条警告不要
+ * 用它的注释，被当成了用了它。同 CLAUDE.md 那条"先确认量法量的是被测对象"。
+ */
+const GLSL_CODE = TRANSITION_FRAGMENT.replace(/\/\/[^\n]*/g, "");
 
 const FROM: Rgba = { r: 1, g: 0, b: 0, a: 1 };
 const TO: Rgba = { r: 0, g: 0, b: 1, a: 1 };
@@ -173,6 +187,161 @@ describe("shader 与参照实现的对应", () => {
 
   it("羽化宽度只有一个来源——GLSL 从 uniform 读，不写死", () => {
     expect(TRANSITION_FRAGMENT).toContain("uFeather");
-    expect(TRANSITION_FRAGMENT).not.toContain(String(TRANSITION_FEATHER));
+    expect(GLSL_CODE).not.toContain(String(TRANSITION_FEATHER));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 故障
+// ---------------------------------------------------------------------------
+
+/** 两层各自是横向渐变，于是"取到了哪一列"能从颜色读出来。 */
+const glitchAt = (u: number, v: number, t: number) =>
+  mixTransition("glitch", FROM, TO, u, v, t, {
+    from: (su) => ramp(FROM)(su),
+    to: (su) => ramp(TO)(su),
+  });
+
+/** 这一点取的是入场层吗（渐变图的 r 通道区分两层）。 */
+const tookTo = (u: number, v: number, t: number) => glitchAt(u, v, t).r === 0;
+
+describe("PCG 整数哈希", () => {
+  it("是纯函数，同一个输入恒定给同一个值", () => {
+    expect(pcgHash(0)).toBe(pcgHash(0));
+    expect(pcgHash(12345)).toBe(pcgHash(12345));
+  });
+
+  it("输出落在 uint32 范围内——每一步都拉回无符号", () => {
+    // 少一个 `>>> 0` 的表现是符号位泄漏进后续移位，只影响一部分输入，
+    // 画面上"随机得挺像"，只有和 GPU 对拍才发现
+    for (let i = 0; i < 64; i++) {
+      const h = pcgHash(i);
+      expect(Number.isInteger(h)).toBe(true);
+      expect(h).toBeGreaterThanOrEqual(0);
+      expect(h).toBeLessThanOrEqual(0xffffffff);
+    }
+  });
+
+  it("相邻输入给出不相关的输出——这是它能当「随机」用的前提", () => {
+    // 顺带挡住"哈希退化成恒等/线性"这类改坏：那时相邻带的翻转时刻会单调排列，
+    // 故障就变成了一道从上往下的擦除
+    const units = Array.from({ length: GLITCH_BLOCKS }, (_, i) => hashUnit(pcgHash(i)));
+    expect(new Set(units).size).toBe(GLITCH_BLOCKS);
+    const sorted = [...units].sort((a, b) => a - b);
+    expect(units).not.toEqual(sorted);
+    expect(units).not.toEqual([...sorted].reverse());
+  });
+
+  it("归一化落在 [0,1)，且只用高 24 位（两边才逐位相同）", () => {
+    for (let i = 0; i < 64; i++) {
+      const unit = hashUnit(pcgHash(i));
+      expect(unit).toBeGreaterThanOrEqual(0);
+      expect(unit).toBeLessThan(1);
+      // 24 位定点：乘 2²⁴ 必须是整数，否则说明用了低位、GPU 那边会多一次舍入
+      expect(Number.isInteger(unit * 16777216)).toBe(true);
+    }
+  });
+});
+
+describe("故障效果", () => {
+  it("t=0 时整屏是纯的出场层，而且不位移", () => {
+    // 位移不归零的表现是转场第一帧画面突然错位一下（同 wipeEdge 那条）
+    for (let band = 0; band < GLITCH_BLOCKS; band++) {
+      const v = (band + 0.5) / GLITCH_BLOCKS;
+      expect(tookTo(0.42, v, 0)).toBe(false);
+      expect(glitchAt(0.42, v, 0).g).toBeCloseTo(0.42, 9);
+    }
+  });
+
+  it("t=1 时整屏是纯的入场层，而且不位移", () => {
+    for (let band = 0; band < GLITCH_BLOCKS; band++) {
+      const v = (band + 0.5) / GLITCH_BLOCKS;
+      expect(tookTo(0.42, v, 1)).toBe(true);
+      expect(glitchAt(0.42, v, 1).g).toBeCloseTo(0.42, 9);
+    }
+  });
+
+  it("中途各条带进度不同——这正是「故障」的样子", () => {
+    // 全部同时翻转就退化成硬切了。取 t=0.5 时应当两种带都有
+    const took = Array.from({ length: GLITCH_BLOCKS }, (_, band) =>
+      tookTo(0.5, (band + 0.5) / GLITCH_BLOCKS, 0.5),
+    );
+    expect(took).toContain(true);
+    expect(took).toContain(false);
+  });
+
+  it("同一条带内所有 v 的行为一致，跨带才变", () => {
+    // 带号用 floor(v * BLOCKS)：算错成 round 会让带边界偏半条
+    const inBand = [0.001, 0.03, 0.062];
+    const first = tookTo(0.5, inBand[0]!, 0.5);
+    for (const v of inBand) expect(tookTo(0.5, v, 0.5)).toBe(first);
+  });
+
+  it("窗口中点附近位移最大，两端为 0", () => {
+    // 找一条带，量它自己窗口内的位移。翻转时刻 = hashUnit(hash(band))*(1-window)
+    const band = 3;
+    const v = (band + 0.5) / GLITCH_BLOCKS;
+    const flipAt = hashUnit(pcgHash(band)) * (1 - GLITCH_WINDOW);
+    const shiftAt = (local: number) => glitchAt(0.5, v, flipAt + local * GLITCH_WINDOW).g - 0.5;
+
+    expect(Math.abs(shiftAt(0))).toBeCloseTo(0, 9);
+    expect(Math.abs(shiftAt(1))).toBeCloseTo(0, 9);
+    // 中点幅度 = GLITCH_SHIFT × |dir|
+    const dir = hashUnit(pcgHash(band + 9781)) * 2 - 1;
+    expect(shiftAt(0.5)).toBeCloseTo(GLITCH_SHIFT * dir, 9);
+  });
+
+  it("位移夹在 [0,1]，不会取到纹理外", () => {
+    // 夹到边缘而不是取透明：越界取透明会在每条带两侧留黑边
+    for (let band = 0; band < GLITCH_BLOCKS; band++) {
+      const v = (band + 0.5) / GLITCH_BLOCKS;
+      for (const t of [0.2, 0.4, 0.5, 0.6, 0.8]) {
+        for (const u of [0, 0.01, 0.99, 1]) {
+          const g = glitchAt(u, v, t).g;
+          expect(g).toBeGreaterThanOrEqual(0);
+          expect(g).toBeLessThanOrEqual(1);
+        }
+      }
+    }
+  });
+
+  it("v 超出 [0,1] 时不会算出负的带号", () => {
+    // 浮点误差让 v 落到 -1e-9 时，floor(v*16) = -1 → 哈希输入变成 2³²-1，
+    // 那一行于是取一条完全不同的带（表现是画面最上/最下一行闪一下）
+    expect(() => glitchAt(0.5, -0.001, 0.5)).not.toThrow();
+    expect(tookTo(0.5, -0.001, 0.5)).toBe(tookTo(0.5, 0.001, 0.5));
+    expect(tookTo(0.5, 1.001, 0.5)).toBe(tookTo(0.5, 0.999, 0.5));
+  });
+});
+
+describe("故障的 GLSL 与参照实现对应", () => {
+  it("哈希在 GLSL 里是整数运算，没有 sin", () => {
+    // 换回 fract(sin(x)*43758.5453) 就会让 GPU-vs-CPU 断言失去意义
+    expect(GLSL_CODE).toContain("747796405u");
+    expect(GLSL_CODE).toContain("277803737u");
+    expect(GLSL_CODE).not.toContain("sin(");
+    expect(GLSL_CODE).not.toContain("43758");
+  });
+
+  it("归一化只取高 24 位", () => {
+    expect(TRANSITION_FRAGMENT).toContain("h >> 8u");
+    expect(TRANSITION_FRAGMENT).toContain("16777216.0");
+    expect(GLSL_CODE).not.toContain("4294967296.0");
+  });
+
+  it("三个故障常量都从 uniform 读，不写死", () => {
+    for (const name of ["uBlocks", "uWindow", "uShift"]) {
+      expect(TRANSITION_FRAGMENT).toContain(name);
+    }
+    expect(GLSL_CODE).not.toContain(String(GLITCH_SHIFT));
+    expect(GLSL_CODE).not.toContain(String(GLITCH_WINDOW));
+  });
+
+  it("幅度用抛物线，不用 sin", () => {
+    expect(TRANSITION_FRAGMENT).toContain("4.0 * local * (1.0 - local)");
+  });
+
+  it("有 effect == 3 这条分支", () => {
+    expect(TRANSITION_FRAGMENT).toContain("effect == 3");
   });
 });

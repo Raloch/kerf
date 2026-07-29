@@ -842,6 +842,7 @@ export const TRANSITION_LABELS: Record<TransitionKind, string> = {
   wipe: "线性擦除",
   iris: "圆形张开",
   slide: "推移",
+  glitch: "故障",
   // 「交叉淡化」这四个字由分组标题和添加按钮给足了上下文，下拉里只留区分点——
   // 写全名是 9 个字，实测把 112px 的下拉撑到 124px 并截断（画面那组都是 4 个字）
   "xfade-power": "等功率淡化",
@@ -855,7 +856,7 @@ export const TRANSITION_LABELS: Record<TransitionKind, string> = {
  * "两段不同的声音"是对的，而那是绝大多数剪辑点（见 `audio/crossfade.ts`）。
  */
 export const TRANSITION_ORDER: Record<TrackKind, readonly TransitionKind[]> = {
-  video: ["dissolve", "wipe", "iris", "slide"],
+  video: ["dissolve", "wipe", "iris", "slide", "glitch"],
   audio: ["xfade-power", "xfade-linear"],
 };
 

@@ -508,14 +508,38 @@ export async function verifyPixiBackend(): Promise<PixiVerifyResult> {
   // 上面两条会因为参照实现也被同一个 kind 驱动而**一起错、于是一起绿**——
   // 不，参照是按用例自己的 kind 算的，所以那种情况上面会红。这一条兜的是另一头：
   // 三个分支恰好在取样点上给出同一个值，那说明取样点选得没有区分力
+  //
+  // **故障不进这一条**：它合法地会输出"纯的某一层"，于是完全可能和推移的入场侧
+  // 取样点给出同一个像素——那是真值相同，不是取样点没区分力。把它算进来会得到
+  // 一条时不时假红的断言，而假红比没有断言更坏。故障自己的区分力由下面那条
+  // "同一进度上不同的带给出不同像素"管，那条更有针对性（钉的是哈希在起作用）。
   const byEffect = new Map<string, string>();
-  for (const c of trCases) byEffect.set(c.name.split(" ·")[0]!, c.actual.join(","));
+  for (const c of trCases) {
+    const effect = c.name.split(" ·")[0]!;
+    if (effect.startsWith("故障")) continue;
+    byEffect.set(effect, c.actual.join(","));
+  }
   checks.push(
     check(
-      "三种效果在各自取样点上给出不同的像素（取样点有区分力）",
-      "3 组各不相同",
+      "擦除 / 圆形张开 / 推移在各自取样点上给出不同的像素（取样点有区分力）",
+      `${byEffect.size} 组各不相同`,
       `${byEffect.size} 组：${[...byEffect.values()].join(" | ")}`,
-      new Set(byEffect.values()).size === byEffect.size,
+      byEffect.size >= 3 && new Set(byEffect.values()).size === byEffect.size,
+    ),
+  );
+
+  // 故障：**同一个进度上，不同的带要给出不同的像素。** 这一条钉的是整数哈希真的在
+  // 起作用——哈希退化成常量（或者 uBlocks 没传到、整屏算成同一条带）时，三条带会
+  // 一起翻，故障就变成了硬切，而"GPU == CPU 参照"仍然全绿（两边用同一个退化的哈希）。
+  // 同 LUT 那条"通道真的轮换了"、D19 那条"画面确实被混过"
+  const glitchBands = trCases.filter((c) => c.name.startsWith("故障 · t=0.5"));
+  const distinctBands = new Set(glitchBands.map((c) => c.actual.join(",")));
+  checks.push(
+    check(
+      "故障：同一进度上不同的带给出不同的像素（哈希真的在分带）",
+      "≥ 2 种",
+      `${glitchBands.length} 条带取到 ${distinctBands.size} 种像素：${[...distinctBands].join(" | ")}`,
+      glitchBands.length >= 2 && distinctBands.size >= 2,
     ),
   );
 

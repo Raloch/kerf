@@ -52,6 +52,9 @@ import type {
 import { colorMatrixOf, isDefaultColorMatrix, lutIntensityOf, type ColorAdjust } from "./color";
 import { buildLutTexture, LUT_FRAGMENT, LUT_VERTEX, type LutTable } from "./lut";
 import {
+  GLITCH_BLOCKS,
+  GLITCH_SHIFT,
+  GLITCH_WINDOW,
   TRANSITION_CODES,
   TRANSITION_FEATHER,
   TRANSITION_FRAGMENT,
@@ -469,6 +472,10 @@ export async function createPixiCompositor(
           // 羽化宽度走 uniform 而不是写死进 GLSL：只有这样它才能和 JS 参照实现
           // 共用同一个常量，而两边不一致时 GPU-vs-CPU 断言只会在羽化带上红
           uFeather: { value: TRANSITION_FEATHER, type: "f32" },
+          // 故障的三个量同理，都只有 transition-shader.ts 那一份定义
+          uBlocks: { value: GLITCH_BLOCKS, type: "f32" },
+          uWindow: { value: GLITCH_WINDOW, type: "f32" },
+          uShift: { value: GLITCH_SHIFT, type: "f32" },
         },
       },
     });

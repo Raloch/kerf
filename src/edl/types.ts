@@ -62,7 +62,7 @@ export type TrackKind = "video" | "audio";
  * 另写一份"哪些算 shader 转场"的名单——漏一种的表现是导出闸门放行，用户拿到
  * 一个转场变成硬切的成片）。
  */
-export type VideoTransitionKind = "dissolve" | "wipe" | "iris" | "slide";
+export type VideoTransitionKind = "dissolve" | "wipe" | "iris" | "slide" | "glitch";
 
 /** 声音转场的种类，定义在 `audio/crossfade.ts`（曲线和它的语义在一起）。 */
 export type { AudioTransitionKind };

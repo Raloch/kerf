@@ -44,7 +44,12 @@ import {
   sampleLutTexture8,
   type LutData,
 } from "../compose/lut";
-import { mixTransition } from "../compose/transition-shader";
+import {
+  GLITCH_BLOCKS,
+  GLITCH_SHIFT,
+  glitchPoint,
+  mixTransition,
+} from "../compose/transition-shader";
 import {
   createCanvas2DCompositor,
   type Compositor,
@@ -641,6 +646,65 @@ const TRANSITION_CASES = [
   { name: "推移 · t=0.4（入场侧）", effect: "slide", progress: 0.4, u: 0.8, v: 0.5 },
 ] as const;
 
+/**
+ * 故障的**纯色层**用例：验的是整数哈希。
+ *
+ * 某条带在 GPU 上算出不同的翻转时刻，这一点就整块取到另一层，两个纯色差 200 个
+ * 色阶，红得不可能看漏——这正是把故障拖到最后的那件事（见 D20）。
+ *
+ * **带号由参照实现挑，不手写。** 第一版手挑了第 0 / 7 / 15 条带，结果三条在
+ * `t=0.5` 时恰好都已经翻过（每条带翻转与否各 50%，三条同侧的概率 1/8），于是
+ * "不同的带给出不同像素"那条假红。同 CLAUDE.md 那条"挑用例时要先问被测的那个量
+ * 在这里是不是恰好等于零/一"，这里的形态是：**让参照实现自己挑出有区分力的取样点**。
+ * 挑不出来就抛错，那说明常量被改得所有带同时翻，这一组从此是空断言。
+ */
+function glitchBandCases(): {
+  readonly name: string;
+  readonly effect: "glitch";
+  readonly progress: number;
+  readonly u: number;
+  readonly v: number;
+}[] {
+  const bandV = (band: number) => (band + 0.5) / GLITCH_BLOCKS;
+  const flipped = (band: number) => glitchPoint(0.5, bandV(band), 0.5).useTo;
+  let already = -1;
+  let notYet = -1;
+  for (let band = 0; band < GLITCH_BLOCKS; band++) {
+    if (flipped(band)) {
+      if (already < 0) already = band;
+    } else if (notYet < 0) notYet = band;
+  }
+  if (already < 0 || notYet < 0) {
+    throw new Error(
+      `故障用例挑不出有区分力的带：t=0.5 时 16 条带全部${already < 0 ? "未翻" : "已翻"}，` +
+        "「不同的带给出不同像素」会变成空断言",
+    );
+  }
+  return [
+    { name: `故障 · t=0.5（第 ${already} 条带，已翻）`, effect: "glitch", progress: 0.5, u: 0.5, v: bandV(already) },
+    { name: `故障 · t=0.5（第 ${notYet} 条带，未翻）`, effect: "glitch", progress: 0.5, u: 0.5, v: bandV(notYet) },
+    // 同一条带的两个进度：钉的是"翻转时刻"这个量本身，而不只是"带之间不同"
+    { name: `故障 · t=0.1（第 ${already} 条带）`, effect: "glitch", progress: 0.1, u: 0.5, v: bandV(already) },
+    { name: `故障 · t=0.9（第 ${notYet} 条带）`, effect: "glitch", progress: 0.9, u: 0.5, v: bandV(notYet) },
+  ];
+}
+
+/**
+ * 故障的**位移**用两色层单独验一组。
+ *
+ * 纯色层看不出位移（在哪儿取都一样），而位移是这个效果一半的内容：把
+ * `clamp(vUV.x + amp, …)` 写成 `vUV.x - amp` 或 `vUV.y + amp` 都画得出图、
+ * 上面那五条也全绿。这里把 `from` 层做成左右两色，取样点选在竖直分界线附近、
+ * 距分界 0.02（OUT=320 上是 6 像素，远离双线性过滤影响的范围），于是"位移有没有
+ * 把取样点推过分界"就是一个整色阶的差别。
+ *
+ * 进度取各带窗口的**中点附近**——那里幅度最大（抛物线的顶点）。具体是哪条带的
+ * 中点由哈希决定，所以这里不写死进度，由 `glitchShiftCases()` 现算。
+ */
+const GLITCH_SPLIT_U = 0.5;
+/** 取样点离分界多远。要大于过滤半径、小于最大位移（0.08）。 */
+const GLITCH_PROBE_OFFSET = 0.02;
+
 export interface TransitionComparison {
   readonly name: string;
   readonly expected: readonly [number, number, number];
@@ -694,10 +758,80 @@ async function transitionPass(): Promise<TransitionComparison[]> {
   let canvasRef: OffscreenCanvas | HTMLCanvasElement | null = null;
   const pixiCanvasOf = () => canvasRef!;
 
+  /** 左右两色的层。故障位移那一组用它——纯色层看不出位移。 */
+  const split = (
+    left: readonly [number, number, number],
+    right: readonly [number, number, number],
+  ): OffscreenCanvas => {
+    const cv = new OffscreenCanvas(OUT, OUT);
+    const ctx = cv.getContext("2d");
+    if (!ctx) throw new Error("造两色层失败");
+    ctx.fillStyle = `rgb(${left[0]},${left[1]},${left[2]})`;
+    ctx.fillRect(0, 0, Math.round(OUT * GLITCH_SPLIT_U), OUT);
+    ctx.fillStyle = `rgb(${right[0]},${right[1]},${right[2]})`;
+    ctx.fillRect(Math.round(OUT * GLITCH_SPLIT_U), 0, OUT, OUT);
+    return cv;
+  };
+
+  // 四色互不相同：于是取样点的颜色同时说明"取的哪一层"和"分界哪一侧"
+  const FROM_L: [number, number, number] = [230, 30, 30];
+  const FROM_R: [number, number, number] = [230, 200, 30];
+  const TO_L: [number, number, number] = [30, 60, 220];
+  const TO_R: [number, number, number] = [30, 200, 120];
+  const splitFrom = { kind: "image" as const, image: split(FROM_L, FROM_R), width: OUT, height: OUT };
+  const splitTo = { kind: "image" as const, image: split(TO_L, TO_R), width: OUT, height: OUT };
+
   const pixi = await createPixiCompositor(OUT, OUT);
   canvasRef = pixi.canvas;
   try {
-    return TRANSITION_CASES.map((testCase) => {
+    const asRgba01 = (c: readonly [number, number, number]) => ({
+      r: c[0] / 255,
+      g: c[1] / 255,
+      b: c[2] / 255,
+      a: 1,
+    });
+    const dist = (a: readonly [number, number, number], b: readonly [number, number, number]) =>
+      Math.max(Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1]), Math.abs(a[2] - b[2]));
+
+    const shiftCases: TransitionComparison[] = glitchShiftCases().map((testCase) => {
+      pixi.composeFrame([
+        {
+          kind: "transition",
+          from: splitFrom,
+          to: splitTo,
+          progress: testCase.progress,
+          effect: "glitch",
+        },
+      ]);
+      const actual = pixelAt(testCase.u, testCase.v);
+      // 取样点同样落在像素中心，与 GPU 光栅化一致
+      const px = Math.min(OUT - 1, Math.max(0, Math.round(testCase.u * OUT - 0.5)));
+      const py = Math.min(OUT - 1, Math.max(0, Math.round(testCase.v * OUT - 0.5)));
+      const cu = (px + 0.5) / OUT;
+      const cv = (py + 0.5) / OUT;
+      // 参照实现按同一条分界取色。分界用 `<` 而不是 `<=`：GPU 那边分界左侧最后
+      // 一个纹素中心是 (OUT/2 - 0.5)/OUT < 0.5，两边判据必须同向
+      const mixed = mixTransition("glitch", asRgba01(FROM_L), asRgba01(TO_L), cu, cv, testCase.progress, {
+        from: (su) => asRgba01(su < GLITCH_SPLIT_U ? FROM_L : FROM_R),
+        to: (su) => asRgba01(su < GLITCH_SPLIT_U ? TO_L : TO_R),
+      });
+      const expected: [number, number, number] = [
+        Math.round(mixed.r * 255),
+        Math.round(mixed.g * 255),
+        Math.round(mixed.b * 255),
+      ];
+      return {
+        name: testCase.name,
+        expected,
+        actual,
+        worst: dist(actual, expected),
+        // 这一组的两层都不是纯色，这个诊断值对它没有意义，报 0 免得被上面
+        // 那条"羽化带确实混过"的过滤误捡（它按名字过滤，这里的名字不含"羽化带"）
+        awayFromPure: 0,
+      };
+    });
+
+    const solidCases = [...TRANSITION_CASES, ...glitchBandCases()].map((testCase) => {
       pixi.composeFrame([
         {
           kind: "transition",
@@ -736,9 +870,6 @@ async function transitionPass(): Promise<TransitionComparison[]> {
         Math.round(mixed.b * 255),
       ];
 
-      const dist = (a: readonly [number, number, number], b: readonly [number, number, number]) =>
-        Math.max(Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1]), Math.abs(a[2] - b[2]));
-
       return {
         name: testCase.name,
         expected,
@@ -748,9 +879,59 @@ async function transitionPass(): Promise<TransitionComparison[]> {
         awayFromPure: Math.min(dist(actual, FROM_RGB), dist(actual, TO_RGB)),
       };
     });
+
+    return [...solidCases, ...shiftCases];
   } finally {
     pixi.dispose();
   }
+}
+
+/**
+ * 故障位移那一组：两色层 + 成对的取样点。
+ *
+ * 挑选规则是**必须能区分**：取样点固定在分界左/右 `GLITCH_PROBE_OFFSET`，进度取
+ * 该带位移最大的那一刻，而只有 `|位移| > offset` 的带才会把取样推过分界。所以这里
+ * 先用参照实现扫一遍找出合格的带，**一条都找不到就抛错**——那说明常量被改小了，
+ * 这一组从此变成永远绿的空断言，而那比红更坏。
+ *
+ * 证明链是：参照实现真的在位移（单测钉住：窗口中点幅度 = `GLITCH_SHIFT × dir`、
+ * 两端为 0），而 GPU == 参照（下面这一组进上面那条聚合断言）。所以 GPU 也在位移。
+ * 单靠"GPU == 参照"不够——两边都不位移时它们照样相等，正是靠"用例能区分"这一条
+ * 把那种情形排除掉的。
+ */
+function glitchShiftCases(): {
+  readonly name: string;
+  readonly progress: number;
+  readonly u: number;
+  readonly v: number;
+}[] {
+  const cases: { name: string; progress: number; u: number; v: number }[] = [];
+  for (let band = 0; band < GLITCH_BLOCKS && cases.length < 3; band++) {
+    const v = (band + 0.5) / GLITCH_BLOCKS;
+    // 扫一遍进度找位移最大的那一刻。不去反推哈希——那等于把哈希抄第二遍
+    let peak = { progress: 0, amp: 0 };
+    for (let i = 0; i <= 200; i++) {
+      const progress = i / 200;
+      const amp = glitchPoint(GLITCH_SPLIT_U, v, progress).u - GLITCH_SPLIT_U;
+      if (Math.abs(amp) > Math.abs(peak.amp)) peak = { progress, amp };
+    }
+    if (Math.abs(peak.amp) <= GLITCH_PROBE_OFFSET * 1.5) continue;
+
+    // 取样点放在位移**来向**那一侧，于是位移会把它推过分界
+    const u = GLITCH_SPLIT_U - Math.sign(peak.amp) * GLITCH_PROBE_OFFSET;
+    cases.push(
+      { name: `故障位移 · 第 ${band} 条带（最大位移，应当跨过分界）`, progress: peak.progress, u, v },
+      // 同一点、零位移的那一刻：t=0 时幅度恒为 0（单测钉住），取的是分界这一侧
+      { name: `故障位移 · 第 ${band} 条带（t=0，不位移）`, progress: 0, u, v },
+    );
+  }
+  if (cases.length === 0) {
+    throw new Error(
+      `故障位移用例挑不出来：最大位移 ${GLITCH_SHIFT} 不足以跨过 ${GLITCH_PROBE_OFFSET}，` +
+        "这一组会变成永远绿的空断言",
+    );
+  }
+  return cases;
 }
 
 /** 红→蓝、绿→红、蓝→绿。线性映射，插值精确，适合当断言的真值。 */
