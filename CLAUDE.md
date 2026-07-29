@@ -41,8 +41,11 @@ pnpm dev:device   # 真机自检用：监听局域网 + 自签 HTTPS（WebCodecs
                   # 加 ?autorun=m0|pixi|timeline|preview|device 会自动跑完并把完整结果 POST 回 .reports/
 pnpm test         # 跑单元测试（771 项：素材帧栅格 8 / 图片解码尺寸 5 / 颜色字符串 15 / 字体族名 5 / 波形取桶 10 / 转场混合 37 / 预览音频排期 17 / 吞吐模型 12 / 环境体检 21 / 项目快照 42 / 素材指认 21 / 落盘读数 15 / 资产清理 20 / 时间基 25 / 状态层 227 / 取样映射 27 / 转场时间模型 26 / 淡化曲线 24 / 混音排期 26 / 混音分段 15 / 预设 14 / 合成几何 14 / 色彩矩阵 23 / LUT 22 / 关键帧 35 / 文字断行 23 / 栅格缓存 12 / 常驻量 12 / 混音 6 / 编码延迟 12）
 pnpm typecheck    # 类型检查，严格模式
-pnpm build        # 构建
+pnpm build        # 构建（自带主 chunk 断言，见「首屏体积」）
+pnpm gate         # 门禁三件套：typecheck + test + build。CI 上跑的就是这三条
 ```
+
+**`pnpm gate` 绿不等于成片是对的。** 它挡的是"改坏了但没人跑"，覆盖不到四个浏览器自检——而这个仓库里几乎每一个真 bug 都是那四个抓到的。改到下面那张表里的东西仍然要自己跑一遍。
 
 ## 状态层约定（M1 起）
 
@@ -311,11 +314,15 @@ pkill -f "user-data-dir=$CHROME_DIR"   # 只清自己这一份
 
 ## 首屏体积
 
-**mediabunny（约 500KB）不能进主 chunk。** 它只能出现在 Worker 里，或被动态 `import()`。已经踩过两次：一次是 `probe`/`capability`/`thumbnails` 静态 import，一次是导出面板经 `client.ts` → `mixdown.ts` 把它拖回来。判断方法是 `pnpm build` 看主 chunk——正常在 250KB 上下，出现 600KB+ 就是又被拖进来了。
+**mediabunny（约 500KB）不能进主 chunk。** 它只能出现在 Worker 里，或被动态 `import()`。已经踩过两次：一次是 `probe`/`capability`/`thumbnails` 静态 import，一次是导出面板经 `client.ts` → `mixdown.ts` 把它拖回来。
+
+**这条纪律现在由构建自己执行**（`vite.config.ts` 的 `bundleGuard`，D38）：被拖进入口 chunk 就直接构建失败，不再靠人记得去看一眼产物。**判据是模块图（`chunk.moduleIds`），不是在产物里 grep 包名**——那个代理两个方向都是坏的，实测：`grep -c mediabunny` 在**真的就是 mediabunny 的那个 chunk**（311KB 的 `id3-*.js`）上同样返回 **0**（压缩把包名整个丢掉了），所以它是一条**恒为真的假断言**，无论有没有被拖进来都报"没有"；反过来 `pixi` 在干净的主 chunk 里出现 5 次，全部来自我们自己的动态 import 路径和 `backend: "pixi"` 这个字符串。这个假判据在仓库里以"`grep -c mediabunny` → 0"的形式当过一次验收证据。**同那条"代理坏掉的时候要问代理为什么坏"**：坏的原因是压缩会丢包名，而模块图不会。
+
+断言还**自证**：整个产物里一个受管库的模块都找不到时也要红（依赖换名、路径形状变了、被整个树摇掉），否则它会安静地退化成上面那个 grep 的下场。三条失败路径都反向验证过——注入静态 import 时入口从 361,867 B 涨到 748,428 B 并报出库名；受管列表里放一个不存在的库时报"判据坏了"；入口判据写错时报"找不到入口"（这条是自然触发的）。
 
 拆分模式是**把"要 mediabunny 的那一半"单独成文件**：`capability.ts` / `capability-probe.ts`、`thumbnails.ts` / `thumbnail-extract.ts`。同步渲染路径上的函数（如 `drawStrip`）不能 await 动态 import，所以必须靠文件边界隔离，不能靠调用点。
 
-**PixiJS 同理（412KB raw / gzip 119KB）。** 但它用的是另一个模式：`pixi-compositor.ts` 对 pixi.js 只有 `import type`，动态 `import()` 藏在 `createPixiCompositor()` 这个**异步工厂**里，返回的 `composeFrame()` 是同步的。边界划在"创建时"而不是"调用时"，因为调用点在 rAF 回调和导出逐帧循环里，每帧 await 不可接受。接 Pixi 那一轮验的是主 chunk **一个字节都不变**（252,997 B / gzip 80,027，见 PLAN.md §7 M1.6）。之后 M2/M3 的功能陆续加进来，**当前是 338,100 B（gzip 111,440）**——判据不是这个绝对值，而是"`pnpm build` 之后主 chunk 里没有 mediabunny / Pixi"：突然跳到 600KB+ 就是又被拖进来了。
+**PixiJS 同理（412KB raw / gzip 119KB）。** 但它用的是另一个模式：`pixi-compositor.ts` 对 pixi.js 只有 `import type`，动态 `import()` 藏在 `createPixiCompositor()` 这个**异步工厂**里，返回的 `composeFrame()` 是同步的。边界划在"创建时"而不是"调用时"，因为调用点在 rAF 回调和导出逐帧循环里，每帧 await 不可接受。接 Pixi 那一轮验的是主 chunk **一个字节都不变**（252,997 B / gzip 80,027，见 PLAN.md §7 M1.6）。之后 M2/M3/M4 的功能陆续加进来，**当前是 361,867 B（gzip 119,072）**——这个数只是读数，判据是上面那条模块图断言：绝对值会随功能正常长大，"被拖进来了"是结构性错误，两件事不能用同一个阈值判。
 
 ## 技术栈（已定，不要另选）
 

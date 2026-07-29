@@ -1,0 +1,55 @@
+name: 门禁
+
+# 挡的是"改坏了但没人跑"这一类：类型、771 项单测、以及主 chunk 里有没有被拖进
+# mediabunny / PixiJS（那条断言由 `vite.config.ts` 的 bundleGuard 承载，所以
+# `pnpm build` 自己就会红，CI 只是保证它每次都被跑一遍）。
+#
+# **它不覆盖四个浏览器自检**（M0 67 项 / 预览一致性 23 / 多片段 54 / Pixi spike 31）。
+# 那四个要真的 WebCodecs、WebGL2 和音频输出，而这个仓库里几乎每一个真 bug 都是
+# 它们抓到的——`StreamTarget` 攒批写坏文件、Pixi 槽位按旧尺寸采样、素材 id 撞号、
+# `await resume()` 挂死，一个都没被单测抓到。所以**这里绿不等于成片是对的**，
+# 改到 CLAUDE.md「四个自检」那张表里的东西，仍然要自己跑一遍。
+# 把它们搬进无头 CI 是单独一件事：先要量清楚 runner 上有没有可用的
+# `VideoEncoder`（H.264 软编要看 Chrome 构建带不带），而"报不支持"很可能只是
+# 派生现象——同 D24。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支上新的推送取消进行中的旧运行
+concurrency:
+  group: gate-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 版本从 package.json 的 packageManager 读，免得 CI 和本地跑的不是同一个 pnpm
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: 类型检查
+        run: pnpm typecheck
+
+      - name: 单元测试
+        run: pnpm test
+
+      # 构建自带主 chunk 断言：mediabunny / PixiJS 被拖进入口 chunk 就在这里红。
+      # 判据是模块图不是 grep 包名——理由见 vite.config.ts 里 bundleGuard 的注释。
+      - name: 构建（含首屏体积断言）
+        run: pnpm build

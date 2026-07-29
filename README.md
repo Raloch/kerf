@@ -59,7 +59,7 @@
 
 手机上**"墙"一道都不存在**：片长（四档全过）、导出次数（一页 24 次连导全过、吞吐死平）、跨档累积（整条阶梯一页跑完四档全过）——先后立过三道，全部倒了。曾经判出的三道墙都是**量法的 bug**，经过记在 §8 风险 4。
 
-首屏主 chunk **338 kB（gzip 111 kB）**：mediabunny（约 500 kB）只出现在 Worker 里或被动态 `import()`，PixiJS 靠一个**异步工厂**隔离（对 `pixi.js` 只有 `import type`，实例走函数里的动态 `import()`），两者都不进主 chunk。判据不是这个绝对值，而是"`pnpm build` 之后主 chunk 里没有它们"——突然跳到 600 kB+ 就是又被拖进来了。这个坑踩过两次。
+首屏主 chunk **362 kB（gzip 119 kB）**：mediabunny（约 500 kB）只出现在 Worker 里或被动态 `import()`，PixiJS 靠一个**异步工厂**隔离（对 `pixi.js` 只有 `import type`，实例走函数里的动态 `import()`），两者都不进主 chunk。这个坑踩过两次，所以现在**构建自己会拦**：判据是入口 chunk 的**模块图**，不是字节上限也不是在产物里搜包名——后者是一条恒为真的假断言（`grep -c mediabunny` 在真的就是 mediabunny 的那个 chunk 上也返回 0，压缩把包名丢光了）。理由见 PLAN.md 的 **D38**。
 
 ## 快速开始
 
@@ -73,11 +73,14 @@ pnpm dev
 其他命令：
 
 ```bash
-pnpm test         # 单元测试，691 项 / 29 个文件
+pnpm test         # 单元测试，771 项 / 32 个文件
 pnpm typecheck    # 类型检查（strict + noUncheckedIndexedAccess + exactOptionalPropertyTypes）
-pnpm build        # 生产构建
+pnpm build        # 生产构建（自带主 chunk 断言）
+pnpm gate         # 上面三条一起跑，CI 上跑的就是它
 pnpm dev:device   # 真机自检用：监听局域网 + 自签 HTTPS
 ```
+
+`pnpm gate` 绿**不等于成片是对的**：它覆盖不到下面那六个跑在真实浏览器里的自检，而这个仓库里几乎每一个真 bug 都是那些抓到的。
 
 `pnpm dev:device` 要自签 HTTPS 是因为 **WebCodecs 和 OPFS 都要求安全上下文**，`localhost` 算、`http://192.168.x.x` 不算。直接开局域网地址会得到"没有 VideoEncoder"，看起来像"这台设备不支持"——这个坑真机上踩过一次。
 
