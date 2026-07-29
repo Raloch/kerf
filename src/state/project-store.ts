@@ -43,6 +43,16 @@ import type {
 } from "../edl/types";
 import type { Rational } from "../time/rational";
 import {
+  fontAssetKey,
+  lutAssetKey,
+  planCleanup,
+  referencedAssetKeys,
+  sourceAssetKey,
+  type AssetEntry,
+  type CleanupPlan,
+  type StorageReadout,
+} from "./asset-cleanup";
+import {
   countClipsBySource,
   duplicatedSnapshot,
   fromSnapshot,
@@ -170,7 +180,7 @@ function assetPayload(record: unknown): unknown {
  */
 export async function putSourceAsset(source: MediaSource): Promise<boolean> {
   try {
-    await run(ASSET_STORE, "readwrite", (s) => s.put(wrapAsset(source.file), `source:${source.id}`));
+    await run(ASSET_STORE, "readwrite", (s) => s.put(wrapAsset(source.file), sourceAssetKey(source.id)));
     return true;
   } catch (error) {
     lastSaveError = error instanceof Error ? error.message : String(error);
@@ -180,7 +190,7 @@ export async function putSourceAsset(source: MediaSource): Promise<boolean> {
 
 export async function putLutAsset(lut: LutSource): Promise<boolean> {
   try {
-    await run(ASSET_STORE, "readwrite", (s) => s.put(wrapAsset(lut.rgb), `lut:${lut.id}`));
+    await run(ASSET_STORE, "readwrite", (s) => s.put(wrapAsset(lut.rgb), lutAssetKey(lut.id)));
     return true;
   } catch (error) {
     lastSaveError = error instanceof Error ? error.message : String(error);
@@ -190,7 +200,7 @@ export async function putLutAsset(lut: LutSource): Promise<boolean> {
 
 export async function putFontAsset(font: FontSource): Promise<boolean> {
   try {
-    await run(ASSET_STORE, "readwrite", (s) => s.put(wrapAsset(font.data), `font:${font.family}`));
+    await run(ASSET_STORE, "readwrite", (s) => s.put(wrapAsset(font.data), fontAssetKey(font.family)));
     return true;
   } catch (error) {
     lastSaveError = error instanceof Error ? error.message : String(error);
@@ -218,7 +228,7 @@ async function isReadable(file: File): Promise<boolean> {
 /** 从资产库取一个素材文件（不验可读性）。首页抽封面帧用。 */
 export async function readSourceFile(id: SourceId): Promise<File | null> {
   try {
-    const record = await run<unknown>(ASSET_STORE, "readonly", (s) => s.get(`source:${id}`));
+    const record = await run<unknown>(ASSET_STORE, "readonly", (s) => s.get(sourceAssetKey(id)));
     const file = assetPayload(record);
     return file instanceof File ? file : null;
   } catch {
@@ -388,7 +398,7 @@ export async function commitReidentified(
   try {
     await run(META_STORE, "readwrite", (s) => s.put(withReplacedSources(snapshot, metas), id));
     for (const [sourceId, next] of replacements) {
-      await run(ASSET_STORE, "readwrite", (s) => s.put(wrapAsset(next.file), `source:${sourceId}`));
+      await run(ASSET_STORE, "readwrite", (s) => s.put(wrapAsset(next.file), sourceAssetKey(sourceId)));
     }
     lastSaveError = null;
     return true;
@@ -437,13 +447,13 @@ export async function loadProject(
       if (file && (await isReadable(file))) files.set(meta.id, file);
     }
     for (const meta of snapshot.timeline.luts ?? []) {
-      const record = await run<unknown>(ASSET_STORE, "readonly", (s) => s.get(`lut:${meta.id}`));
+      const record = await run<unknown>(ASSET_STORE, "readonly", (s) => s.get(lutAssetKey(meta.id)));
       const rgb = assetPayload(record);
       if (rgb instanceof Float32Array) luts.set(meta.id, rgb);
     }
     for (const meta of snapshot.timeline.fonts ?? []) {
       const record = await run<unknown>(ASSET_STORE, "readonly", (s) =>
-        s.get(`font:${meta.family}`),
+        s.get(fontAssetKey(meta.family)),
       );
       const data = assetPayload(record);
       if (!(data instanceof ArrayBuffer) || data.byteLength === 0) continue;
@@ -497,6 +507,160 @@ export async function renameStoredProject(id: ProjectId, name: string): Promise<
     lastSaveError = error instanceof Error ? error.message : String(error);
     return false;
   }
+}
+
+// ---------------------------------------------------------------- 存储读数与清理
+
+/**
+ * 这个窗口能不能持久化。**能则返回 null**，不能则返回原因。
+ *
+ * 隐私模式 / 被策略禁掉时 IndexedDB 根本打不开，那是从第一次写就注定的**能力性
+ * 事实**，不该等用户编辑半天才说——首页进来就要提示（D24 的"折叠回根因"：它和
+ * 配额满的派生现象相同，出路完全不同）。
+ */
+export async function probePersistence(): Promise<string | null> {
+  try {
+    await openDb();
+    return null;
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+}
+
+/** 量一条资产记录占多少字节。量不出来的按 0 记——**宁可少报，不要编**。 */
+function assetBytes(payload: unknown): number {
+  if (payload instanceof File || payload instanceof Blob) return payload.size;
+  if (payload instanceof ArrayBuffer) return payload.byteLength;
+  if (ArrayBuffer.isView(payload)) return payload.byteLength;
+  return 0;
+}
+
+/** 资产记录的写入时刻；裸值旧记录**没有**，返回 null（见 `asset-cleanup.ts` 文件头）。 */
+function assetWrittenAt(record: unknown): number | null {
+  if (
+    record !== null &&
+    typeof record === "object" &&
+    "writtenAt" in record &&
+    typeof (record as AssetRecord).writtenAt === "number"
+  ) {
+    return (record as AssetRecord).writtenAt;
+  }
+  return null;
+}
+
+interface AssetScan {
+  readonly entries: readonly AssetEntry[];
+  /** 字体与 LUT 的字节合计。**`File` 是磁盘引用，不算进存储读数。** */
+  readonly storedBytes: number;
+}
+
+/**
+ * 扫一遍资产库。键、字节、写入时刻都在这里量，取舍归 `asset-cleanup.ts`。
+ *
+ * 键和值要在**同一个事务**里取——分两个事务的话，另一个标签在中间写了一条，
+ * 键值就错位一格，于是"这个键有多大 / 多老"全部对错人（同 `listProjects`）。
+ */
+async function scanAssets(): Promise<AssetScan> {
+  let keys: IDBValidKey[];
+  let values: unknown[];
+  try {
+    const db = await openDb();
+    [keys, values] = await new Promise<[IDBValidKey[], unknown[]]>((resolve, reject) => {
+      const tx = db.transaction(ASSET_STORE, "readonly");
+      const store = tx.objectStore(ASSET_STORE);
+      const keysReq = store.getAllKeys();
+      const valuesReq = store.getAll();
+      tx.oncomplete = () => resolve([keysReq.result, valuesReq.result]);
+      tx.onerror = () => reject(tx.error ?? new Error("IndexedDB 请求失败"));
+      tx.onabort = () => reject(tx.error ?? new Error("IndexedDB 事务被中止"));
+    });
+  } catch {
+    return { entries: [], storedBytes: 0 };
+  }
+
+  const entries: AssetEntry[] = [];
+  let storedBytes = 0;
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i];
+    if (typeof key !== "string") continue;
+    const record = values[i];
+    const bytes = assetBytes(assetPayload(record));
+    entries.push({ key, bytes, writtenAt: assetWrittenAt(record) });
+    // 素材文件是磁盘引用，占的不是浏览器存储；只有 LUT 和字体是真存进来的字节
+    if (!key.startsWith("source:")) storedBytes += bytes;
+  }
+  return { entries, storedBytes };
+}
+
+/** 全部快照（清理要算"所有项目"的引用集合，漏一个项目就删一批）。 */
+async function allSnapshots(): Promise<ProjectSnapshot[]> {
+  try {
+    const values = await run<unknown[]>(META_STORE, "readonly", (s) => s.getAll());
+    return values.filter(isSnapshotUsable);
+  } catch {
+    return [];
+  }
+}
+
+export interface StorageStatus {
+  readonly readout: StorageReadout;
+  readonly plan: CleanupPlan;
+}
+
+/**
+ * 存储读数 + 清理计划。**自己数，不问 `estimate()`**（理由见 `asset-cleanup.ts`）。
+ *
+ * 快照字节用 `JSON.stringify` 的长度量：EDL 是纯数据，这个数和真实占用同量级，
+ * 而且**它和括号里的分项来自同一次扫描**，对得上账——那正是不问 `estimate().usage`
+ * 的理由（那个数会把 OPFS 导出残留混进来，与分项对不上）。
+ */
+export async function measureStorage(): Promise<StorageStatus> {
+  const [snapshots, scan] = await Promise.all([allSnapshots(), scanAssets()]);
+  let projectBytes = 0;
+  for (const snapshot of snapshots) {
+    try {
+      projectBytes += JSON.stringify(snapshot).length;
+    } catch {
+      /* 量不出来就不算这一份，宁可少报 */
+    }
+  }
+  const referenced = referencedAssetKeys(snapshots.map((s) => s.timeline));
+  return {
+    readout: { projectBytes, assetBytes: scan.storedBytes },
+    plan: planCleanup(scan.entries, referenced, Date.now()),
+  };
+}
+
+/**
+ * 执行清理。**删孤儿 + 给没有时间戳的旧记录回填时间戳。**
+ *
+ * 回填是这件事的另一半，而且是不能省的一半：那些记录这一轮**不删**（不知道多老），
+ * 回填之后它们从现在开始计龄，够老了才真的可清。少了回填，它们会永远停在"待定"。
+ */
+export async function runCleanup(plan: CleanupPlan): Promise<{ removed: number; bytes: number }> {
+  let removed = 0;
+  let bytes = 0;
+  for (const entry of plan.removable) {
+    try {
+      await run(ASSET_STORE, "readwrite", (s) => s.delete(entry.key));
+      removed += 1;
+      bytes += entry.bytes;
+    } catch (error) {
+      lastSaveError = error instanceof Error ? error.message : String(error);
+    }
+  }
+  for (const entry of plan.needsStamp) {
+    try {
+      // 读回来再包一层时间戳写回去。**不能凭 entry 重建数据**——那里只有字节数
+      const record = await run<unknown>(ASSET_STORE, "readonly", (s) => s.get(entry.key));
+      const payload = assetPayload(record);
+      if (payload === undefined) continue;
+      await run(ASSET_STORE, "readwrite", (s) => s.put(wrapAsset(payload), entry.key));
+    } catch (error) {
+      lastSaveError = error instanceof Error ? error.message : String(error);
+    }
+  }
+  return { removed, bytes };
 }
 
 /** 制作副本。返回副本的摘要（列表刷新前界面就能说出「X 副本」）。 */

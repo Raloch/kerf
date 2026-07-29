@@ -13,6 +13,18 @@ import { useTimeline } from "../state/timeline-store";
 // 只要类型：`autosave` 本身走动态 import，别把 IndexedDB 那一层拖进首屏
 import type { AutosaveHandle, SaveReadout } from "../state/autosave";
 import { UNNAMED_PROJECT } from "../state/project-snapshot";
+// 纯函数、零运行时依赖，静态 import 不会把 IndexedDB 那层拖进首屏
+import {
+  bannerCopy,
+  classifyPersistError,
+  dismissBanner,
+  nextBanner,
+  NO_BANNER,
+  topbarFailureText,
+  type BannerState,
+  type PersistFailure,
+} from "../state/persist-status";
+import { cleanupLabel, type CleanupPlan } from "../state/asset-cleanup";
 import { findClip } from "../state/operations";
 import { clipDuration, sourceDurationFrames } from "../edl/types";
 import { formatDuration, framesToTimecode } from "../time/timebase";
@@ -36,7 +48,10 @@ import {
   IconRedo,
   IconTrash,
   IconUndo,
+  IconWarn,
   IconWave,
+  IconX,
+  IconBroom,
 } from "./icons";
 import "./editor.css";
 
@@ -87,6 +102,13 @@ export function Editor({
   const [notice, setNotice] = useState<string | null>(note);
   /** 存盘读数。刚装进来的项目本来就是从盘上读的（新建的也先落了一条），所以初始是"已保存"。 */
   const [readout, setReadout] = useState<SaveReadout>({ status: "saved", at: null, reason: null });
+  /**
+   * 落盘失败横幅。**只在"正常 → 失败"的沿上弹一次**，状态机是纯函数（`persist-status.ts`）
+   * ——防抖 1 秒意味着失败每秒重演，按次弹就是风暴。
+   */
+  const [banner, setBanner] = useState<BannerState>(NO_BANNER);
+  /** 横幅上那个清理按钮要显示的计划。只在横幅出现时才去量。 */
+  const [cleanup, setCleanup] = useState<CleanupPlan | null>(null);
   /** 「N 秒前」要走表。5 秒一格，比它细就得每秒重渲整个顶栏。 */
   const [clock, setClock] = useState(() => Date.now());
   const [menuOpen, setMenuOpen] = useState(false);
@@ -111,6 +133,15 @@ export function Editor({
   }, [timeline.width, timeline.height]);
 
   /**
+   * 每次落盘尝试都过一遍状态机。**读数和横幅要在同一个回调里更新**：分两处的话
+   * "这一期弹过了没有"和"现在是失败态"会各自变化，中间那一帧就可能重新弹一次。
+   */
+  const onReadout = useCallback((next: SaveReadout) => {
+    setReadout(next);
+    setBanner((prev) => nextBanner(prev, next.status === "saved"));
+  }, []);
+
+  /**
    * 自动存盘跟着剪辑台的生命周期走（D37，改写自 D23 的三态）：App 只在项目
    * **装进 store 之后**才渲染这里，所以挂载即可开工——"空时间轴把项目覆盖成空的"
    * 由这个顺序挡第一道，autosave 自己对 `projectId === null` 拒写挡第二道。
@@ -122,7 +153,7 @@ export function Editor({
     void import("../state/autosave").then(({ startAutosave }) => {
       // 挂载已经被撤销（严格模式双挂载/极快的视图切换）就别再订阅，孤儿订阅没人停
       if (stopped) return;
-      handle = startAutosave(setReadout);
+      handle = startAutosave(onReadout);
       autosaveRef.current = handle;
     });
     return () => {
@@ -130,7 +161,42 @@ export function Editor({
       handle?.stop();
       autosaveRef.current = null;
     };
-  }, []);
+  }, [onReadout]);
+
+  // 横幅出现时才去量"能清掉多少"。这不是每帧都要的读数，而且它要扫全部项目的引用
+  useEffect(() => {
+    if (!banner.showing) {
+      setCleanup(null);
+      return;
+    }
+    let stale = false;
+    void import("../state/project-store")
+      .then(({ measureStorage }) => measureStorage())
+      .then(({ plan }) => {
+        if (!stale) setCleanup(plan);
+      })
+      .catch(() => {});
+    return () => {
+      stale = true;
+    };
+  }, [banner.showing]);
+
+  /**
+   * 清理没人用的资产，然后**立刻重试一次落盘**。
+   *
+   * 不重试的话红字会一直挂着——失败那一次已经把欠账清掉了，此后没有新编辑就不会
+   * 再写，于是横幅上"清出空间后会自动接着保存"在用户眼里是假话（见 `autosave.ts`）。
+   */
+  const runCleanupNow = useCallback(async () => {
+    if (!cleanup) return;
+    const { runCleanup } = await import("../state/project-store");
+    const { removed, bytes } = await runCleanup(cleanup);
+    setCleanup(null);
+    const { formatBytes } = await import("../state/asset-cleanup");
+    setBusy(removed > 0 ? `已清理 ${removed} 项 · ${formatBytes(bytes)}` : "没有可清理的");
+    setTimeout(() => setBusy(null), 4000);
+    await autosaveRef.current?.retry();
+  }, [cleanup]);
 
   // 「已保存 · N 秒前」走表
   useEffect(() => {
@@ -161,6 +227,8 @@ export function Editor({
   }, [timeline.sources]);
 
   const projectName = timeline.name ?? UNNAMED_PROJECT;
+  /** 失败的根因；不在失败态时是 null。顶栏红字和横幅文案都从它来，只有一个真值来源。 */
+  const failure = readout.status === "failed" ? classifyPersistError(readout.reason) : null;
 
   const commitRename = useCallback(
     (raw: string) => {
@@ -328,17 +396,18 @@ export function Editor({
                 </span>
               </button>
               <span
-                className={`sub${readout.status === "failed" ? " bad" : ""}`}
+                className={`sub${failure ? " bad" : ""}`}
                 title={
-                  readout.status === "failed"
+                  failure
                     ? (readout.reason ?? undefined)
                     : readout.at
                       ? new Date(readout.at).toLocaleString()
                       : undefined
                 }
               >
-                {readout.status === "failed"
-                  ? "存不进去了"
+                {/* 失败态把派生现象折叠回根因（D24）：配额满和隐私模式的出路完全不同 */}
+                {failure
+                  ? topbarFailureText(failure)
                   : readout.at
                     ? `已保存 · ${savedAgo(readout.at, clock)}`
                     : "已保存"}
@@ -444,6 +513,20 @@ export function Editor({
           </button>
         </div>
       )}
+
+      {/*
+        落盘失败横幅：**这一稿唯一新增的真警告**，也是顶栏那行「已保存 · N 秒前」
+        存在的全部理由——没有失败态的话它只是个恒为真的装饰（同 `FontFaceSet.check()`
+        那类假读数）。只在"正常 → 失败"的沿上弹一次，写成功自动消失（状态机在
+        `persist-status.ts`），关掉之后这一期不再弹而顶栏红字**照旧留着**——失败还在。
+        文案由纯函数生成，所以"改动不会被保住"这句过头话钉得住不会溜回来。
+      */}
+      {banner.showing && failure && <SaveBanner
+        failure={failure}
+        plan={cleanup}
+        onCleanup={() => void runCleanupNow()}
+        onDismiss={() => setBanner(dismissBanner)}
+      />}
 
       {/* ---------- 三栏 ---------- */}
       <div className="ed-body">
@@ -599,6 +682,44 @@ export function Editor({
           onClose={() => setExportOpen(false)}
         />
       )}
+    </div>
+  );
+}
+
+/**
+ * 落盘失败横幅。形态同 `.ed-recover`（D23 验过 `flex: 0 0 auto` 不挤三栏），
+ * 色调用 `--bad`——这是数据丢失级别的警告，不是 D19 那种"看得见的降级"。
+ */
+function SaveBanner({
+  failure,
+  plan,
+  onCleanup,
+  onDismiss,
+}: {
+  readonly failure: PersistFailure;
+  readonly plan: CleanupPlan | null;
+  readonly onCleanup: () => void;
+  readonly onDismiss: () => void;
+}) {
+  const copy = bannerCopy(failure);
+  // 没东西可清就不摆按钮：一个写着"0 项"的清理入口只会让人以为清理坏了
+  const label = plan ? cleanupLabel(plan) : null;
+  return (
+    <div className="ed-savebar">
+      <IconWarn />
+      <span className="msg">
+        <b>{copy.headline}</b>
+        {copy.advice}
+      </span>
+      {copy.offerCleanup && label && (
+        <button type="button" className="chip-btn" onClick={onCleanup}>
+          <IconBroom />
+          {label}
+        </button>
+      )}
+      <button type="button" className="ib" aria-label="知道了" onClick={onDismiss}>
+        <IconX />
+      </button>
     </div>
   );
 }

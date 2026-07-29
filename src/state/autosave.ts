@@ -59,6 +59,14 @@ export interface AutosaveHandle {
    * 所以「制作副本」之类"要读最新快照"的操作先 await 它再去读。
    */
   flush(): Promise<void>;
+  /**
+   * 不管欠不欠账，**强行再写一次**。
+   *
+   * 给"落盘失败 → 用户清理出空间"这条路用：失败那一次已经把欠账清掉了
+   * （`pending` 归 false），此后没有新编辑就不会再写，于是横幅上那句"清出空间后会
+   * 自动接着保存"在用户眼里成了假话——他清完了，红字还在。所以清理之后要retry 一次。
+   */
+  retry(): Promise<void>;
   /** 停止订阅。内部先 flush——卸载时丢掉最后一次编辑，开发时表现成"改完代码刷新，编辑没了"。 */
   stop(): void;
 }
@@ -70,8 +78,7 @@ export function startAutosave(onReadout?: (readout: SaveReadout) => void): Autos
   let pending = false;
   let lastOkAt: number | null = null;
 
-  const flush = (): Promise<void> => {
-    if (!pending) return Promise.resolve();
+  const write = (): Promise<void> => {
     clearTimeout(timer);
     timer = undefined;
     pending = false;
@@ -92,6 +99,8 @@ export function startAutosave(onReadout?: (readout: SaveReadout) => void): Autos
       }
     });
   };
+
+  const flush = (): Promise<void> => (pending ? write() : Promise.resolve());
 
   const unsubscribe = useTimeline.subscribe((state) => {
     // 项目没装好时的时间轴变化不欠账（`closeProject` 清空时间轴就是这种），
@@ -116,6 +125,7 @@ export function startAutosave(onReadout?: (readout: SaveReadout) => void): Autos
 
   return {
     flush,
+    retry: write,
     stop() {
       // 停之前把欠着的那一份写掉：热更新和 React 严格模式的双挂载都会走到这里
       void flush();

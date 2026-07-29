@@ -177,6 +177,12 @@ export const IconWarn = () => (
   </svg>
 );
 
+export const IconBroom = () => (
+  <svg viewBox="0 0 16 16" aria-hidden="true" {...stroke} strokeWidth={1.3}>
+    <path d="M9.6 2.4 6.2 8.6M4.2 8.2h5.2l1.1 5.2H3.1z" />
+  </svg>
+);
+
 export const IconDots = () => (
   <svg viewBox="0 0 16 16" aria-hidden="true" fill="currentColor">
     <circle cx="8" cy="3.6" r="1.25" />

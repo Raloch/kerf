@@ -13,9 +13,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ProjectId, ProjectSummary } from "../state/project-snapshot";
 import { UNNAMED_PROJECT } from "../state/project-snapshot";
+// 纯函数，零运行时依赖
+import { cleanupLabel, formatBytes, storageLine } from "../state/asset-cleanup";
+import type { StorageStatus } from "../state/project-store";
+import { bannerCopy, classifyPersistError } from "../state/persist-status";
 import { formatDuration } from "../time/timebase";
 import { formatFps } from "../time/rational";
 import {
+  IconBroom,
   IconCopy,
   IconDots,
   IconFilm,
@@ -58,13 +63,29 @@ export function Home({
   const [menuFor, setMenuFor] = useState<ProjectId | null>(null);
   const [renamingId, setRenamingId] = useState<ProjectId | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** 存储读数 + 清理计划。**自己数，不问 `estimate()`**（见 `asset-cleanup.ts`）。 */
+  const [storage, setStorage] = useState<StorageStatus | null>(null);
+  /**
+   * 这个窗口能不能持久化；非 null = 不能（隐私模式）。
+   *
+   * **进首页就要说**：那是从第一次写就注定的能力性事实，不该等用户编辑半天才告诉他
+   * （D24 的"折叠回根因"——它和配额满的派生现象相同，出路完全不同）。
+   */
+  const [unavailable, setUnavailable] = useState<string | null>(null);
 
   const refresh = useCallback(() => {
     let stale = false;
     void import("../state/project-store")
-      .then(({ listProjects }) => listProjects())
-      .then((list) => {
-        if (!stale) setProjects(list);
+      .then(async ({ listProjects, measureStorage, probePersistence }) => {
+        const [list, status, reason] = await Promise.all([
+          listProjects(),
+          measureStorage(),
+          probePersistence(),
+        ]);
+        if (stale) return;
+        setProjects(list);
+        setStorage(status);
+        setUnavailable(reason);
       })
       .catch(() => {
         if (!stale) setProjects([]);
@@ -161,6 +182,17 @@ export function Home({
     [refresh],
   );
 
+  const cleanup = useCallback(async () => {
+    if (!storage) return;
+    const { runCleanup } = await import("../state/project-store");
+    const { removed, bytes } = await runCleanup(storage.plan);
+    if (removed > 0) setError(`已清理 ${removed} 项 · 腾出 ${formatBytes(bytes)}`);
+    refresh();
+  }, [storage, refresh]);
+
+  const line = storage ? storageLine(storage.readout) : null;
+  const cleanLabel = storage ? cleanupLabel(storage.plan) : null;
+
   return (
     <div className="hm">
       <div className="hm-top">
@@ -180,6 +212,19 @@ export function Home({
         )}
       </div>
 
+      {/*
+        隐私模式：**进首页就说**，不等用户编辑半天。文案走同一个 `bannerCopy`，
+        所以它和编辑器里那条不会各说一套。
+      */}
+      {unavailable && (
+        <div className="hm-note">
+          <IconWarn />
+          <span>
+            <b>{bannerCopy(classifyPersistError(unavailable)).headline}</b>{" "}
+            {bannerCopy(classifyPersistError(unavailable)).advice}
+          </span>
+        </div>
+      )}
       {error && (
         <div className="hm-note">
           <IconWarn />
@@ -203,7 +248,12 @@ export function Home({
               <IconPlus />
               新建项目
             </button>
-            <span className="hint">项目自动保存，不需要按保存</span>
+            {/*
+              **持久化不可用时这句话是假的**，所以不说。顶上那条提示已经讲清了这个窗口
+              不保存，而这里再写一句"项目自动保存"就是自相矛盾——同 D37 起因那条
+              「上次的编辑没有正常结束」：产品里的假话要删掉，不是补充说明。
+            */}
+            {!unavailable && <span className="hint">项目自动保存，不需要按保存</span>}
           </div>
         ) : (
           <>
@@ -248,6 +298,28 @@ export function Home({
           </>
         )}
       </div>
+
+      {/*
+        存储读数。**数字全是自己记的账**（快照序列化字节 + assets 里字体/LUT 逐项加总），
+        不问 `estimate()`——`usage` 会把 OPFS 导出残留混进来，总数和括号里的分项对不上账，
+        而对不上账的读数比没有读数更坏。导出残留仍归导出面板的 `.dlg-tidy` 管，
+        首页不再报一遍（两处清理入口抢同一份数据，跨标签还得把"够老"那道闸再抄一遍）。
+
+        **空态整条不出现**：`storageLine` 在一个字节都没存时返回 null——`quota` 不是磁盘
+        空间（跨浏览器语义不一致，摆出来必然被读成"磁盘剩多少"），编一个数字比沉默更坏。
+      */}
+      {line && (
+        <div className="home-foot">
+          <span>{line}</span>
+          <div className="spacer" />
+          {cleanLabel && (
+            <button type="button" className="chip-btn" onClick={() => void cleanup()}>
+              <IconBroom />
+              {cleanLabel}
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }

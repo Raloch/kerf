@@ -552,3 +552,23 @@
   color: var(--tx-dim);
   border-color: var(--line-2);
 }
+
+/* ---------- 底部存储条（空态整条不出现，见 Home.tsx 的注释） ---------- */
+.hm .home-foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  flex: 0 0 auto;
+  padding: 10px 22px;
+  min-height: 40px;
+  background: var(--panel);
+  border-top: 1px solid var(--line);
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+  color: var(--tx-faint);
+}
+.hm .hm-note b {
+  color: #e0938d;
+  font-weight: 600;
+}
