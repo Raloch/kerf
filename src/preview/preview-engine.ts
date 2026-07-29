@@ -19,11 +19,12 @@
  * 用户一个"听起来对但实际不对"的预览。多轨音频预览要等独立的音频引擎。
  */
 
-import type { AvSource, Timeline } from "../edl/types";
+import type { AvSource, ImageSource, Timeline } from "../edl/types";
 import { microsToSeconds, visibleVideoClips, type VisibleClip } from "../edl/sampling";
 import { createCompositor, type CompositorBackend } from "../compose/backend";
 import type { ComposeLayer, ComposeSourceLayer, Compositor } from "../compose/compositor";
 import { rasterizeText } from "../compose/text-raster";
+import { decodeImage, decodedImage } from "../compose/image-store";
 import { frameDurationMicros, MICROS_PER_SECOND } from "../time/timebase";
 import type { Rational } from "../time/rational";
 
@@ -242,9 +243,11 @@ export async function createPreviewEngine(
   function layersFor(
     timeline: Timeline,
     frame: number,
-  ): { layers: ComposeLayer[]; active: ActiveSource[] } {
+  ): { layers: ComposeLayer[]; active: ActiveSource[]; images: Set<ImageSource> } {
     const layers: ComposeLayer[] = [];
     const active: ActiveSource[] = [];
+    /** 这一帧用到的图片素材，供 `renderFrame` 在画之前把它们解出来。 */
+    const images = new Set<ImageSource>();
 
     /**
      * 一层 → 一个合成图层。素材还没就绪时返回 null（这一帧先不画它）。
@@ -273,6 +276,22 @@ export async function createPreviewEngine(
           image: raster.canvas,
           width: raster.width,
           height: raster.height,
+          ...looks,
+        };
+      }
+      if (visible.kind === "image") {
+        // 还没解好就这一帧先不画它，**完全同 video 元素的 `readyState < 2`**：
+        // 暂停态由 `renderFrame` 先 await 解码再画（下面那个 `pending`），播放态
+        // 跳过一帧无所谓。导出侧不能这么办（少一层是静默错），它靠
+        // `prepareImages()` 在逐帧循环之前挡住，见 `compose/image-store.ts`
+        images.add(visible.source);
+        const entry = decodedImage(visible.source.id);
+        if (!entry) return null;
+        return {
+          kind: "image",
+          image: entry.bitmap,
+          width: entry.width,
+          height: entry.height,
           ...looks,
         };
       }
@@ -320,7 +339,7 @@ export async function createPreviewEngine(
       const layer = toLayer(entry);
       if (layer) layers.push(layer);
     }
-    return { layers, active };
+    return { layers, active, images };
   }
 
   /**
@@ -349,15 +368,18 @@ export async function createPreviewEngine(
     },
 
     async renderFrame(timeline, frame) {
-      const { layers, active } = layersFor(timeline, frame);
-      // 暂停态要等素材就绪 + seek 完成再画，否则显示的是上一次的画面或纯黑
-      await Promise.all(
-        active.map(async ({ source, clipId, seekSeconds }) => {
+      const { layers, active, images } = layersFor(timeline, frame);
+      // 暂停态要等素材就绪 + seek 完成再画，否则显示的是上一次的画面或纯黑。
+      // 图片走同一条等待：解码是异步的，而不等的话刚导入的那张图要等到下一次
+      // 渲染才出现——而暂停时没有下一次
+      await Promise.all([
+        ...[...images].map((source) => decodeImage(source, compositor.width, compositor.height)),
+        ...active.map(async ({ source, clipId, seekSeconds }) => {
           const handle = handleFor(source, clipId);
           await ensureLoaded(handle.video);
           await seekTo(handle.video, seekSeconds);
         }),
-      );
+      ]);
       // seek 期间 handle.ready 可能才变 true，重新收集一次
       const fresh = layersFor(timeline, frame);
       await draw(fresh.layers.length > 0 ? fresh.layers : layers);

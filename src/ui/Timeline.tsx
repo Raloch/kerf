@@ -11,6 +11,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import {
   clipDuration,
+  clipSourceId,
   sourceGridFps,
   type Clip,
   type Timeline as Tl,
@@ -24,6 +25,7 @@ import { toNumber } from "../time/rational";
 import { useTimeline } from "../state/timeline-store";
 import { ghostForTrack, useClipDrag, type ClipDragApi, type Ghost } from "./use-clip-drag";
 import { buildStrip, cachedStrip, drawStrip } from "../media/thumbnails";
+import { decodeImage, decodedImage } from "../compose/image-store";
 import {
   buildWaveform,
   cachedWaveform,
@@ -39,7 +41,7 @@ import {
   type Keyframe,
 } from "../anim/keyframes";
 import { PROPERTY_LABELS, PROPERTY_RANGES } from "../state/operations";
-import { IconCut, IconEye, IconFilm, IconLock, IconMagnet, IconMute, IconPlus, IconText, IconTrash, IconVolume, IconWave } from "./icons";
+import { IconCut, IconEye, IconFilm, IconImage, IconLock, IconMagnet, IconMute, IconPlus, IconText, IconTrash, IconVolume, IconWave } from "./icons";
 
 /** 片段内缩略图条高度，与 .strip 的 CSS 保持一致。 */
 const STRIP_HEIGHT = 32;
@@ -624,13 +626,16 @@ function ClipView({
 }) {
   // 片段颜色和标签跟着**片段**类型走，不跟轨道类型：文字片段可以放在任意画面轨上
   const isText = clip.kind === "text";
-  const source = clip.kind === "media" ? timeline.sources.find((s) => s.id === clip.sourceId) : undefined;
+  const sourceId = clipSourceId(clip);
+  const source = sourceId ? timeline.sources.find((s) => s.id === sourceId) : undefined;
   const sourceInFrame = clip.kind === "media" ? clip.sourceIn : 0;
   const label = clip.name ?? (clip.kind === "text" ? clip.text : source?.name) ?? clip.id;
   const length = clipDuration(clip);
   const widthPx = length * pxPerFrame;
   const stripRef = useRef<HTMLCanvasElement>(null);
   const waveRef = useRef<HTMLCanvasElement>(null);
+  /** 图片解码是异步的，解好之后靠它触发一次重画（同缩略图等代理就绪）。 */
+  const [imageTick, setImageTick] = useState(0);
   // 拆成两个标量再进依赖数组：直接依赖 `clip` 会让每次任何编辑都重画所有波形
   const volumeBase = clip.kind === "media" ? clip.volume : undefined;
   const keyframes = clip.keyframes;
@@ -682,6 +687,38 @@ function ClipView({
       cancelled = true;
     };
   }, [sourceInFrame, kind, length, proxyUrl, pxPerFrame, source, widthPx]);
+
+  /**
+   * 图片片段把**图本身**平铺成缩略条。
+   *
+   * 走的是 `compose/image-store.ts` 那份解码结果，不另解一次：那是渲染路径已经
+   * 要用的东西，时间轴再解一遍就是同一张图在内存里躺两份。还没解好时不画——
+   * 预览那边一解出来就会重渲，这里的 effect 也会跟着 `imageTick` 再跑一次
+   */
+  useEffect(() => {
+    if (kind !== "video" || clip.kind !== "image" || source?.kind !== "image") return;
+    const canvas = stripRef.current;
+    if (!canvas || widthPx < 12) return;
+    const entry = decodedImage(source.id);
+    if (!entry) {
+      void decodeImage(source, timeline.width, timeline.height).then(() => setImageTick((n) => n + 1));
+      return;
+    }
+
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    const h = STRIP_HEIGHT;
+    canvas.width = Math.max(1, Math.round(widthPx * dpr));
+    canvas.height = Math.round(h * dpr);
+    canvas.style.height = `${h}px`;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.scale(dpr, dpr);
+    // 按缩略条高度等比，横向平铺——和视频那条缩略条长得一致，一眼能看出"这是一段画面"
+    const tileWidth = Math.max(1, (entry.width / entry.height) * h);
+    for (let x = 0; x < widthPx; x += tileWidth) {
+      ctx.drawImage(entry.bitmap, x, 0, tileWidth, h);
+    }
+  }, [clip.kind, imageTick, kind, source, timeline.height, timeline.width, widthPx]);
 
   // 波形只画音频轨上的素材片段。**解原片而不是代理**（代理丢掉了音轨），所以
   // 不必等代理就绪；解不出来时缓存记 null，不会每次重绘都重试
@@ -783,7 +820,7 @@ function ClipView({
       {kind === "video" && !isText && <canvas className="strip" ref={stripRef} />}
       {kind === "audio" && !isText && <canvas className="wave" ref={waveRef} />}
       <span className="lbl">
-        {isText ? <IconText /> : kind === "video" ? <IconFilm /> : <IconWave />}
+        {isText ? <IconText /> : clip.kind === "image" ? <IconImage /> : kind === "video" ? <IconFilm /> : <IconWave />}
         {label}
       </span>
       {/* 片段太窄时藏掉帧数，否则会溢出成一团 */}
@@ -792,7 +829,7 @@ function ClipView({
       {/* 裁切手柄。窄片段也要留出可抓区域，否则短片段无法裁切 */}
       <span
         className="grip l"
-        title={isText ? "裁切入点" : "裁切入点（拖动同时改变引用源片的起点）"}
+        title={clip.kind === "media" ? "裁切入点（拖动同时改变引用源片的起点）" : "裁切入点"}
         onPointerDown={(e) => drag.onHandlePointerDown(e, clip, trackId, "in")}
       />
       <span

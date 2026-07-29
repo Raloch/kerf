@@ -41,6 +41,14 @@ export interface ResidencySnapshot {
   readonly openInputs: number;
   /** 文字栅格缓存占的字节。每张是**输出尺寸**的画布，1080p 下单张 8.3MB。 */
   readonly textRasterBytes: number;
+  /**
+   * 已解码图片占的字节（`宽 × 高 × 4`）。
+   *
+   * 单张可以很大：解码尺寸按输出分辨率的 2 倍封顶，1080p 项目下上限 3840×2560
+   * = 37MB。**目前没有淘汰**（解过就一直留着），所以这一项的上界是"项目里有几张
+   * 不同的图"——几十张大图的幻灯片会把它顶起来，而这个数就是那时唯一的读数。
+   */
+  readonly decodedImageBytes: number;
   /** 混好的 PCM。这一项**随片长线性增长**。 */
   readonly audioPcmBytes: number;
   /**
@@ -94,6 +102,7 @@ class ResidencyMeter {
   private audioMixBytes = 0;
   /** 文字缓存的字节数由 text-raster 自己算，这里只存一个取值函数，避免反向依赖。 */
   private textRasterBytes: () => number = () => 0;
+  private decodedImageBytes: () => number = () => 0;
 
   retainSample(width: number, height: number): void {
     this.samples++;
@@ -134,6 +143,11 @@ class ResidencyMeter {
     this.textRasterBytes = read;
   }
 
+  /** 同上，图片解码缓存那一份。注入而不是直接 import，理由同 `bindTextRasterBytes`。 */
+  bindDecodedImageBytes(read: () => number): void {
+    this.decodedImageBytes = read;
+  }
+
   /**
    * 归零。
    *
@@ -155,16 +169,22 @@ class ResidencyMeter {
 
   snapshot(): ResidencySnapshot {
     const textRasterBytes = this.textRasterBytes();
+    const decodedImageBytes = this.decodedImageBytes();
     return {
       decodedSamples: this.samples,
       decodedBytes: this.sampleBytes,
       openCursors: this.cursors,
       openInputs: this.inputs,
       textRasterBytes,
+      decodedImageBytes,
       audioPcmBytes: this.audioPcmBytes,
       audioMixBytes: this.audioMixBytes,
       estimatedBytes:
-        this.sampleBytes + textRasterBytes + this.audioPcmBytes + this.audioMixBytes,
+        this.sampleBytes +
+        textRasterBytes +
+        decodedImageBytes +
+        this.audioPcmBytes +
+        this.audioMixBytes,
       jsHeapBytes: readJsHeap(),
     };
   }

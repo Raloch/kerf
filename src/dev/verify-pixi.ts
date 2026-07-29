@@ -427,6 +427,49 @@ export async function verifyPixiBackend(): Promise<PixiVerifyResult> {
     ),
   );
 
+  // ---- 9b'. 同一个槽位上源尺寸变了（D36）----
+  // 两条判据缺一不可：**和 Canvas2D 一致**（抓后端分歧）、**命中手算的黑边**
+  // （两个后端一起错时一致性仍然成立——同"两条路径比对覆盖不了渲染算法本身"）
+  {
+    let worstPair = 0;
+    let worstPairName = "";
+    let worstBand = 0;
+    let worstBandName = "";
+    for (const c of report.sizeSwitch) {
+      const pair = Math.max(Math.abs(c.pixi.top - c.canvas2d.top), Math.abs(c.pixi.bottom - c.canvas2d.bottom));
+      if (pair > worstPair) {
+        worstPair = pair;
+        worstPairName = `${c.name}：Pixi 上下 ${c.pixi.top}/${c.pixi.bottom} vs Canvas2D ${c.canvas2d.top}/${c.canvas2d.bottom}`;
+      }
+      const band = Math.max(
+        Math.abs(c.pixi.top - c.expectedBand),
+        Math.abs(c.pixi.bottom - c.expectedBand),
+      );
+      if (band > worstBand) {
+        worstBand = band;
+        worstBandName = `${c.name}：期望上下各 ${c.expectedBand}，实际 ${c.pixi.top}/${c.pixi.bottom}`;
+      }
+    }
+    checks.push(
+      check(
+        "源尺寸在同一槽位上来回变时两个后端一致",
+        "≤ 1px",
+        worstPair === 0
+          ? `${report.sizeSwitch.length} 步逐条完全相同`
+          : `差 ${worstPair}px · ${worstPairName}`,
+        worstPair <= 1,
+      ),
+    );
+    checks.push(
+      check(
+        "换了源尺寸之后留边跟着换（不是按上一个源的尺寸摆）",
+        "≤ 1px",
+        worstBand === 0 ? "三步都命中手算值" : `差 ${worstBand}px · ${worstBandName}`,
+        worstBand <= 1,
+      ),
+    );
+  }
+
   // ---- 9c. 3D LUT（M2 后半段）----
   // 比调色那三条更要紧：调色错了还能靠"画面偏绿了"看出来，LUT 本来就是用来把
   // 颜色改成另一样的，查歪了肉眼分不出来。半纹素偏移、切片拼接、蓝方向的手动

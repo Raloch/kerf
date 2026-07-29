@@ -923,7 +923,7 @@ export function setClipVolume(timeline: Timeline, clipId: ClipId, volume: number
   const found = findClip(timeline, clipId);
   if (!found) return reject(timeline, `找不到片段 ${clipId}`);
   if (found.track.locked) return reject(timeline, "轨道已锁定");
-  if (found.clip.kind !== "media") return reject(timeline, "文字片段没有音量");
+  if (found.clip.kind !== "media") return reject(timeline, "只有素材片段有音量");
   // NaN 会一路传到 GainNode，那一段整个静音且不报错
   if (!Number.isFinite(volume)) return reject(timeline, "音量必须是有限数");
 
@@ -977,9 +977,9 @@ export function setKeyframe(
   if (!found) return reject(timeline, `找不到片段 ${clipId}`);
   if (found.track.locked) return reject(timeline, "轨道已锁定");
   // 关键帧通道挂在 `ClipBase` 上（三组共用一张表，见 keyframes.ts），所以类型上
-  // 拦不住"给文字片段打一条音量曲线"。那条曲线永远不会被求值——文字片段没有音轨
+  // 拦不住"给文字或图片片段打一条音量曲线"。那条曲线永远不会被求值——它们没有音轨
   if (isAudioProperty(property) && found.clip.kind !== "media") {
-    return reject(timeline, "文字片段没有音量");
+    return reject(timeline, "只有素材片段有音量");
   }
 
   const clamped = clampProperty(property, value);
@@ -1079,7 +1079,7 @@ export function clearKeyframes(
     // 表现是"关掉动画之后调色整个丢了"
     if (isAudioProperty(property)) {
       // 音量的静态值是片段上的标量，没有"一组"可以归一化，所以自己夹紧 + 判缺省
-      if (next.kind !== "media") return reject(timeline, "文字片段没有音量");
+      if (next.kind !== "media") return reject(timeline, "只有素材片段有音量");
       const clamped = clampProperty(property, bakeValue);
       const keep = clamped === PROPERTY_RANGES[property].fallback ? undefined : clamped;
       next = setOptional(next, property, keep);
@@ -1260,6 +1260,14 @@ export function addTextClip(timeline: Timeline, options: AddTextOptions): AddCli
 // 导入素材
 // ---------------------------------------------------------------------------
 
+/**
+ * 图片片段的缺省时长（秒）。
+ *
+ * 一张图在时间轴上想占多久都行，所以这个数纯粹是"刚拖进来时多长"。5 秒是图片
+ * 轮播的常见长度，也足够长到能一眼看见、不至于让用户先去拉一下才看得到。
+ */
+export const IMAGE_DEFAULT_SECONDS = 5;
+
 export interface AddSourceOptions {
   readonly source: MediaSource;
   /** 片段放在哪一帧起。通常是播放头。 */
@@ -1304,29 +1312,47 @@ export function addSource(timeline: Timeline, options: AddSourceOptions): AddSou
     empty && source.kind === "av"
       ? { ...timeline, fps: source.fps, width: source.width, height: source.height }
       : timeline;
-  // 帧数要在**定好项目帧率之后**再算：纯音频素材的帧数是按项目帧率派生的
-  const lengthFrames = sourceDurationFrames(source, conformed.fps);
+  /**
+   * 片段初始有多长。
+   *
+   * 视频和音频用素材自己的长度；**图片没有长度**，用一个缺省秒数——它想占多久都行，
+   * 而 0 帧或 1 帧的片段用户还得自己拉开。这个数不是"源片长度"，所以刻意不走
+   * `sourceDurationFrames`（那个函数对图片返回 `Infinity`，正是裁切要的答案）。
+   */
+  const lengthFrames =
+    source.kind === "image"
+      ? Math.max(1, Math.round((IMAGE_DEFAULT_SECONDS * conformed.fps.num) / conformed.fps.den))
+      : // 帧数要在**定好项目帧率之后**再算：纯音频素材的帧数是按项目帧率派生的
+        sourceDurationFrames(source, conformed.fps);
   const withSource: Timeline = {
     ...conformed,
     sources: [...conformed.sources, source],
   };
+
+  const placing = { timelineIn, timelineOut: timelineIn + lengthFrames, name: source.name };
 
   /** 画面片段和音频片段共用同一份占位与 `sourceIn`，只是落在不同种类的轨上。 */
   const clipFor = (suffix: string): MediaClip => ({
     id: `${source.id}${suffix}`,
     kind: "media",
     sourceId: source.id,
-    name: source.name,
-    timelineIn,
-    timelineOut: timelineIn + lengthFrames,
+    ...placing,
     sourceIn: 0,
   });
 
-  const plan: { readonly clip: MediaClip; readonly kind: TrackKind }[] = [];
+  const plan: { readonly clip: Clip; readonly kind: TrackKind }[] = [];
   if (source.kind === "av") plan.push({ clip: clipFor("-v"), kind: "video" });
+  if (source.kind === "image") {
+    // 图片片段**没有 `sourceIn`**，所以不能走 `clipFor`——那是它自己一种片段的
+    // 全部理由，见 `ImageClip`
+    plan.push({
+      clip: { id: `${source.id}-i`, kind: "image", sourceId: source.id, ...placing },
+      kind: "video",
+    });
+  }
   if (source.hasAudio) plan.push({ clip: clipFor("-a"), kind: "audio" });
   if (plan.length === 0) {
-    // 探针不会产出这种素材（两条路都要求对应轨道解得动），所以这只是不信任它
+    // 探针不会产出这种素材（三条路都要求对应的轨道/格式能用），所以这只是不信任它
     return reject(timeline, `素材 ${source.name} 既没有画面也没有能解的声音`);
   }
 
@@ -1350,7 +1376,7 @@ export function addSource(timeline: Timeline, options: AddSourceOptions): AddSou
  */
 function placeOnFirstFittingTrack(
   timeline: Timeline,
-  clip: MediaClip,
+  clip: Clip,
   kind: TrackKind,
 ): EditResult {
   const candidates = timeline.tracks.filter((t) => t.kind === kind);

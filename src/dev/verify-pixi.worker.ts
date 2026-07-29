@@ -52,6 +52,7 @@ import {
 } from "../compose/transition-shader";
 import {
   createCanvas2DCompositor,
+  type ComposeLayer,
   type Compositor,
   type LayerTransform,
 } from "../compose/compositor";
@@ -180,6 +181,8 @@ export interface PixiProbeReport {
   readonly transforms: readonly TransformComparison[];
   /** 一级调色：GPU 出来的像素与 CPU 参照实现的比对（M2 后半段加的）。 */
   readonly colors: readonly ColorComparison[];
+  /** 同一个槽位上源尺寸变化时两个后端是否一致，见 `compareSizeSwitch`。 */
+  readonly sizeSwitch: readonly SizeSwitchComparison[];
   /** 3D LUT：同上，外加"先调色再 LUT"这个顺序的钉子。 */
   readonly luts: readonly LutComparison[];
   readonly transitions: readonly TransitionComparison[];
@@ -413,6 +416,98 @@ async function transformPass(sample: VideoSample): Promise<TransformComparison[]
   } finally {
     pixi.dispose();
     canvas2d.dispose();
+  }
+}
+
+/**
+ * **同一个槽位上源尺寸变了。** 两个后端必须给出同一个结果。
+ *
+ * 这一组是被一个真 bug 逼出来的（D36）：`ImageSource.resize()` 会把 `Texture` 的
+ * frame / orig / uvs 全都更新好，但**通知不到 `Sprite` 的包围盒**——sprite 还按
+ * 上一个源的尺寸算自己有多大，而我们给的 `scale` 是按新尺寸算的，画出来就是
+ * "旧尺寸 × 新缩放"。实测 640×360 之后画 200×100：屏幕那 320px 只显示了图片
+ * 左边 100px（640/200 = 3.2 倍），纵向拉到底，**而上黑边仍然是对的 80px**。
+ *
+ * 为什么别的自检抓不到它：
+ *
+ * - **「预览 / 导出一致性」抓不到**——两条路径都走 Pixi，各画各的同一个错。这正是
+ *   「两条路径比对覆盖不了渲染算法本身」那条教训的又一个实例。
+ * - **「多片段一致性」抓不到**——它同一条轨上的片段都用同一个素材，源尺寸从不变。
+ *
+ * 而它影响的**不只是图片**：同一条轨上接两个分辨率不同的视频片段就会中招，
+ * 那是极常见的剪辑动作。所以判据写成"源尺寸在同一槽位上来回变"，与图层种类无关。
+ *
+ * 用两张纯色图而不是真视频帧：把被测对象从解码里剥出来（同 spike 里其它组的做法）。
+ * 大图 640×360（16:9，方形输出上应上下各留 (320-180)/2 = 70），小图 200×100（2:1，
+ * 应上下各留 (320-160)/2 = 80）——两个期望值不同，所以"没跟着换"一定会露出来。
+ */
+export interface SizeSwitchComparison {
+  readonly name: string;
+  /** 手算的期望上/下黑边。 */
+  readonly expectedBand: number;
+  readonly pixi: Bands;
+  readonly canvas2d: Bands;
+}
+
+const SIZE_SWITCH_BIG = { width: 640, height: 360 } as const;
+const SIZE_SWITCH_SMALL = { width: 200, height: 100 } as const;
+
+/** 造一张左右两色的位图。左右不同色是为了让"只显示了左边一小块"这种错露出来。 */
+async function twoToneBitmap(width: number, height: number): Promise<ImageBitmap> {
+  const canvas = new OffscreenCanvas(width, height);
+  const ctx = canvas.getContext("2d", { alpha: false });
+  if (!ctx) throw new Error("造尺寸切换用的位图拿不到 2D 上下文");
+  ctx.fillStyle = "rgb(220,40,40)";
+  ctx.fillRect(0, 0, width / 2, height);
+  ctx.fillStyle = "rgb(40,60,220)";
+  ctx.fillRect(width / 2, 0, width / 2, height);
+  return createImageBitmap(canvas);
+}
+
+async function compareSizeSwitch(): Promise<SizeSwitchComparison[]> {
+  const big = await twoToneBitmap(SIZE_SWITCH_BIG.width, SIZE_SWITCH_BIG.height);
+  const small = await twoToneBitmap(SIZE_SWITCH_SMALL.width, SIZE_SWITCH_SMALL.height);
+  const bandOf = (size: { readonly width: number; readonly height: number }) =>
+    Math.round((OUT - (size.height * OUT) / size.width) / 2);
+
+  const probe = new OffscreenCanvas(OUT, OUT);
+  const probeCtx = probe.getContext("2d", { willReadFrequently: true });
+  if (!probeCtx) throw new Error("尺寸切换探测画布没有 2D 上下文");
+
+  const snapshot = (
+    compositor: { composeFrame: (layers: ComposeLayer[]) => void; canvas: CanvasImageSource },
+    bitmap: ImageBitmap,
+  ): Bands => {
+    compositor.composeFrame([
+      { kind: "image", image: bitmap, width: bitmap.width, height: bitmap.height },
+    ]);
+    probeCtx.clearRect(0, 0, OUT, OUT);
+    probeCtx.drawImage(compositor.canvas, 0, 0);
+    return measure(probeCtx, OUT, OUT);
+  };
+
+  // **顺序有意义**：大 → 小 → 大。只测一个方向的话，"从小到大"那一半是对的
+  // （第一版实测就是这样），会让人以为整件事没问题
+  const steps = [
+    { name: "先画 640×360", bitmap: big, size: SIZE_SWITCH_BIG },
+    { name: "换成 200×100（同一个槽位）", bitmap: small, size: SIZE_SWITCH_SMALL },
+    { name: "再换回 640×360", bitmap: big, size: SIZE_SWITCH_BIG },
+  ] as const;
+
+  const pixi = await createPixiCompositor(OUT, OUT);
+  const canvas2d = createCanvas2DCompositor(OUT, OUT);
+  try {
+    return steps.map((step) => ({
+      name: step.name,
+      expectedBand: bandOf(step.size),
+      pixi: snapshot(pixi, step.bitmap),
+      canvas2d: snapshot(canvas2d, step.bitmap),
+    }));
+  } finally {
+    pixi.dispose();
+    canvas2d.dispose();
+    big.close();
+    small.close();
   }
 }
 
@@ -1312,6 +1407,8 @@ async function run(): Promise<PixiProbeReport> {
 
     // ---- 5b. 一级调色：GPU 算出来的颜色是不是 colorMatrixOf() 那个矩阵 ----
     const colors = await colorPass(probeSample);
+    // 源尺寸在同一槽位上变化：这一组只用纯色位图，与解码无关（见 `compareSizeSwitch`）
+    const sizeSwitch = await compareSizeSwitch();
 
     // ---- 5c. 3D LUT：GPU 查出来的是不是 sampleLutTexture() 查出来的 ----
     const luts = await lutPass(probeSample);
@@ -1347,6 +1444,7 @@ async function run(): Promise<PixiProbeReport> {
       frameCount: FRAMES,
       transforms,
       colors,
+      sizeSwitch,
       luts,
       transitions,
       perf,

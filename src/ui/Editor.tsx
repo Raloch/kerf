@@ -24,6 +24,7 @@ import {
   IconCheck,
   IconDownload,
   IconFilm,
+  IconImage,
   IconMark,
   IconNo,
   IconPlus,
@@ -179,6 +180,19 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
       setBusy("读取素材…");
       setError(null);
       try {
+        // 图片走**另一个探针**，它一行 mediabunny 都不用——导入一张 PNG 不该把
+        // 那 500KB 拖进来（见 `media/image-probe.ts` 的文件头）
+        const { looksLikeImage } = await import("../media/image-probe");
+        if (looksLikeImage(file)) {
+          const { probeImageFile } = await import("../media/image-probe");
+          const { source } = await probeImageFile(file);
+          addSource(source);
+          void import("../state/project-store").then(({ putSourceAsset }) =>
+            putSourceAsset(source),
+          );
+          setBusy(null);
+          return;
+        }
         const { probeFile, wasFpsSnapped } = await import("../media/probe");
         const result = await probeFile(file);
         addSource(result.source);
@@ -360,13 +374,21 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
           <div className="pane-body">
             {timeline.sources.length === 0 ? (
               <p className="empty">
-                还没有素材。导入一个视频或音频文件开始，或用顶栏的「M0 自检」生成测试素材。
+                还没有素材。导入视频、音频或图片开始，或用顶栏的「M0 自检」生成测试素材。
               </p>
             ) : (
               <div className="assets">
                 {timeline.sources.map((source) => (
                   <button type="button" className="asset" key={source.id} title={source.name}>
-                    <span className="thumb">{source.kind === "av" ? <IconFilm /> : <IconWave />}</span>
+                    <span className="thumb">
+                      {source.kind === "av" ? (
+                        <IconFilm />
+                      ) : source.kind === "image" ? (
+                        <IconImage />
+                      ) : (
+                        <IconWave />
+                      )}
+                    </span>
                     <span>
                       <span className="nm">{source.name}</span>
                       <span className="meta">
@@ -374,6 +396,16 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
                           <>
                             {source.width}×{source.height} · {formatFps(source.fps)} ·{" "}
                             {formatDuration(source.durationFrames, source.fps)}
+                          </>
+                        ) : source.kind === "image" ? (
+                          // 图片没有时长（想占多久都行），所以这里只报尺寸和格式。
+                          // 动图要说出来：我们只画第一帧，静默处理就是硬规则 10
+                          <>
+                            {source.width}×{source.height} ·{" "}
+                            {source.mimeType.replace(/^image\//, "").toUpperCase()}
+                            {source.frameCount !== null && source.frameCount > 1
+                              ? ` · 动图 ${source.frameCount} 帧，只用第一帧`
+                              : ""}
                           </>
                         ) : (
                           // 纯音频素材按项目帧率数帧（它没有自己的栅格，见 `sourceGridFps`），
@@ -403,7 +435,7 @@ export function Editor({ onOpenSelfCheck }: { readonly onOpenSelfCheck: () => vo
                 type="file"
                 // 音频也收：配乐和旁白是纯音频文件，而混流、波形、音量包络、
                 // 交叉淡化早就都能用了，此前缺的只有这个入口（见 `probeFile`）
-                accept="video/*,audio/*"
+                accept="video/*,audio/*,image/*"
                 onChange={(e) => {
                   const file = e.target.files?.[0];
                   if (file) void importFile(file);

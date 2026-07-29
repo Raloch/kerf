@@ -85,8 +85,18 @@ export interface PixiCompositor extends Compositor {
 
 interface LayerSlot {
   readonly source: ImageSource;
-  readonly texture: Texture;
+  /**
+   * 当前的取样纹理。**源尺寸变了要换一个新的**，不是 readonly——见 `configureSlot`
+   * 里那段注释：`Sprite` 的包围盒不跟着 `ImageSource.resize()` 变。
+   */
+  texture: Texture;
   readonly sprite: Sprite;
+  /**
+   * 上一帧这个槽位的源尺寸。**判据必须记在我们自己这边**：`texture.frame` 在
+   * `resize()` 之后已经跟上了新尺寸，拿它当判据的话条件恒为假（踩过）。
+   */
+  sourceWidth: number;
+  sourceHeight: number;
   /**
    * 调色滤镜。**懒建并跨帧复用**——和 `ImageSource` 是同一个理由：
    * 每帧 `new ColorMatrixFilter()` 会逐帧新建 GPU 资源，导出慢一个量级。
@@ -236,6 +246,8 @@ export async function createPixiCompositor(
       source,
       texture,
       sprite,
+      sourceWidth: 1,
+      sourceHeight: 1,
       colorFilter: null,
       lutFilter: null,
       lutData: null,
@@ -398,6 +410,36 @@ export async function createPixiCompositor(
     // 尺寸没变时 resize 是 no-op，Pixi 的上传就会走 texSubImage2D 复用纹理
     slot.source.resize(srcWidth, srcHeight);
     slot.source.update();
+    /**
+     * **源尺寸变了要换一张新 `Texture` 塞给 sprite。**
+     *
+     * `ImageSource.resize()` 会把 `Texture` 的 frame / orig / uvs 都更新好（实测
+     * 全对），但**通知不到 `Sprite` 的包围盒**——sprite 还按上一个源的尺寸算自己
+     * 有多大，而我们给的 `scale` 是按新尺寸算的，于是画出来是"旧尺寸 × 新缩放"。
+     *
+     * 实测（先画 640×360 的视频帧、再画 200×100 的图片）：屏幕那 320px 宽只显示了
+     * 图片左边 100px（640/200 = 3.2 倍），纵向也被拉到底，而**上黑边仍然是对的
+     * 80px**。所以只看"预览与导出一致"或者只看上边距都抓不住它——Canvas2D 后端
+     * 同一份输入完全正确，两条路径**各画各的错**才会被一致性断言放过。这是
+     * 「Pixi 的槽位是跨帧复用的状态」第三次犯案（前两次是 `anchor` / `rotation`
+     * 和 `filters`），而这次连"两条分支都显式写"都不够，状态藏在 sprite 内部。
+     *
+     * 同一个 `Texture` 对象重新赋值**没用**（Pixi 的 setter 对相同引用直接返回），
+     * 所以换一个新的。source 不变，因此**不新建 GPU 纹理**——`destroy(false)`
+     * 就是"只拆这层壳"。**只在尺寸真的变了时换**（片段切换那一帧）。
+     *
+     * 判据用我们自己记的 `slot.sourceWidth`，**不能用 `texture.frame`**：它在
+     * `resize()` 之后已经等于新尺寸了，拿它当判据的话条件恒为假、这段永不执行
+     * （第一版就是这么写的，改完读数一点没变）。
+     */
+    if (slot.sourceWidth !== srcWidth || slot.sourceHeight !== srcHeight) {
+      const previous = slot.texture;
+      slot.texture = new pixi.Texture({ source: slot.source });
+      slot.sprite.texture = slot.texture;
+      previous.destroy(false);
+      slot.sourceWidth = srcWidth;
+      slot.sourceHeight = srcHeight;
+    }
 
     slot.sprite.visible = true;
     slot.sprite.alpha = layer.transform?.opacity ?? 1;

@@ -120,6 +120,14 @@ export const IconFilm = () => (
   </svg>
 );
 
+export const IconImage = () => (
+  <svg viewBox="0 0 16 16" aria-hidden="true" {...stroke} strokeWidth={1.2}>
+    <rect x="2" y="3" width="12" height="10" rx="1.5" />
+    <circle cx="5.75" cy="6.25" r="1.1" />
+    <path d="M2.4 11.2 6 8.2l2.6 2.1L11 8l2.6 2.6" />
+  </svg>
+);
+
 export const IconWave = () => (
   <svg viewBox="0 0 16 16" aria-hidden="true" {...stroke} strokeWidth={1.2}>
     <path d="M2.5 6.5v3M5.2 4.5v7M8 3v10M10.8 5v6M13.5 6.5v3" />

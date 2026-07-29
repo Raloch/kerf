@@ -29,6 +29,8 @@ import {
   sourceGridFps,
   type AvSource,
   type Clip,
+  type ImageClip,
+  type ImageSource,
   type MediaClip,
   type LutSource,
   type MediaSource,
@@ -138,13 +140,33 @@ export interface VisibleTextClip {
 }
 
 /**
+ * 某一帧要画的一层图片。
+ *
+ * **没有 `sourceMicros`**：整段占位画的都是同一张图，转场窗口里也一样。这个字段
+ * 不存在比"存一个恒等于片段起点的值"好——后者会让调用方以为可以拿它去取帧。
+ *
+ * 像素本身不在这里：`ImageBitmap` 是**每个上下文一份**的资源，而 EDL 与取样映射
+ * 都是纯数据（要能进撤销栈、要能 postMessage）。两条渲染路径各自去
+ * `compose/image-store.ts` 查同一个 sourceId，那是它们共用的那份解码结果。
+ */
+export interface VisibleImageClip {
+  readonly kind: "image";
+  readonly trackId: string;
+  readonly clip: ImageClip;
+  readonly source: ImageSource;
+  readonly transform?: LayerTransform;
+  readonly color?: ColorAdjust;
+  readonly lut?: LutSource;
+}
+
+/**
  * 某一帧在某条画面轨上要画的东西。
  *
  * `kind` 与 `clip.kind` 同值，冗余是刻意的：调用点写 `if (v.kind === "media")`
  * 就能同时收窄 `clip` / `source` / `sourceMicros`，靠嵌套的 `v.clip.kind` 收窄不了外层。
  * 这个字段只在下面两个函数里赋值，不存在第二个真值来源。
  */
-export type VisibleClip = VisibleMediaClip | VisibleTextClip;
+export type VisibleClip = VisibleMediaClip | VisibleTextClip | VisibleImageClip;
 
 /**
  * 一帧里的一个 shader 转场：两层已经各自解算好，等着被渲进两张纹理再混。
@@ -336,6 +358,12 @@ function visibleFor(
   }
   const source = timeline.sources.find((s) => s.id === clip.sourceId);
   if (!source) return null;
+  if (clip.kind === "image") {
+    // 图片层**没有取帧位置**：整段占位画的都是同一张图，转场窗口里也一样，所以
+    // 这里既不算 `sourceMicros` 也不夹紧。`inTransition` 对它没有意义
+    if (source.kind !== "image") return null;
+    return { kind: "image", trackId: track.id, clip, source, ...extras };
+  }
   // 纯音频素材没有像素，跳过它**就是**正确语义，不是"静默丢了一层"——没有 UI
   // 能把它放到画面轨上（`moveClip` 不许跨轨道种类拖，`addSource` 按种类放），
   // 所以这一行实际拦不到东西，留着是防将来新的编辑入口忘了分种类

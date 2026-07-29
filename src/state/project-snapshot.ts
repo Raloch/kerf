@@ -36,6 +36,7 @@ import type {
   Timeline,
   Track,
 } from "../edl/types";
+import { clipSourceId } from "../edl/types";
 import { withNormalizedTracks } from "./operations";
 
 /**
@@ -46,7 +47,7 @@ import { withNormalizedTracks } from "./operations";
  * 合成器里才炸，而那时早已看不出是快照的问题。版本不认就当没有存过（见
  * `readSnapshot` 的调用方），代价是丢一次未保存的编辑，比恢复出一个半坏的项目好。
  */
-export const SNAPSHOT_VERSION = 3;
+export const SNAPSHOT_VERSION = 4;
 
 /**
  * 素材在快照里的样子：除 `file` 之外的一切。文件本身单独存一份，见 `project-store.ts`。
@@ -223,8 +224,12 @@ export function fromSnapshot(snapshot: ProjectSnapshot, assets: RestoreAssets): 
   const tracks: Track[] = snapshot.timeline.tracks.map((track) => {
     const clips: Clip[] = [];
     for (const clip of track.clips) {
-      if (clip.kind === "media" && missingSourceIds.has(clip.sourceId)) {
-        dropCount.set(clip.sourceId, (dropCount.get(clip.sourceId) ?? 0) + 1);
+      // **问 `clipSourceId` 而不是判 `kind === "media"`**：图片片段同样带 `sourceId`，
+      // 而漏掉它的表现是"图片文件找不回来了，片段却留着"——渲染时那一层静默消失，
+      // 而用户得到的提示里也不会提这张图（见 `clipSourceId` 的注释）
+      const sourceId = clipSourceId(clip);
+      if (sourceId !== null && missingSourceIds.has(sourceId)) {
+        dropCount.set(sourceId, (dropCount.get(sourceId) ?? 0) + 1);
         continue;
       }
       // LUT / 字体丢了**不删片段**：它照样渲染，只是不上那张表、字体退回兜底。

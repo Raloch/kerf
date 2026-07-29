@@ -34,10 +34,13 @@ import { formatCssColor, parseCssColor, toHexRgb } from "../compose/css-color";
 import { newFontFamily, registerFont } from "../compose/font-registry";
 import { parseCubeLut } from "../compose/lut";
 import { TEXT_STYLE_DEFAULTS } from "../compose/text-raster";
+import { decodeSizeFor } from "../compose/image-store";
 import {
   clipDuration,
+  clipSourceId,
   findLut,
   type Clip,
+  type ImageClip,
   type MediaClip,
   type TextClip,
   type Timeline,
@@ -181,10 +184,10 @@ export function Inspector() {
 
   const { clip, track } = found;
   // 先落到 const 再判别：属性路径的收窄进不到 find() 的回调里
-  const sourceName =
-    clip.kind === "media"
-      ? timeline.sources.find((s) => s.id === clip.sourceId)?.name
-      : undefined;
+  const sourceId = clipSourceId(clip);
+  const sourceName = sourceId
+    ? timeline.sources.find((s) => s.id === sourceId)?.name
+    : undefined;
 
   return (
     <>
@@ -205,7 +208,14 @@ export function Inspector() {
             {clip.name ?? (clip.kind === "text" ? clip.text : sourceName) ?? clip.id}
           </div>
           <div className="s">
-            {clip.kind === "text" ? "文字" : track.kind === "video" ? "视频" : "音频"} · {track.id}
+            {clip.kind === "text"
+              ? "文字"
+              : clip.kind === "image"
+                ? "图片"
+                : track.kind === "video"
+                  ? "视频"
+                  : "音频"}{" "}
+            · {track.id}
           </div>
         </div>
       </div>
@@ -230,6 +240,8 @@ export function Inspector() {
 
       {clip.kind === "text" ? (
         <TextSection clip={clip} />
+      ) : clip.kind === "image" ? (
+        <ImageSection clip={clip} timeline={timeline} />
       ) : (
         <SourceSection clip={clip} timeline={timeline} />
       )}
@@ -270,6 +282,59 @@ function SourceSection({
           <label>源时间码</label>
           <span className="val">{framesToTimecode(clip.sourceIn, timeline.fps)}</span>
         </div>
+      </div>
+    </>
+  );
+}
+
+/**
+ * 图片片段那一节。
+ *
+ * **没有"源起始帧"**：一张图没有"哪一刻"，那一行会是个恒为 0 的谜。
+ *
+ * 有的是**解码尺寸**，而且只在它小于原图时才出现——那是一次看得见的画质取舍
+ * （见 `compose/image-store.ts` 的 `MAX_OVERSAMPLE`），静默缩掉就是硬规则 10。
+ *
+ * 尺寸**直接算，不去问缓存**（`decodeSizeFor` 是纯函数）。第一版读的是
+ * `decodedImage()` 的结果，于是渲染那一刻还没解好就什么都不显示，而解好之后
+ * 没有任何东西触发重渲——那条"看得见的降级"实际上**看不见**，实测 6000×4000
+ * 的图只显示了原图尺寸。要说的本来就是"我们会把它解成多大"，那不需要等。
+ */
+function ImageSection({
+  clip,
+  timeline,
+}: {
+  readonly clip: ImageClip;
+  readonly timeline: Timeline;
+}) {
+  const source = timeline.sources.find((s) => s.id === clip.sourceId);
+  if (!source || source.kind !== "image") return null;
+  const size = decodeSizeFor(source.width, source.height, timeline.width, timeline.height);
+  const shrunk = size.width < source.width;
+  return (
+    <>
+      <div className="grp-title">图片</div>
+      <div className="fields">
+        <div className="f">
+          <label>原图尺寸</label>
+          <span className="val">
+            {source.width}×{source.height}
+          </span>
+        </div>
+        {shrunk && (
+          <div className="f">
+            <label>解码尺寸</label>
+            <span className="val" title="为省内存按输出分辨率的 2 倍上限缩过；放大超过 200% 会偏软">
+              {size.width}×{size.height}
+            </span>
+          </div>
+        )}
+        {source.frameCount !== null && source.frameCount > 1 && (
+          <div className="f">
+            <label>动图</label>
+            <span className="val">{source.frameCount} 帧，只用第一帧</span>
+          </div>
+        )}
       </div>
     </>
   );

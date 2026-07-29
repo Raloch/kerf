@@ -7,7 +7,15 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { sourceDurationFrames, sourceGridFps, type AudioOnlySource, type AvSource } from "./types";
+import {
+  clipSourceId,
+  sourceDurationFrames,
+  sourceGridFps,
+  sourceHasPicture,
+  type AudioOnlySource,
+  type AvSource,
+  type ImageSource,
+} from "./types";
 import { FPS } from "../time/rational";
 
 const av: AvSource = {
@@ -60,5 +68,42 @@ describe("素材的帧栅格", () => {
   it("极短的音频至少算 1 帧，不能是 0 帧的片段", () => {
     const blip: AudioOnlySource = { ...music, durationMicros: 1000 };
     expect(sourceDurationFrames(blip, FPS.ndf2997)).toBe(1);
+  });
+});
+
+const photo: ImageSource = {
+  id: "p",
+  kind: "image",
+  name: "p.png",
+  file: new File([], "p.png"),
+  hasAudio: false,
+  audioCodec: null,
+  width: 4000,
+  height: 3000,
+  mimeType: "image/png",
+  frameCount: 1,
+};
+
+describe("图片素材", () => {
+  it("源片长度没有上限——裁出点永远不该被它挡住", () => {
+    expect(sourceDurationFrames(photo, FPS.ndf2997)).toBe(Number.POSITIVE_INFINITY);
+    // 换个帧率也一样：它不是"多少帧"，而是"没有这个概念"
+    expect(sourceDurationFrames(photo, FPS.film24)).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  it("有画面，所以放得进画面轨", () => {
+    expect(sourceHasPicture(photo)).toBe(true);
+    expect(sourceHasPicture(av)).toBe(true);
+    expect(sourceHasPicture(music)).toBe(false);
+  });
+});
+
+describe("片段引用哪个素材", () => {
+  const base = { id: "c", timelineIn: 0, timelineOut: 10 } as const;
+
+  it("素材片段和图片片段都给出 sourceId，文字片段给 null", () => {
+    expect(clipSourceId({ ...base, kind: "media", sourceId: "s1", sourceIn: 0 })).toBe("s1");
+    expect(clipSourceId({ ...base, kind: "image", sourceId: "s2" })).toBe("s2");
+    expect(clipSourceId({ ...base, kind: "text", text: "x" })).toBeNull();
   });
 });

@@ -5,6 +5,7 @@ import type { LutSource } from "../edl/types";
 import type {
   AudioOnlySource,
   AvSource,
+  ImageSource,
   Clip,
   MediaClip,
   MediaSource,
@@ -18,6 +19,7 @@ import {
   addLut,
   addSource,
   addTextClip,
+  IMAGE_DEFAULT_SECONDS,
   clearKeyframes,
   computeDuration,
   findClip,
@@ -619,7 +621,7 @@ describe("片段音量", () => {
   it("文字片段拒掉，不静默忽略", () => {
     const r = setClipVolume(one(), "t", 0.5);
     expect(r.changed).toBe(false);
-    expect(r.reason).toContain("没有音量");
+    expect(r.reason).toContain("只有素材片段有音量");
   });
 
   it("锁定轨道上改不动", () => {
@@ -644,7 +646,7 @@ describe("片段音量", () => {
     // 那条曲线永远不会被求值（文字片段没有音轨），留着就是"打了点没反应"
     const r = setKeyframe(one(), "t", "volume", 0, 0.5);
     expect(r.changed).toBe(false);
-    expect(r.reason).toContain("没有音量");
+    expect(r.reason).toContain("只有素材片段有音量");
   });
 
   it("**关掉音量动画时值烘进 clip.volume，不是 transform 也不是 color**", () => {
@@ -1499,6 +1501,63 @@ describe("导入素材", () => {
     expect(r.timeline.sources.map((s) => s.id)).toEqual(["src"]);
   });
 
+  const photo = (id: string, over: Partial<ImageSource> = {}): ImageSource => ({
+    id,
+    kind: "image",
+    name: `${id}.png`,
+    file: new File([], `${id}.png`),
+    hasAudio: false,
+    audioCodec: null,
+    width: 1200,
+    height: 800,
+    mimeType: "image/png",
+    frameCount: 1,
+    ...over,
+  });
+
+  it("图片落在画面轨上，长度是缺省秒数（它没有源片长度）", () => {
+    const r = addSource(emptyLayout(), { source: photo("p1"), timelineIn: 0 });
+    expect(r.changed).toBe(true);
+    const clips = trackClips(r.timeline, "V1");
+    expect(clips).toHaveLength(1);
+    // 29.97 下 5 秒 = 150 帧（round(5 × 30000/1001)）
+    expect(clips[0]!.timelineOut - clips[0]!.timelineIn).toBe(
+      Math.round((IMAGE_DEFAULT_SECONDS * 30000) / 1001),
+    );
+    expect(r.clipIds).toEqual(["p1-i"]);
+  });
+
+  it("图片片段是 `kind:\"image\"`，而且**没有 sourceIn**", () => {
+    const r = addSource(emptyLayout(), { source: photo("p1"), timelineIn: 0 });
+    const clip = trackClips(r.timeline, "V1")[0]!;
+    expect(clip.kind).toBe("image");
+    expect("sourceIn" in clip).toBe(false);
+  });
+
+  it("图片不产生音频片段", () => {
+    const r = addSource(emptyLayout(), { source: photo("p1"), timelineIn: 0 });
+    expect(trackClips(r.timeline, "A1")).toHaveLength(0);
+    expect(trackClips(r.timeline, "A2")).toHaveLength(0);
+  });
+
+  it("图片**不改**项目帧率和画布，哪怕时间轴是空的", () => {
+    // 它没有帧率可给；而画布跟着一张图走会让"导入一张竖图"把整个项目变成竖屏
+    const r = addSource(emptyLayout(), {
+      source: photo("p1", { width: 800, height: 1200 }),
+      timelineIn: 0,
+    });
+    expect(r.timeline.fps).toEqual(FPS.ndf2997);
+    expect(r.timeline.width).toBe(1920);
+    expect(r.timeline.height).toBe(1080);
+  });
+
+  it("V1 被占时顺延到 V2，不会跑到最上面的字幕轨", () => {
+    const first = addSource(emptyLayout(), { source: photo("p1"), timelineIn: 0 });
+    const second = addSource(first.timeline, { source: photo("p2"), timelineIn: 0 });
+    expect(trackClips(second.timeline, "V2")).toHaveLength(1);
+    expect(trackClips(second.timeline, "T1")).toHaveLength(0);
+  });
+
   it("同一个素材 id 不能进两次", () => {
     const first = addSource(emptyLayout(), { source: video("v1"), timelineIn: 0 });
     const again = addSource(first.timeline, { source: video("v1"), timelineIn: 400 });
@@ -1555,5 +1614,76 @@ describe("裁切纯音频片段", () => {
     const over = trimClip(withMusic(), "m", "out", 51);
     expect(over.changed).toBe(false);
     expect(over.reason).toContain("源片末尾");
+  });
+});
+
+describe("裁切图片片段", () => {
+  const withPhoto = (): Timeline => ({
+    fps: FPS.ntsc30,
+    width: 1920,
+    height: 1080,
+    durationFrames: 100,
+    tracks: [
+      {
+        id: "V1",
+        kind: "video",
+        clips: [{ id: "p", kind: "image", sourceId: "src", timelineIn: 0, timelineOut: 100 }],
+      },
+    ],
+    sources: [
+      {
+        id: "src",
+        kind: "image",
+        name: "p.png",
+        file: new File([], "p.png"),
+        hasAudio: false,
+        audioCodec: null,
+        width: 1200,
+        height: 800,
+        mimeType: "image/png",
+        frameCount: 1,
+      },
+    ],
+  });
+
+  it("出点想拉多长都行——图片没有「源片末尾」", () => {
+    const r = trimClip(withPhoto(), "p", "out", 100_000);
+    expect(r.changed).toBe(true);
+    expect(findClip(r.timeline, "p")!.clip.timelineOut).toBe(100_100);
+  });
+
+  it("裁入点不碰 sourceIn（它根本没有），但仍然平移关键帧", () => {
+    const tl = withPhoto();
+    const withKeys = {
+      ...tl,
+      tracks: tl.tracks.map((t) => ({
+        ...t,
+        clips: t.clips.map((c) => ({ ...c, keyframes: { opacity: [{ frame: 20, value: 0.5 }] } })),
+      })),
+    } as Timeline;
+    const r = trimClip(withKeys, "p", "in", 10);
+    expect(r.changed).toBe(true);
+    const clip = findClip(r.timeline, "p")!.clip;
+    expect("sourceIn" in clip).toBe(false);
+    // 起点右移 10 帧，关键帧偏移跟着减 10（同素材片段，见 shiftKeyframes）
+    expect(clip.keyframes?.opacity?.[0]?.frame).toBe(10);
+  });
+
+  it("切分不给右半段推进 sourceIn", () => {
+    const r = splitClipAt(withPhoto(), "p", 40);
+    expect(r.changed).toBe(true);
+    const halves = r.timeline.tracks[0]!.clips;
+    expect(halves).toHaveLength(2);
+    for (const half of halves) {
+      expect(half.kind).toBe("image");
+      expect("sourceIn" in half).toBe(false);
+    }
+    expect(halves[1]!.timelineIn).toBe(40);
+  });
+
+  it("图片片段没有音量", () => {
+    const r = setClipVolume(withPhoto(), "p", 0.5);
+    expect(r.changed).toBe(false);
+    expect(r.reason).toContain("只有素材片段有音量");
   });
 });

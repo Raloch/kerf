@@ -44,6 +44,7 @@ import type { MixChunk, MixHeader } from "../audio/mixdown";
 import { createCompositor, type CompositorBackend } from "../compose/backend";
 import type { ComposeLayer, ComposeSourceLayer, Compositor } from "../compose/compositor";
 import { registerFonts } from "../compose/font-registry";
+import { decodedImage, decodedImageBytes, prepareImages } from "../compose/image-store";
 import { residency, ResidencyTracker } from "./residency";
 import { rasterizeText, textRasterCacheBytes } from "../compose/text-raster";
 import { videoTracksInDrawOrder, visibleVideoClips, type VisibleClip } from "../edl/sampling";
@@ -102,6 +103,9 @@ export async function runExport(
   const leftover = residency.reset();
   // text-raster 的缓存字节由它自己算，这里注入取值函数，避免 residency 反向依赖 compose
   residency.bindTextRasterBytes(textRasterCacheBytes);
+  // 图片解码缓存同理。单张可以到 37MB（1080p 下的解码上限），不记账的话
+  // 一个幻灯片项目的常驻量报表会明显少报（同那条"内存要自己数"）
+  residency.bindDecodedImageBytes(decodedImageBytes);
   // PCM 不再一次性拿到手，`audioPcmBytes` 由音频泵按"此刻攥着几段"逐段维护。
   // 这一项从"随片长线性增长"变成"有上界"，正是分段要证明的事
   residency.setAudioPcmBytes(0);
@@ -155,6 +159,15 @@ export async function runExport(
   // 而预览里是对的。装不上就在这里失败，不要写出半份文件（见 font-registry.ts 文件头）
   step("register-fonts", "prepare", 0);
   await registerFonts(timeline.fonts);
+
+  // **图片同理，而且理由一字不差**：`ImageBitmap` 是每个上下文一份的资源，
+  // `composeFrame` 是同步的所以循环里没法等，漏了这一步的表现是成片里少一层画面。
+  // 解不出来在这里失败并带上文件名——循环里发现时只剩"某一层没画"
+  step("decode-images", "prepare", 0);
+  const failedImages = await prepareImages(timeline.sources, timeline.width, timeline.height);
+  if (failedImages.length > 0) {
+    throw new Error(`这些图片解不出来，导出会少画它们：${failedImages.join("、")}`);
+  }
 
   // 能力探测放在建 Output 之前：编码器不可用要在写出任何字节之前就失败
   step("probe-capabilities", "prepare", 0);
@@ -314,6 +327,30 @@ export async function runExport(
             image: raster.canvas,
             width: raster.width,
             height: raster.height,
+            ...looks,
+          };
+        }
+        if (visible.kind === "image") {
+          // **解不出来要抛，不能返回 null。** 图片在循环开始前就该全部解好
+          // （下面那个 `prepareImages`），这里拿不到只有两种可能：漏了那一步，
+          // 或者缓存被谁清了。两种都是 bug，而返回 null 的表现是**成片里少一层
+          // 画面且导出报成功**——那是最坏的一类失败（同硬规则 10）。
+          //
+          // 注意编译器**没有**逼出这个分支：`VisibleImageClip` 和 `VisibleMediaClip`
+          // 都有 `clip.id`，所以少写它照样编译得过，只是会去查一个不存在的解码帧。
+          // 判别联合只在字段集合真的不同的地方才帮得上忙
+          const entry = decodedImage(visible.source.id);
+          if (!entry) {
+            throw new Error(
+              `图片 ${visible.source.name} 没有解好就开始导出了——` +
+                `逐帧循环之前必须 prepareImages()，见 compose/image-store.ts`,
+            );
+          }
+          return {
+            kind: "image",
+            image: entry.bitmap,
+            width: entry.width,
+            height: entry.height,
             ...looks,
           };
         }

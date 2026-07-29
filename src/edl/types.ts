@@ -181,6 +181,32 @@ export interface AudioOnlySource extends SourceBase {
 }
 
 /**
+ * 一张静态图片——Logo、水印、片头卡、图片素材。
+ *
+ * **有尺寸但没有时间**：没有 `fps`、没有 `durationFrames`，因为一张图想在时间轴上
+ * 占多久都行。这正是它不能当成"只有一帧的视频"的原因——那样裁出点就会被"源片
+ * 只有一帧"挡住，而用户想要的恰恰是把它拉成 5 秒。
+ *
+ * `hasAudio` 恒为 false，留着字段是让混流侧那句 `!source.hasAudio` 不必分岔。
+ */
+export interface ImageSource extends SourceBase {
+  readonly kind: "image";
+  readonly hasAudio: false;
+  readonly width: number;
+  readonly height: number;
+  /** 图片格式（`image/png` 这一类），只用来显示。 */
+  readonly mimeType: string;
+  /**
+   * 动图的帧数，探不出来时为 null。
+   *
+   * 我们**只画第一帧**，所以 >1 时界面要说出来（硬规则 10：不静默降级）。探测靠
+   * `ImageDecoder`，它不是所有浏览器都有——**探不出来时不许假称"是静态图"**，
+   * 那和"确实是静态图"是两个结论。
+   */
+  readonly frameCount: number | null;
+}
+
+/**
  * 导入的素材。
  *
  * 用**判别联合**而不是"`width` / `height` 填 0"，理由同 `Clip`（见 D8）：填 0
@@ -188,7 +214,12 @@ export interface AudioOnlySource extends SourceBase {
  * 不会报错——代理转码会去转一个没有视频轨的文件、缩略图会画出一条空白带、
  * 而合成器会拿到一个 0×0 的图层。
  */
-export type MediaSource = AvSource | AudioOnlySource;
+export type MediaSource = AvSource | AudioOnlySource | ImageSource;
+
+/** 这个素材有画面吗（视频或图片）。画面轨上只放得下这两种。 */
+export function sourceHasPicture(source: MediaSource): source is AvSource | ImageSource {
+  return source.kind !== "audio";
+}
 
 /**
  * 这个素材的 `sourceIn` 用哪个帧栅格。
@@ -202,6 +233,17 @@ export function sourceGridFps(source: MediaSource, timelineFps: Rational): Ratio
 }
 
 /**
+ * 图片的"源片长度"。
+ *
+ * 一张图想在时间轴上占多久都行，所以正确答案是**没有上限**——`Number.POSITIVE_INFINITY`
+ * 让裁出点那道 `usedSourceFrames > sourceLimit` 永远不成立，而这正是想要的行为。
+ * 别改成一个大整数：那会在某个片长上突然变成"到源片末尾了"，而用户看不出为什么。
+ *
+ * 图片片段的**初始**长度是另一件事，由 `addSource()` 按 `IMAGE_DEFAULT_SECONDS` 给。
+ */
+export const IMAGE_SOURCE_FRAMES = Number.POSITIVE_INFINITY;
+
+/**
  * 这个素材在自己的栅格里有多少帧——裁切的"还有没有更多素材"就是拿它判的。
  *
  * 纯音频素材用 `floor` 而不是 `round`：宁可少报一帧，也不能报出一帧解不出内容的
@@ -209,6 +251,7 @@ export function sourceGridFps(source: MediaSource, timelineFps: Rational): Ratio
  */
 export function sourceDurationFrames(source: MediaSource, timelineFps: Rational): number {
   if (source.kind === "av") return source.durationFrames;
+  if (source.kind === "image") return IMAGE_SOURCE_FRAMES;
   return Math.max(
     1,
     Math.floor((source.durationMicros * timelineFps.num) / (timelineFps.den * 1_000_000)),
@@ -306,13 +349,41 @@ export interface TextClip extends ClipBase {
 }
 
 /**
+ * 一张静态图片的片段。
+ *
+ * **有 `sourceId` 但没有 `sourceIn`**，这就是它不能并进 `MediaClip` 的全部理由：
+ * `sourceId` 回答"用哪个素材"，`sourceIn` 回答"用它的哪一刻"，而一张图没有"哪一刻"。
+ * 给它一个恒为 0 的 `sourceIn` 会让四件事跟着错——裁出点会被源片长度挡住、切分会
+ * 徒劳地推进它、取帧会算出一个没人读的时刻、而 reader 会拿一个 PNG 去问视频轨
+ * （拿到 null，于是**画面静默消失**）。同 D8 那条"不要加可选字段来兼容两种片段"。
+ *
+ * 也没有 `volume`：图片没有声音，同 `MediaClip.volume` 不放在 `ClipBase` 上的理由。
+ */
+export interface ImageClip extends ClipBase {
+  readonly kind: "image";
+  readonly sourceId: SourceId;
+}
+
+/**
  * 时间轴上的一个片段。
  *
  * 用**判别联合**而不是"`sourceId` 可选"：可选会把 null 处理散到每一个消费点，
  * 而且漏掉一处不会报错——只会在导出时静默少一层画面。判别联合让 TS 在
  * strict + `noUncheckedIndexedAccess` 下强制每个取源片的地方先表态。
  */
-export type Clip = MediaClip | TextClip;
+export type Clip = MediaClip | TextClip | ImageClip;
+
+/**
+ * 这个片段引用哪个素材；文字片段返回 null。
+ *
+ * 存在的理由是**有两种片段带 `sourceId`**（素材和图片），而"这个素材找不回来了、
+ * 谁引用了它"这类问题跟种类无关。散着写 `clip.kind === "media" && …` 的地方会在
+ * 加了图片之后**漏掉图片**，而漏掉的表现是：素材丢了却留着片段，渲染时才炸
+ * （见 `project-snapshot.ts` 那条"素材找不回来时片段必须移除"）。
+ */
+export function clipSourceId(clip: Clip): SourceId | null {
+  return clip.kind === "text" ? null : clip.sourceId;
+}
 
 export interface Track {
   readonly id: TrackId;

@@ -18,6 +18,7 @@
 import { ALL_FORMATS, BlobSource, Input } from "mediabunny";
 import { snapToKnownFps, type Rational, toNumber } from "../time/rational";
 import type { AudioOnlySource, AvSource, MediaSource } from "../edl/types";
+import { newSourceId } from "./source-id";
 
 export interface ProbeResult {
   readonly source: MediaSource;
@@ -28,8 +29,6 @@ export interface ProbeResult {
   /** 容器总时长（秒）。通常略长于视频轨，差值来自音频编码的 padding。 */
   readonly containerSeconds: number;
 }
-
-let sourceSeq = 0;
 
 export async function probeFile(file: File): Promise<ProbeResult> {
   const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(file) });
@@ -63,7 +62,7 @@ export async function probeFile(file: File): Promise<ProbeResult> {
     const fps: Rational = snapToKnownFps(rawFps);
 
     const source: AvSource = {
-      id: `src-${++sourceSeq}`,
+      id: newSourceId(),
       kind: "av",
       name: file.name,
       file,
@@ -119,7 +118,7 @@ async function probeAudioOnly(
   ]);
 
   const source: AudioOnlySource = {
-    id: `src-${++sourceSeq}`,
+    id: newSourceId(),
     kind: "audio",
     name: file.name,
     file,

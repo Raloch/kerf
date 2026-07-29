@@ -16,7 +16,10 @@ const FRAME_1080P = Math.round(1920 * 1080 * 1.5);
 
 beforeEach(() => {
   residency.reset();
+  // 注入的取值函数**不归 `reset()` 管**（它清的是借还账，不是绑定），所以在这里
+  // 手动解绑。少解一个的后果是下一条用例读到上一条的数，而两条都不会报错
   residency.bindTextRasterBytes(() => 0);
+  residency.bindDecodedImageBytes(() => 0);
 });
 
 describe("借出与归还配平", () => {
@@ -49,13 +52,24 @@ describe("借出与归还配平", () => {
 });
 
 describe("估算字节的构成", () => {
-  it("解码帧 + 文字栅格 + 音频 PCM 三项相加", () => {
+  it("解码帧 + 文字栅格 + 图片 + 音频 PCM 四项相加", () => {
     residency.retainSample(1920, 1080);
     residency.bindTextRasterBytes(() => 8_294_400); // 1080p 一张 RGBA
+    residency.bindDecodedImageBytes(() => 39_321_600); // 3840×2560 RGBA，1080p 项目的解码上限
     residency.setAudioPcmBytes(1_000_000);
 
     const snapshot = residency.snapshot();
-    expect(snapshot.estimatedBytes).toBe(FRAME_1080P + 8_294_400 + 1_000_000);
+    expect(snapshot.estimatedBytes).toBe(
+      FRAME_1080P + 8_294_400 + 39_321_600 + 1_000_000,
+    );
+  });
+
+  it("图片字节也是**实时读**的，理由同文字缓存", () => {
+    let bytes = 0;
+    residency.bindDecodedImageBytes(() => bytes);
+    expect(residency.snapshot().decodedImageBytes).toBe(0);
+    bytes = 39_321_600;
+    expect(residency.snapshot().decodedImageBytes).toBe(39_321_600);
   });
 
   it("文字缓存的字节是**实时读**的，不是注册时的快照", () => {

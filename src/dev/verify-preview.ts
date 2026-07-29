@@ -33,6 +33,7 @@ import { createPreviewEngine } from "../preview/preview-engine";
 import { applyColorMatrix8, colorMatrixOf } from "../compose/color";
 import { singleClipTimeline, type LutSource, type Timeline } from "../edl/types";
 import { frameDurationMicros, frameToMicros, MICROS_PER_SECOND } from "../time/timebase";
+import { FPS } from "../time/rational";
 import { measure, type Bands, type MeasureRegion } from "./measure";
 import type { Check } from "./verify-m0";
 
@@ -46,6 +47,8 @@ const VERIFY_TEXT_OUT = "kerf-verify-preview-text.mp4";
 const VERIFY_COLOR_OUT = "kerf-verify-preview-color.mp4";
 /** LUT 比对的落盘文件名。 */
 const VERIFY_LUT_OUT = "kerf-verify-preview-lut.mp4";
+/** 图片层那一组的落盘名。 */
+const VERIFY_IMAGE_OUT = "kerf-verify-preview-image.mp4";
 
 /**
  * 比对用的 LUT：**红绿蓝轮换**（R←B、G←R、B←G）。
@@ -717,12 +720,159 @@ export async function verifyPreviewMatchesExport(): Promise<PreviewVerifyResult>
 
   await removeExportFile(VERIFY_TEXT_OUT);
 
+  checks.push(...(await verifyImageLayer()));
+
   return {
     checks,
     passed: checks.every((c) => c.pass),
     preview: previewBands,
     exported: exportedBands,
   };
+}
+
+// ---------------------------------------------------------------------------
+// 图片层
+// ---------------------------------------------------------------------------
+
+/** 探针图的尺寸，**刻意是 2:1**：方形输出下必然留上下黑边，于是留边几何可算可验。 */
+const IMAGE_W = 200;
+const IMAGE_H = 100;
+/** 左右两半各一个纯色，用来钉住"没有左右翻转"。红在左、蓝在右。 */
+const IMAGE_LEFT_RGB = [220, 40, 40] as const;
+const IMAGE_RIGHT_RGB = [40, 60, 220] as const;
+/** 2:1 的图放进 320×320：缩放取 min(320/200, 320/100) = 1.6，于是 320×160、上下各留 80。 */
+const IMAGE_EXPECTED_BAND = Math.round((OUT_SIZE - (IMAGE_H * OUT_SIZE) / IMAGE_W) / 2);
+const IMAGE_FRAMES = 10;
+/** 左右分区：各取中间一条，避开边界那几列的编码振铃。 */
+const IMAGE_LEFT_REGION = { x: 40, y: 130, width: 80, height: 60 };
+const IMAGE_RIGHT_REGION = { x: 200, y: 130, width: 80, height: 60 };
+const FULL_REGION = { x: 0, y: 0, width: OUT_SIZE, height: OUT_SIZE };
+
+/** 现造一张 PNG。**不放进仓库**，同 `make-sample.ts` 不放视频文件的理由。 */
+async function makeProbeImage(): Promise<File> {
+  const canvas = new OffscreenCanvas(IMAGE_W, IMAGE_H);
+  const ctx = canvas.getContext("2d", { alpha: false });
+  if (!ctx) throw new Error("造探针图拿不到 2D 上下文");
+  ctx.fillStyle = `rgb(${IMAGE_LEFT_RGB.join(",")})`;
+  ctx.fillRect(0, 0, IMAGE_W / 2, IMAGE_H);
+  ctx.fillStyle = `rgb(${IMAGE_RIGHT_RGB.join(",")})`;
+  ctx.fillRect(IMAGE_W / 2, 0, IMAGE_W / 2, IMAGE_H);
+  const blob = await canvas.convertToBlob({ type: "image/png" });
+  return new File([blob], "kerf-probe.png", { type: "image/png" });
+}
+
+/**
+ * 图片层在两条路径上画得一样，而且摆位落在 `containRect` 上。
+ *
+ * 三件会静默出错的事：**导出侧漏了 `prepareImages()`**（成片里那一层没有，而
+ * 预览是对的——硬规则 2 最经典的形态）、**摆位没走留边几何**（占满全屏或比例错）、
+ * **左右翻转**（`drawImage` 的参数顺序写错时画面照样"有内容"）。
+ *
+ * 探针图刻意是 2:1 + 左右两个纯色：前者让上下黑边可以手算，后者让翻转露出来。
+ * 用纯色而不是渐变，理由同 spike 里"两个输入用纯色"——把被测对象从采样精度里剥出来。
+ */
+async function verifyImageLayer(): Promise<Check[]> {
+  const checks: Check[] = [];
+  const file = await makeProbeImage();
+  const { probeImageFile } = await import("../media/image-probe");
+  const { source } = await probeImageFile(file);
+
+  const timeline: Timeline = {
+    fps: FPS.ndf2997,
+    width: OUT_SIZE,
+    height: OUT_SIZE,
+    durationFrames: IMAGE_FRAMES,
+    sources: [source],
+    tracks: [
+      {
+        id: "V1",
+        kind: "video",
+        clips: [
+          { id: "img", kind: "image", sourceId: source.id, timelineIn: 0, timelineOut: IMAGE_FRAMES },
+        ],
+      },
+    ],
+  };
+
+  const engine = await createPreviewEngine(document.createElement("div"), OUT_SIZE, OUT_SIZE);
+  let previewFull: Bands;
+  let previewLeft: Bands;
+  let previewRight: Bands;
+  try {
+    await engine.renderFrame(timeline, 0);
+    const ctx = probeContextOf(engine.canvas as CanvasImageSource, OUT_SIZE);
+    previewFull = measure(ctx, OUT_SIZE, OUT_SIZE, FULL_REGION);
+    previewLeft = measure(ctx, OUT_SIZE, OUT_SIZE, IMAGE_LEFT_REGION);
+    previewRight = measure(ctx, OUT_SIZE, OUT_SIZE, IMAGE_RIGHT_REGION);
+  } finally {
+    engine.dispose();
+  }
+
+  const [regions] = await exportAndMeasure(timeline, [0], VERIFY_IMAGE_OUT, [
+    FULL_REGION,
+    IMAGE_LEFT_REGION,
+    IMAGE_RIGHT_REGION,
+  ]);
+  const exportFull = regions![0]!;
+  const exportLeft = regions![1]!;
+  const exportRight = regions![2]!;
+
+  checks.push(
+    check(
+      "图片层在两条路径上都画出来了",
+      "都非黑",
+      `预览最大通道 ${previewFull.maxChannel} · 导出 ${exportFull.maxChannel}`,
+      previewFull.maxChannel > 32 && exportFull.maxChannel > 32,
+    ),
+  );
+
+  const delta = worstEdgeDelta(previewFull, exportFull);
+  checks.push(
+    check(
+      "图片层的留边在两条路径上一致（四条边）",
+      "≤ 1px",
+      delta === 0
+        ? `完全相同（${edgesText(previewFull)}）`
+        : `差 ${delta}px · 预览 ${edgesText(previewFull)} / 导出 ${edgesText(exportFull)}`,
+      delta <= 1,
+    ),
+  );
+
+  // 摆位必须落在 `containRect` 上。**只比"两条路径一致"抓不住这条**——两边共用
+  // 同一个（错的）几何时它照样绿，同那条"两条路径比对覆盖不了渲染算法本身"
+  const bandDelta = Math.max(
+    Math.abs(previewFull.top - IMAGE_EXPECTED_BAND),
+    Math.abs(previewFull.bottom - IMAGE_EXPECTED_BAND),
+  );
+  checks.push(
+    check(
+      `图片按留边几何摆位（2:1 的图在方形输出上应上下各留 ${IMAGE_EXPECTED_BAND}px）`,
+      "≤ 2px",
+      `上 ${previewFull.top} / 下 ${previewFull.bottom} / 左 ${previewFull.left} / 右 ${previewFull.right}`,
+      bandDelta <= 2 && previewFull.left === 0 && previewFull.right === 0,
+    ),
+  );
+
+  // 左右不能对调。`drawImage` 的参数写错时画面仍然"有内容"、留边也仍然对，
+  // 只有两个不同颜色的半幅能把它抓出来
+  const leftIsRed = previewLeft.meanR > previewLeft.meanB;
+  const rightIsBlue = previewRight.meanB > previewRight.meanR;
+  const exportMatches =
+    exportLeft.meanR > exportLeft.meanB && exportRight.meanB > exportRight.meanR;
+  checks.push(
+    check(
+      "图片没有左右翻转（左半红、右半蓝，两条路径都是）",
+      "都对",
+      `预览 左(${previewLeft.meanR},${previewLeft.meanG},${previewLeft.meanB})` +
+        ` 右(${previewRight.meanR},${previewRight.meanG},${previewRight.meanB})` +
+        ` · 导出 左(${exportLeft.meanR},${exportLeft.meanG},${exportLeft.meanB})` +
+        ` 右(${exportRight.meanR},${exportRight.meanG},${exportRight.meanB})`,
+      leftIsRed && rightIsBlue && exportMatches,
+    ),
+  );
+
+  await removeExportFile(VERIFY_IMAGE_OUT);
+  return checks;
 }
 
 /**
