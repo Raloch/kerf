@@ -29,6 +29,7 @@ import {
 } from "../anim/keyframes";
 import type { ColorAdjust } from "../compose/color";
 import type { LayerTransform } from "../compose/compositor";
+import { isCssColor } from "../compose/css-color";
 import { isManagedFamily } from "../compose/font-registry";
 import type { TextStyle } from "../compose/text-raster";
 import {
@@ -1094,7 +1095,14 @@ export type TextStylePatch = {
   readonly [K in keyof TextStyle]?: TextStyle[K] | undefined;
 };
 
-/** 样式里数值项的取值范围。字符串项（颜色、字体族、对齐）不夹。 */
+/**
+ * 样式里的颜色项。**值要当场校验**：`ctx.shadowColor = "乱码"` 不抛错，赋值被整个
+ * 忽略、保持上一个值——新建的上下文里那是透明黑，表现是"颜色调了没反应"。
+ * 认得出的写法见 `compose/css-color.ts` 文件头。
+ */
+const STYLE_COLORS = ["color", "strokeColor", "shadowColor"] as const;
+
+/** 样式里数值项的取值范围。字符串项（字体族、对齐）不夹。 */
 const STYLE_RANGES: Record<string, { readonly min: number; readonly max: number }> = {
   fontSizeRatio: { min: 0.01, max: 1 },
   fontWeight: { min: 100, max: 900 },
@@ -1149,6 +1157,9 @@ export function setTextStyle(
     if (raw === undefined) {
       delete merged[key];
       continue;
+    }
+    if (typeof raw === "string" && (STYLE_COLORS as readonly string[]).includes(key)) {
+      if (!isCssColor(raw)) return reject(timeline, `认不出这个颜色：${raw}`);
     }
     if (typeof raw === "number") {
       if (!Number.isFinite(raw)) return reject(timeline, `样式项 ${key} 必须是有限数`);

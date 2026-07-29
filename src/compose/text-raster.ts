@@ -75,7 +75,9 @@ export const TEXT_STYLE_DEFAULTS = {
   strokeRatio: 0,
   strokeColor: "#000000",
   shadowRatio: 0,
-  shadowColor: "rgba(0,0,0,0.6)",
+  // 写成 `css-color.ts` 的规范形式（而不是紧凑的 `rgba(0,0,0,0.6)`），
+  // 于是"用户改过这个颜色没有"可以直接比字符串
+  shadowColor: "rgba(0, 0, 0, 0.6)",
   align: "center" as const,
   lineHeight: 1.25,
   maxWidthRatio: 0.86,

@@ -1053,6 +1053,27 @@ describe("文字片段", () => {
     expect(again.changed).toBe(false);
     expect(again.reason).toBeUndefined();
   });
+
+  it("认不出的颜色当场拒掉，不写进 EDL", () => {
+    // `ctx.shadowColor = "乱码"` **不抛错**，赋值被整个忽略、保持上一个值，
+    // 新建的上下文里那是透明黑——表现是"颜色调了没反应"。所以要在入口挡住
+    for (const bad of ["papayawhip", "hsl(0 100% 50%)", "#12345"]) {
+      const r = setTextStyle(one(), "tt", { shadowColor: bad });
+      expect(r.changed).toBe(false);
+      expect(r.reason).toContain("认不出这个颜色");
+    }
+  });
+
+  it("三个颜色项都校验，不只阴影", () => {
+    expect(setTextStyle(one(), "tt", { color: "red" }).changed).toBe(false);
+    expect(setTextStyle(one(), "tt", { strokeColor: "red" }).changed).toBe(false);
+  });
+
+  it("带 alpha 的写法照常收下", () => {
+    const t = setTextStyle(one(), "tt", { shadowColor: "rgba(255, 0, 0, 0.4)" });
+    const c = findClip(t.timeline, "tt")!.clip;
+    expect(c.kind === "text" && c.style?.shadowColor).toBe("rgba(255, 0, 0, 0.4)");
+  });
 });
 
 describe("新建文字片段", () => {

@@ -30,6 +30,7 @@
 
 import { useRef, useState } from "react";
 import { valueAt, type AnimatableProperty, type Easing } from "../anim/keyframes";
+import { formatCssColor, parseCssColor, toHexRgb } from "../compose/css-color";
 import { newFontFamily, registerFont } from "../compose/font-registry";
 import { parseCubeLut } from "../compose/lut";
 import { TEXT_STYLE_DEFAULTS } from "../compose/text-raster";
@@ -877,6 +878,58 @@ function FontRow({ clip }: { readonly clip: TextClip }) {
   );
 }
 
+/**
+ * 带不透明度的颜色行：`input[type=color]` 管 RGB，旁边一个百分比管 alpha。
+ *
+ * 为什么要拆成两个控件：**`input[type=color]` 吐不出 alpha**，而阴影颜色不带 alpha
+ * 就没法用（缺省本来就是半透明黑）。原生控件里没有带 alpha 的取色器，自绘一个
+ * 色轮属于 §9 里推后的东西，所以拆成"原生取色器 + 一个百分比"——两个控件都是原生的、
+ * 都能用键盘输入，而且拼装规则收在 `css-color.ts` 一处。
+ *
+ * 认不出的字符串（手改过 EDL）**不静默改掉**：控件按缺省值显示，但只有用户真的动了
+ * 才会写回去。同"带草稿态的受控输入"那条——显示归显示，提交归提交。
+ */
+function RgbaRow({
+  label,
+  value,
+  onCommit,
+}: {
+  readonly label: string;
+  readonly value: string;
+  readonly onCommit: (next: string) => void;
+}) {
+  const parsed = parseCssColor(value) ?? { r: 0, g: 0, b: 0, a: 1 };
+  return (
+    <div className="f ctl">
+      <label>{label}</label>
+      {/* 顺序和「描边」那一行一致：数字在前占满，小色块收在末尾。
+          色块用 `.color`（宽度 100%）的话不透明度输入框会被挤成一条缝 */}
+      <NumberField
+        value={parsed.a * 100}
+        step={5}
+        min={0}
+        max={100}
+        digits={0}
+        suffix="%不透明"
+        title="不透明度。0 = 完全透明（等于没有阴影）"
+        onCommit={(v) => onCommit(formatCssColor({ ...parsed, a: v / 100 }))}
+      />
+      <input
+        type="color"
+        className="color sm"
+        value={toHexRgb(parsed)}
+        title={parseCssColor(value) ? value : `认不出这个颜色：${value}`}
+        onChange={(e) => {
+          const rgb = parseCssColor(e.target.value);
+          // 原生取色器只会给出 `#rrggbb`，解析不出来说不通；解析不出就什么都不做，
+          // 而不是把 alpha 悄悄丢掉
+          if (rgb) onCommit(formatCssColor({ ...rgb, a: parsed.a }));
+        }}
+      />
+    </div>
+  );
+}
+
 function TextSection({ clip }: { readonly clip: TextClip }) {
   const setTextContent = useTimeline((s) => s.setTextContent);
   const setTextStyle = useTimeline((s) => s.setTextStyle);
@@ -964,6 +1017,15 @@ function TextSection({ clip }: { readonly clip: TextClip }) {
             onCommit={(v) => setTextStyle(clip.id, { shadowRatio: v / 100 })}
           />
         </div>
+        {/* 只在真的有阴影时才出现：模糊半径是 0 时调它的颜色毫无效果，
+            而一个"调了没反应"的控件比没有这个控件更让人困惑 */}
+        {style.shadowRatio > 0 && (
+          <RgbaRow
+            label="阴影颜色"
+            value={style.shadowColor}
+            onCommit={(v) => setTextStyle(clip.id, { shadowColor: v })}
+          />
+        )}
         <div className="f">
           <label>对齐</label>
           <div className="seg">
