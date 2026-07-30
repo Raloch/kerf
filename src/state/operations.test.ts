@@ -29,6 +29,7 @@ import {
   moveKeyframe,
   removeClip,
   removeClips,
+  clipsInBox,
   moveClips,
   copyClips,
   pasteClips,
@@ -377,6 +378,61 @@ describe("文字片段", () => {
     expect(
       computeDuration([{ id: "T1", kind: "video", clips: [textClip("t", 0, 320)] }]),
     ).toBe(320);
+  });
+});
+
+describe("框选", () => {
+  /** V1 上 a[0,100) b[200,300)，A1 上 m[50,150)。 */
+  const base = () =>
+    timeline([
+      { id: "V1", kind: "video", clips: [clip("a", 0, 100), clip("b", 200, 300)] },
+      { id: "A1", kind: "audio", clips: [clip("m", 50, 150)] },
+    ]);
+
+  it("**碰到就算，不要求完全框住**", () => {
+    // 要求完全框住的话，比可视区还长的片段永远选不中（只能先缩小时间轴）
+    expect(clipsInBox(base(), { fromFrame: 50, toFrame: 60, trackIds: ["V1"] })).toEqual(["a"]);
+  });
+
+  it("只看给进来的那几条轨", () => {
+    const box = { fromFrame: 0, toFrame: 300 };
+    expect(clipsInBox(base(), { ...box, trackIds: ["V1"] })).toEqual(["a", "b"]);
+    expect(clipsInBox(base(), { ...box, trackIds: ["A1"] })).toEqual(["m"]);
+    expect(clipsInBox(base(), { ...box, trackIds: ["V1", "A1"] })).toEqual(["a", "b", "m"]);
+    expect(clipsInBox(base(), { ...box, trackIds: [] })).toEqual([]);
+    expect(clipsInBox(base(), { ...box, trackIds: ["没有这条轨"] })).toEqual([]);
+  });
+
+  it("**边界是左闭右开，和 `overlaps` 同一套**", () => {
+    // 两处用不同的边界规则会让"框到贴边"时选中数忽多忽少
+    expect(clipsInBox(base(), { fromFrame: 0, toFrame: 200, trackIds: ["V1"] })).toEqual(["a"]);
+    expect(clipsInBox(base(), { fromFrame: 0, toFrame: 201, trackIds: ["V1"] })).toEqual(["a", "b"]);
+    expect(clipsInBox(base(), { fromFrame: 100, toFrame: 200, trackIds: ["V1"] })).toEqual([]);
+  });
+
+  it("零宽的框（纯垂直拖动）选中它穿过的片段", () => {
+    expect(clipsInBox(base(), { fromFrame: 60, toFrame: 60, trackIds: ["V1", "A1"] })).toEqual([
+      "a",
+      "m",
+    ]);
+  });
+
+  it("零宽的框落在交界上时两边都不选中（左闭右开的必然结果）", () => {
+    const t = timeline([
+      { id: "V1", kind: "video", clips: [clip("a", 0, 100), clip("b", 100, 200)] },
+    ]);
+    expect(clipsInBox(t, { fromFrame: 100, toFrame: 100, trackIds: ["V1"] })).toEqual([]);
+  });
+
+  it("小数边界照常算——UI 给的是像素换出来的浮点帧号", () => {
+    expect(clipsInBox(base(), { fromFrame: 99.4, toFrame: 99.6, trackIds: ["V1"] })).toEqual(["a"]);
+    expect(clipsInBox(base(), { fromFrame: 100.1, toFrame: 199.9, trackIds: ["V1"] })).toEqual([]);
+  });
+
+  it("**锁定轨道上的片段照样选中**，同 selectAll", () => {
+    // 在选中这一步先筛一遍等于让用户看不见"那里还有东西"；能不能删由批量操作报
+    const t = timeline([{ id: "V1", kind: "video", locked: true, clips: [clip("a", 0, 100)] }]);
+    expect(clipsInBox(t, { fromFrame: 0, toFrame: 100, trackIds: ["V1"] })).toEqual(["a"]);
   });
 });
 

@@ -714,6 +714,21 @@ describe("多选", () => {
     expect(s().timeline().tracks.find((t) => t.id === "A1")?.clips).toHaveLength(3);
   });
 
+  it("**`selectMany` 去重**——⌘ 加框选时基础选中和框里那些天然会撞", () => {
+    const ids = seeded();
+    const s = () => useTimeline.getState();
+    s().selectMany([ids[0]!, ids[1]!, ids[0]!]);
+    expect(s().selectedClipIds).toEqual([ids[0], ids[1]]);
+  });
+
+  it("`selectMany` 传空数组等于清空", () => {
+    const ids = seeded();
+    const s = () => useTimeline.getState();
+    s().select(ids[0]!);
+    s().selectMany([]);
+    expect(s().selectedClipIds).toEqual([]);
+  });
+
   it("部分成功要报出来（锁定轨道），而删掉的那些确实删了", () => {
     const ids = seeded();
     const s = () => useTimeline.getState();

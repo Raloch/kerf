@@ -26,6 +26,7 @@ import { framesToTimecode, secondsToFrameCount } from "../time/timebase";
 import { toNumber } from "../time/rational";
 import { useTimeline } from "../state/timeline-store";
 import { ghostsForTrack, useClipDrag, type ClipDragApi, type Ghost } from "./use-clip-drag";
+import { useMarquee } from "./use-marquee";
 import { buildStrip, cachedStrip, drawStrip } from "../media/thumbnails";
 import { decodeImage, decodedImage } from "../compose/image-store";
 import {
@@ -90,6 +91,7 @@ export function TimelinePanel() {
   const pxPerFrame = zoom / 100;
   const ticksRef = useRef<HTMLDivElement>(null);
   const drag = useClipDrag(pxPerFrame);
+  const marquee = useMarquee(pxPerFrame);
 
   /**
    * 代理就绪的 URL 表。
@@ -249,6 +251,7 @@ export function TimelinePanel() {
                 selectedClipIds={selectedClipIds}
                 onSelect={select}
                 drag={drag}
+                onLanePointerDown={marquee.onLanePointerDown}
                 proxyUrls={proxyUrls}
               />
             ))}
@@ -257,6 +260,19 @@ export function TimelinePanel() {
               {/* 吸附辅助线：贯穿所有轨道，让用户看清贴住了什么 */}
               {drag.snapLine !== null && (
                 <div className="snapline" style={{ left: `${drag.snapLine * pxPerFrame}px` }} />
+              )}
+              {/* 框选的矩形。放在这一层是因为它跨轨道，而单条 lane 装不下；这一层已经按
+                  轨道头宽度偏移过，且 pointer-events: none——框不能挡住底下的 pointermove */}
+              {marquee.rect && (
+                <div
+                  className="mq"
+                  style={{
+                    left: `${marquee.rect.left}px`,
+                    top: `${marquee.rect.top}px`,
+                    width: `${marquee.rect.width}px`,
+                    height: `${marquee.rect.height}px`,
+                  }}
+                />
               )}
             </div>
           </div>
@@ -316,6 +332,7 @@ function TrackRow({
   selectedClipIds,
   onSelect,
   drag,
+  onLanePointerDown,
   proxyUrls,
 }: {
   track: Track;
@@ -324,6 +341,7 @@ function TrackRow({
   selectedClipIds: readonly string[];
   onSelect: (id: string) => void;
   drag: ClipDragApi;
+  onLanePointerDown: (event: ReactPointerEvent<HTMLElement>) => void;
   proxyUrls: Record<string, string>;
 }) {
   const isAudio = track.kind === "audio";
@@ -381,7 +399,9 @@ function TrackRow({
         </button>
       </div>
       {/* data-track-id 供拖拽时做几何命中测试，判断落在哪条轨道 */}
-      <div className="lane" data-track-id={track.id}>
+      {/* 片段自己的 pointerdown 会 stopPropagation，所以这里只收**空白处**：
+          拖 = 框选，点 = 清空选中（见 `use-marquee`） */}
+      <div className="lane" data-track-id={track.id} onPointerDown={onLanePointerDown}>
         {track.clips.map((clip) => (
           <ClipView
             key={clip.id}

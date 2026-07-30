@@ -254,6 +254,13 @@ export interface TimelineState {
    * 就能取消误选的手势。
    */
   toggleSelect: (clipId: ClipId) => void;
+  /**
+   * 换成正好选中这一组（框选拖动中每帧都在调它）。
+   *
+   * 框选**边拖边写选中**，不等松手：那是这个手势唯一的反馈——不写的话用户得先松手才知道
+   * 框住了什么。选中不进撤销栈，所以"每次 pointermove 写一次"没有代价（同播放头）。
+   */
+  selectMany: (clipIds: readonly ClipId[]) => void;
   /** 全选所有轨道上的所有片段（⌘A）。锁定轨道上的也选，批量操作会自己报出没做成的。 */
   selectAll: () => void;
   toggleSnap: () => void;
@@ -640,6 +647,12 @@ export const useTimeline = create<TimelineState>((set, get) => {
           : [...state.selectedClipIds, clipId],
         lastRejection: null,
       }));
+    },
+
+    selectMany(clipIds) {
+      // 去重是这里的责任：`selectedClipIds` 的不变量是"没有重复"，而框选把基础选中和
+      // 框里那些并起来时天然会撞（⌘ 加框选，框住的正好包含已经选中的那个）
+      set({ selectedClipIds: [...new Set(clipIds)], lastRejection: null });
     },
 
     selectAll() {

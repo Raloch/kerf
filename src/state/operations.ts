@@ -1887,6 +1887,49 @@ function placeOnFirstFittingTrack(
 }
 
 // ---------------------------------------------------------------------------
+// 框选
+// ---------------------------------------------------------------------------
+
+/**
+ * 框选的范围。**帧号必须已经归一化**（`from <= to`）——往左拖出来的框在像素上是反的，
+ * 而把归一化留给这里意味着每个调用点都要记得，忘了的表现是"往左框什么都选不中"。
+ *
+ * 轨道给的是**一组 id 而不是上下边界**：`tracks` 只是一个数组，"第 2 到第 4 条"这种说法
+ * 依赖它的顺序，而垂直命中测试本来就在像素上做（关键帧轨会插在轨道之间，按序号算就会
+ * 把它数进去）。所以由 UI 把"框碰到了哪几条轨"算好交进来。
+ */
+export interface SelectionBox {
+  readonly fromFrame: number;
+  readonly toFrame: number;
+  readonly trackIds: readonly TrackId[];
+}
+
+/**
+ * 框里碰到的片段。**碰到就算，不要求完全框住。**
+ *
+ * 要求完全框住的话，一个比可视区还长的片段永远选不中（用户只能先缩小时间轴），
+ * 而"碰到就算"是所有 NLE 的做法。判据和 `overlaps` 完全一样（**左闭右开**）：框到 200 帧
+ * 而片段从 200 开始就不算碰到——两处用不同的边界规则会让"框到贴边"时选中数忽多忽少。
+ *
+ * 推论：**零宽的框（纯垂直拖动）选中它穿过的那些片段**，这是对的；而框刚好落在交界上时
+ * 两边都不选中（`in < to && from < out` 在 from===to===交界 时两边都假）。
+ *
+ * **锁定轨道上的片段照样选中**，同 `selectAll`：能不能删由批量操作自己判并报出来，
+ * 在选中这一步先筛一遍等于让用户看不见"那里还有东西"。
+ */
+export function clipsInBox(timeline: Timeline, box: SelectionBox): ClipId[] {
+  const tracks = new Set(box.trackIds);
+  const ids: ClipId[] = [];
+  for (const track of timeline.tracks) {
+    if (!tracks.has(track.id)) continue;
+    for (const clip of track.clips) {
+      if (clip.timelineIn < box.toFrame && box.fromFrame < clip.timelineOut) ids.push(clip.id);
+    }
+  }
+  return ids;
+}
+
+// ---------------------------------------------------------------------------
 // 磁吸
 // ---------------------------------------------------------------------------
 

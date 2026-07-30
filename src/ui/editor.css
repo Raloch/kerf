@@ -1193,6 +1193,16 @@
 }
 
 /* 吸附辅助线：贯穿轨道区，说明贴住了哪个位置 */
+/* 框选矩形。用强调色的极淡填充 + 实线边：虚线边在拖动中会"爬"，看着像在加载。
+   `pointer-events` 由父层（.ph-layer）统一关掉——框要是吃掉指针事件，
+   pointermove 就会打在框上而不是轨道上，拖到一半就断（父层已经 none，这里不必再写）。 */
+.ed .mq {
+  position: absolute;
+  background: var(--kerf-glow);
+  border: 1px solid var(--kerf-soft);
+  border-radius: 2px;
+  z-index: 18;
+}
 .ed .snapline {
   position: absolute;
   top: 0;
