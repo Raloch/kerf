@@ -4,6 +4,8 @@ node_modules/
 
 # 构建产物
 dist/
+# Pages 部署时组装出来的站点（dist + 两份设计稿），CI 里生成，本地验证时也会有
+_site/
 build/
 .vite/
 *.tsbuildinfo

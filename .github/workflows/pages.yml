@@ -1,17 +1,33 @@
-name: 部署设计稿到 GitHub Pages
+name: 部署到 GitHub Pages
 
-# 设计稿是自包含单文件（内联样式与脚本、无外部依赖），所以站点不需要构建，
-# 复制成 index.html 即可。第三方 HTML 预览服务（githack / jsdelivr）都不适合做公开入口：
-# githack 对顶层导航会插一个防钓鱼确认页，jsdelivr 以 text/plain 返回、浏览器不渲染。
+# 发出去的是**真编辑器**（2026-07-30 起，决策 D51）。在此之前根路径是
+# `design/kerf-editor-mockup.html` 那份自包含设计稿，因为那时还没有可跑的编辑器。
 #
-# M1 有可运行的编辑器之后，把「组装站点」那一步换成 pnpm build 并改 path 即可。
+# 两条不能忘的：
+#
+# 1. **`--base` 必须给。** 这是项目页（`https://<user>.github.io/kerf/`），而 Vite 默认
+#    base 是 `/`，产物里的 `/assets/index-xxx.js` 会被解析到域名根上——**页面出得来、
+#    脚本全 404**，白屏且控制台里全是 404。base 只在这里给、不写进 `vite.config.ts`：
+#    写进去会连开发服务器一起搬到 `/kerf/` 下，而 CLAUDE.md 里所有 `?autorun=` 的
+#    地址、以及本地手验的每一条 URL 都是按 `http://localhost:5173/` 写的。
+#
+# 2. **两份设计稿要继续跟着发。** 根路径换成编辑器之后，原来那个可点原型的链接
+#    （`/kerf/kerf-editor-mockup.html`）**不能失效**——它已经被分享出去过，而它是
+#    界面定稿的凭据。所以旧文件名原样保留一份，另外在 `design/` 下也各留一份。
+#
+# 部署**先过门禁**（`pnpm gate`）：typecheck + 单测 + 构建。多花十几秒，换的是
+# "线上那份一定是门禁绿的那份"。但**门禁绿不等于成片是对的**（四个浏览器自检不在
+# 里面，见 ci.yml 的注释），所以改到取帧 / 合成 / 音频之后仍然要自己跑一遍再推。
 
 on:
   push:
     branches: [main]
-    paths:
-      - "design/**"
-      - ".github/workflows/pages.yml"
+    # 文档和报告不触发部署。**用 paths-ignore 而不是 paths**：白名单漏一条路径的
+    # 表现是"改了代码但线上没变"，而那种漏没有任何提示
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
+      - ".reports/**"
   workflow_dispatch:
 
 permissions:
@@ -33,13 +49,46 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 版本从 package.json 的 packageManager 读，免得 CI 和本地跑的不是同一个 pnpm
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: 类型检查
+        run: pnpm typecheck
+
+      - name: 单元测试
+        run: pnpm test
+
+      # 构建自带主 chunk 断言（mediabunny / PixiJS 被拖进入口就红，见 vite.config.ts）。
+      # `--base` 见文件头第 1 条
+      - name: 构建（base = /kerf/）
+        run: pnpm build --base=/kerf/
+
       - name: 组装站点
         run: |
-          mkdir -p _site
-          # 根路径直接是设计稿
-          cp design/kerf-editor-mockup.html _site/index.html
-          # 原文件名也保留一份，旧链接不失效
+          set -euo pipefail
+          rm -rf _site
+          cp -r dist _site
+          # 设计稿：旧链接原样保留 + design/ 下各留一份（见文件头第 2 条）
+          mkdir -p _site/design
           cp design/kerf-editor-mockup.html _site/kerf-editor-mockup.html
+          cp design/kerf-editor-mockup.html _site/design/kerf-editor-mockup.html
+          cp design/kerf-home-mockup.html _site/design/kerf-home-mockup.html
+          # 判据不是"命令成功了"而是"该在的文件在不在"：cp 少了一个源文件时上面
+          # 那行会失败，但产物里少一个 chunk 不会——所以这里点名验一遍
+          test -f _site/index.html
+          test -f _site/kerf-editor-mockup.html
+          test -d _site/assets
+          # 入口 HTML 里的资源路径必须带 /kerf/ 前缀，否则线上白屏（见文件头第 1 条）。
+          # 这一条是**部署侧唯一挡得住 base 给错**的地方：给错时构建照样成功
+          grep -q 'src="/kerf/assets/' _site/index.html
+          echo "站点组装完成：$(du -sh _site | cut -f1)"
 
       # 首次使用需要先在 Settings → Pages 把 Source 选成「GitHub Actions」。
       # 不用 enablement: true 自动开启——那需要 administration: write，
