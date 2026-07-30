@@ -350,6 +350,30 @@ export interface MediaClip extends ClipBase {
    * 也没有转场的项目，混出来的 PCM 与加这个功能之前**逐样本一致**。
    */
   readonly volume?: number;
+  /**
+   * 播放速度倍数。缺省 = 1× = 原速。**没有这个字段和 `speed: 1` 必须行为相同**，
+   * 而且缺省时取帧要走**不乘不除的原路径**（同 `isDefaultGeometry` / 恒等增益）：
+   * 那不是性能优化，是保证没变速的项目逐像素、逐样本不变——否则 M0 那条音画同步
+   * 断言会开始漂，而漂的原因和变速毫无关系。所以改回 1× 要把字段整个 `delete`。
+   *
+   * **是 `Rational` 不是 `number`。** 会做的预设（0.25 / 0.5 / 1.5 / 2 / 4）都是精确
+   * 有理数，而浮点倍数会给"源片时刻"多加一道量化——那正是 `mix-plan.ts` 的
+   * `exactSeconds` 踩过的地方（微秒取整在 48kHz 上是 0.048 个样本，实测让分段与
+   * 不分段差了 5.22e-4）。有理数下换算仍是整数乘除加一次取整，同硬规则 1。
+   *
+   * **放 `MediaClip` 不放 `ClipBase`**，理由同 `volume`：文字片段没有"源片的哪一刻"。
+   * 图片片段也没有——一张图要停多久是改片段长度，给它一个速度就是造出第二种表达
+   * 同一件事的方式，而两个真值来源"都设了听谁的"错了不报错。
+   *
+   * **不是可动画属性**，刻意不进那三张关键帧通道表。给速度打关键帧意味着源片时刻
+   * 变成速度曲线的**积分**（还要保证单调），那是另一个模型、要配曲线编辑器（§9 推后）；
+   * 半做的表现是"钻石能拖、画面不动"。它不在 `AnimatableProperty` 里，所以
+   * `setKeyframe` 编译期就传不进来——这比运行时拒绝好。
+   *
+   * **只允许正数**（倒放不做）：`VideoTrackReader` 的"取帧只能向前"是硬规则 3 的
+   * 前提，整个解码架构建在顺序解码上。范围由 `SPEED_RANGE` 夹。
+   */
+  readonly speed?: Rational;
 }
 
 /**
@@ -514,9 +538,79 @@ export function findFont(timeline: Timeline, family: FontFamily): FontSource | n
   return timeline.fonts?.find((f) => f.family === family) ?? null;
 }
 
-/** 把时间轴帧号换算成源片帧号。 */
+/**
+ * 把时间轴帧号换算成源片帧号。
+ *
+ * **不要拿它做取帧位置**（见 `edl/sampling.ts` 的文件头）。它有两个隐含假设，
+ * 各自都不报错：源片帧率等于时间轴帧率，以及**片段没有变速**。留着是给单测当
+ * "错的那一种算法"的对照。
+ */
 export function toSourceFrame(clip: MediaClip, timelineFrame: number): number {
   return clip.sourceIn + (timelineFrame - clip.timelineIn);
+}
+
+/** 原速。`speed` 字段省略时的等价值。 */
+export const NORMAL_SPEED: Rational = { num: 1, den: 1 };
+
+/**
+ * 速度的取值范围。上下限不是技术限制，是**防手滑**（同 `MAX_TRANSITION_FRAMES`）：
+ * 输入框里多打一个零会让一个 10 秒的片段变成 0.1 秒，而用户很难对上发生了什么。
+ */
+export const SPEED_RANGE = { min: 1 / 8, max: 8 } as const;
+
+/** 这个片段的速度倍数；没设过就是原速。**判"是不是原速"一律问 `isNormalSpeed`。** */
+export function clipSpeed(clip: MediaClip): Rational {
+  return clip.speed ?? NORMAL_SPEED;
+}
+
+/**
+ * 原速吗。取帧、音频排期、波形都靠它决定走不走那条"不乘不除"的原路径。
+ *
+ * 判 `speed === undefined` 是不够的：`{num:2,den:2}` 也是原速，而它进得来
+ * （`setClipSpeed` 会归一化，但快照是旧数据、也可能被别处构造）。
+ */
+export function isNormalSpeed(clip: MediaClip): boolean {
+  const s = clip.speed;
+  return s === undefined || s.num === s.den;
+}
+
+/**
+ * 这个片段从 `sourceIn` 起消耗多少源片帧——裁出点那道"还有没有更多素材"就是拿它判的。
+ *
+ * 片段占 L 帧，末帧落在源片的 `sourceIn + (L-1)×speed`，所以要 L-1 而不是 L 乘速度，
+ * 再加回那一帧本身。**speed 为 1 时结果与旧式的 `sourceIn + L` 逐值相同**，这是刻意的：
+ * 那道判据的行为在没变速的项目上一个字都不能变。
+ *
+ * 用 `ceil` 而不是 `round`：宁可少给一帧，也不能报出一帧解不出内容的位置——同
+ * `sourceDurationFrames` 里那个 `floor`，失败形态也一样（末帧静默变成解不出来的黑帧）。
+ */
+export function clipSourceFrames(clip: MediaClip): number {
+  const frames = clipDuration(clip);
+  if (frames <= 0) return 0;
+  if (isNormalSpeed(clip)) return frames;
+  const s = clipSpeed(clip);
+  return Math.ceil(((frames - 1) * s.num) / s.den) + 1;
+}
+
+/**
+ * 时间轴上走 `frames` 帧，源片走多少帧（可负——转场窗口要往入点之前借）。
+ *
+ * 取整**只在这里发生一次**。散到各个调用点会让"裁入点"和"取帧"对同一个量取整
+ * 两次，而两次取整的差表现为"裁了一帧，画面动了两帧"，不报错。
+ */
+export function scaleBySpeed(frames: number, speed: Rational): number {
+  return speed.num === speed.den ? frames : Math.round((frames * speed.num) / speed.den);
+}
+
+/**
+ * 反过来：源片有 `sourceFrames` 帧余量，够铺多少个时间轴帧。
+ *
+ * 用 `floor` 而不是 `round`，**和 `scaleBySpeed` 刻意不对称**：这个数用来回答
+ * "余量够不够"，少算一帧只会让界面多报一帧定格（看得见、无害），多算一帧则是
+ * 报"余量够"而那一帧实际解不出来——那正是转场一侧静默定格、而检查器说没事。
+ */
+export function unscaleBySpeed(sourceFrames: number, speed: Rational): number {
+  return speed.num === speed.den ? sourceFrames : Math.floor((sourceFrames * speed.den) / speed.num);
 }
 
 /**

@@ -437,3 +437,93 @@ describe("trackClipsAt", () => {
     ]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 变速（D39）
+// ---------------------------------------------------------------------------
+
+describe("变速片段的取帧位置", () => {
+  const HALF_SECOND = 500_000;
+
+  it("原速走原路径：结果与不带 speed 字段逐值相同", () => {
+    // 这条不是重复断言。取帧对原速有一条"不乘不除"的快路径（见 MediaClip.speed），
+    // 而它存在的全部理由就是"没变速的项目一个字节都不变"
+    const plain = clip({ sourceIn: 10 });
+    const explicit = clip({ sourceIn: 10, speed: { num: 1, den: 1 } });
+    for (const frame of [0, 1, 37, 99]) {
+      const a = sourceMicrosAt(plain, frame, FPS.ntsc30, FPS.ntsc30);
+      const b = sourceMicrosAt(explicit, frame, FPS.ntsc30, FPS.ntsc30);
+      expect(b).toBe(a);
+    }
+  });
+
+  it("2× 时间轴走一秒，源片走两秒", () => {
+    const c = clip({ speed: { num: 2, den: 1 } });
+    const fps = FPS.ntsc30;
+    expect(sourceMicrosAt(c, 0, fps, fps)).toBe(0);
+    // 第 30 帧 = 时间轴 1 秒 → 源片 2 秒
+    expect(sourceMicrosAt(c, 30, fps, fps)).toBe(2_000_000);
+    expect(sourceMicrosAt(c, 15, fps, fps)).toBe(1_000_000);
+  });
+
+  it("0.5× 时间轴走一秒，源片只走半秒", () => {
+    const c = clip({ speed: { num: 1, den: 2 } });
+    expect(sourceMicrosAt(c, 30, FPS.ntsc30, FPS.ntsc30)).toBe(HALF_SECOND);
+  });
+
+  it("**入点先换算再叠加，不受速度影响**", () => {
+    // sourceIn 是源片自己栅格里的帧号，速度只作用于"从片段起点走了多久"。
+    // 把 sourceIn 也乘进去的表现是"裁过入点的片段一变速就跳到别的地方"
+    const c = clip({ sourceIn: 30, timelineIn: 0, speed: { num: 2, den: 1 } });
+    const fps = FPS.ntsc30;
+    expect(sourceMicrosAt(c, 0, fps, fps)).toBe(frameToMicros(30, fps));
+    expect(sourceMicrosAt(c, 30, fps, fps)).toBe(frameToMicros(30, fps) + 2_000_000);
+  });
+
+  it("片段不从 0 开始时，算的是「走了多久」而不是绝对帧号", () => {
+    const c = clip({ timelineIn: 100, timelineOut: 200, speed: { num: 2, den: 1 } });
+    const fps = FPS.ntsc30;
+    expect(sourceMicrosAt(c, 100, fps, fps)).toBe(0);
+    expect(sourceMicrosAt(c, 130, fps, fps)).toBe(2_000_000);
+  });
+
+  it("**1.5× 下相邻两帧必须落在不同的源片时刻**", () => {
+    // 在帧号上乘速度（而不是在微秒上）会把它量化到整帧，于是 1.5× 下
+    // 相邻两帧算出同一个位置——画面一顿一顿，而单看某一帧完全正常
+    const c = clip({ speed: { num: 3, den: 2 } });
+    const fps = FPS.ntsc30;
+    const seen = new Set<number>();
+    for (let f = 0; f < 10; f++) seen.add(sourceMicrosAt(c, f, fps, fps));
+    expect(seen.size).toBe(10);
+    // 而且步长要**恒定**。取整两次（先 frameToMicros 再乘倍率）会让相邻差在
+    // 50000 / 50001 之间逐帧交替，那是亚微秒误差被放大后 `round` 推上去的
+    const steps = new Set<number>();
+    for (let f = 1; f < 10; f++) {
+      steps.add(sourceMicrosAt(c, f, fps, fps) - sourceMicrosAt(c, f - 1, fps, fps));
+    }
+    expect([...steps]).toEqual([50_000]);
+  });
+
+  it("源片帧率与时间轴帧率不同时，两个换算叠加而不互相吃掉", () => {
+    // 25fps 素材放在 30fps 时间轴上 2× 播：入点用源片栅格，走过的时间用时间轴栅格
+    const c = clip({ sourceIn: 25, speed: { num: 2, den: 1 } });
+    const got = sourceMicrosAt(c, 30, FPS.ntsc30, FPS.pal25);
+    expect(got).toBe(frameToMicros(25, FPS.pal25) + 2_000_000);
+  });
+
+  it("速度不影响可视图层的其它字段，只影响 sourceMicros", () => {
+    const fast = clip({ speed: { num: 2, den: 1 } });
+    const track: Track = { id: "V1", kind: "video", clips: [fast] };
+    const tl = timeline([track], [source()]);
+    const [layer] = layersOf(visibleVideoClips(tl, 30));
+    if (layer?.kind !== "media") throw new Error("期望素材层");
+    expect(layer.sourceMicros).toBe(2_000_000);
+  });
+
+  it("音频轨也跟着变速取帧——两条路径共用 sourceMicrosAt", () => {
+    const fast = clip({ id: "a1", speed: { num: 2, den: 1 } });
+    const track: Track = { id: "A1", kind: "audio", clips: [fast] };
+    const tl = timeline([track], [source()]);
+    expect(audioClipsAt(tl, 30)[0]?.sourceMicros).toBe(2_000_000);
+  });
+});

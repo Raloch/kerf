@@ -51,6 +51,13 @@ import { withNormalizedTracks } from "./operations";
  *
  * 这一轮 4 → 5：`Timeline` 加了 `name` / `namedByUser`，存法也从单键 `current`
  * 换成按项目 id 存（D37）。旧的 `current` 记录版本不认、自动不可见，不迁移。
+ *
+ * **纯加法的可选字段不算"改了形状"，不要为它 +1。** 判据是上面那句话的理由：
+ * 老记录读出来是不是**坏的**。`MediaClip.speed`（变速，D39）就是这一类——老快照
+ * 没有这个字段，而 `clipSpeed()` 对"没有"给出的答案恰好就是正确答案（1×），
+ * 没有任何东西会流到合成器里才炸。这时候 +1 会把用户现有的项目全部变成不可见，
+ * 为的是防一个不存在的问题；而 4 → 5 和 2 → 3 都不是这一类（前者换了存储键的
+ * 形状，后者把 `MediaSource` 改成判别联合，老记录真的解释不出来）。
  */
 export const SNAPSHOT_VERSION = 5;
 

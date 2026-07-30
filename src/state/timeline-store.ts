@@ -23,7 +23,7 @@ import type {
   TrackId,
   Transition,
 } from "../edl/types";
-import { FPS } from "../time/rational";
+import { FPS, type Rational } from "../time/rational";
 import {
   canRedo as histCanRedo,
   canUndo as histCanUndo,
@@ -51,6 +51,7 @@ import {
   rippleDeleteClip,
   setClipColor,
   setClipLut,
+  setClipSpeed,
   setClipVolume,
   setTransition,
   setClipTransform,
@@ -154,6 +155,8 @@ export interface TimelineState {
   setClipColor: (clipId: ClipId, patch: ColorPatch) => void;
   /** 改片段音量。合并键带 clipId，理由同 `setClipTransform`。 */
   setClipVolume: (clipId: ClipId, volume: number) => void;
+  /** 改片段速度。**片段长度会跟着变**（保内容），放不下会被拒。见 `setClipSpeed`。 */
+  setClipSpeed: (clipId: ClipId, speed: Rational) => void;
   /** 把一张解析好的 LUT 加进项目库。 */
   addLut: (lut: LutSource) => void;
   /** 给片段挂上 / 摘掉 LUT。传 undefined 表示摘掉。 */
@@ -397,6 +400,10 @@ export const useTimeline = create<TimelineState>((set, get) => {
 
     setClipVolume(clipId, volume) {
       apply(setClipVolume(get().timeline(), clipId, volume), "音量", `volume:${clipId}`);
+    },
+
+    setClipSpeed(clipId, speed) {
+      apply(setClipSpeed(get().timeline(), clipId, speed), "变速", `speed:${clipId}`);
     },
 
     addLut(lut) {

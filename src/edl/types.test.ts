@@ -8,13 +8,20 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  clipSourceFrames,
   clipSourceId,
+  clipSpeed,
+  isNormalSpeed,
+  NORMAL_SPEED,
+  scaleBySpeed,
+  unscaleBySpeed,
   sourceDurationFrames,
   sourceGridFps,
   sourceHasPicture,
   type AudioOnlySource,
   type AvSource,
   type ImageSource,
+  type MediaClip,
 } from "./types";
 import { FPS } from "../time/rational";
 
@@ -105,5 +112,82 @@ describe("片段引用哪个素材", () => {
     expect(clipSourceId({ ...base, kind: "media", sourceId: "s1", sourceIn: 0 })).toBe("s1");
     expect(clipSourceId({ ...base, kind: "image", sourceId: "s2" })).toBe("s2");
     expect(clipSourceId({ ...base, kind: "text", text: "x" })).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 变速的帧数换算（D39）
+// ---------------------------------------------------------------------------
+
+const mediaClip = (over: Partial<MediaClip> = {}): MediaClip => ({
+  id: "c",
+  kind: "media",
+  sourceId: "v",
+  timelineIn: 0,
+  timelineOut: 100,
+  sourceIn: 0,
+  ...over,
+});
+
+describe("速度是不是原速", () => {
+  it("没有字段就是原速", () => {
+    expect(isNormalSpeed(mediaClip())).toBe(true);
+    expect(clipSpeed(mediaClip())).toEqual(NORMAL_SPEED);
+  });
+
+  it("**没归一化的 1× 也算原速**", () => {
+    // 判 `speed === undefined` 不够：{num:2,den:2} 从旧快照或别处构造出来时
+    // 会掉出那条"不乘不除"的原路径，而它本该是原速
+    expect(isNormalSpeed(mediaClip({ speed: { num: 2, den: 2 } }))).toBe(true);
+    expect(isNormalSpeed(mediaClip({ speed: { num: 3, den: 2 } }))).toBe(false);
+  });
+});
+
+describe("片段消耗多少源片帧", () => {
+  it("原速下与占位帧数逐值相同", () => {
+    // 这条钉的是"没变速的项目那道裁切判据一个字都不变"
+    for (const frames of [1, 2, 37, 100, 999]) {
+      expect(clipSourceFrames(mediaClip({ timelineOut: frames }))).toBe(frames);
+    }
+  });
+
+  it("2× 下 50 帧占位消耗 99 帧源片", () => {
+    // 末帧落在 sourceIn + (50-1)×2，所以是 98+1 而不是 100——多算那一帧
+    // 就是"允许把出点拉到源片之外"
+    expect(clipSourceFrames(mediaClip({ timelineOut: 50, speed: { num: 2, den: 1 } }))).toBe(99);
+  });
+
+  it("0.5× 下 100 帧占位只消耗 51 帧源片", () => {
+    expect(clipSourceFrames(mediaClip({ timelineOut: 100, speed: { num: 1, den: 2 } }))).toBe(51);
+  });
+
+  it("非整数结果用 ceil：宁可少给一帧", () => {
+    // 1.5× 下 4 帧占位要 (4-1)×1.5 = 4.5 → 5，+1 = 6
+    expect(clipSourceFrames(mediaClip({ timelineOut: 4, speed: { num: 3, den: 2 } }))).toBe(6);
+  });
+
+  it("零长片段消耗 0 帧", () => {
+    expect(clipSourceFrames(mediaClip({ timelineIn: 10, timelineOut: 10 }))).toBe(0);
+  });
+});
+
+describe("时间轴帧 ↔ 源片帧的缩放", () => {
+  it("原速两个方向都是恒等", () => {
+    expect(scaleBySpeed(37, NORMAL_SPEED)).toBe(37);
+    expect(unscaleBySpeed(37, NORMAL_SPEED)).toBe(37);
+  });
+
+  it("scaleBySpeed 就近取整，可以为负（转场要往入点之前借）", () => {
+    expect(scaleBySpeed(10, { num: 2, den: 1 })).toBe(20);
+    expect(scaleBySpeed(-10, { num: 2, den: 1 })).toBe(-20);
+    expect(scaleBySpeed(3, { num: 3, den: 2 })).toBe(5); // 4.5 → 5
+  });
+
+  it("**unscaleBySpeed 用 floor，和 scaleBySpeed 刻意不对称**", () => {
+    // 它回答"余量够不够"。多算一帧 = 报"余量够"而那一帧解不出来，
+    // 表现是转场一侧静默定格而检查器说没事
+    expect(unscaleBySpeed(30, { num: 2, den: 1 })).toBe(15);
+    expect(unscaleBySpeed(31, { num: 2, den: 1 })).toBe(15);
+    expect(unscaleBySpeed(5, { num: 3, den: 2 })).toBe(3); // 3.33 → 3
   });
 });

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { FPS } from "../time/rational";
-import { clipsUsingEffects } from "../edl/types";
+import { clipSourceFrames, clipsUsingEffects } from "../edl/types";
 import type { LutSource } from "../edl/types";
 import type {
   AudioOnlySource,
@@ -31,6 +31,7 @@ import {
   removeKeyframe,
   rippleDeleteClip,
   setClipColor,
+  setClipSpeed,
   setClipVolume,
   staticValueOf,
   setClipLut,
@@ -1760,5 +1761,156 @@ describe("项目名（D37）", () => {
     // 名字字符串没变，但 namedByUser 变了——这次提交护住"以后不再自动改名"
     expect(confirmed.changed).toBe(true);
     expect(confirmed.timeline.namedByUser).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 变速（D39）
+// ---------------------------------------------------------------------------
+
+const SPEED_2X = { num: 2, den: 1 };
+const SPEED_HALF = { num: 1, den: 2 };
+
+function speedTimeline(sourceDuration = 1000): Timeline {
+  return timeline([{ id: "V1", kind: "video", clips: [clip("a", 0, 100)] }], sourceDuration);
+}
+
+describe("setClipSpeed：保内容、改长度", () => {
+  it("2× 让片段占位减半，源片跨度不变", () => {
+    const r = setClipSpeed(speedTimeline(), "a", SPEED_2X);
+    expect(r.changed).toBe(true);
+    const c = media(findClip(r.timeline, "a")?.clip);
+    expect(c.timelineIn).toBe(0);
+    expect(c.timelineOut).toBe(50);
+    expect(c.speed).toEqual(SPEED_2X);
+    // 50 帧 × 2 = 原来那 100 帧内容（末帧算法见 clipSourceFrames）
+    expect(clipSourceFrames(c)).toBe(99);
+  });
+
+  it("0.5× 让片段占位翻倍", () => {
+    const c = media(findClip(setClipSpeed(speedTimeline(), "a", SPEED_HALF).timeline, "a")?.clip);
+    expect(c.timelineOut).toBe(200);
+    expect(c.speed).toEqual(SPEED_HALF);
+  });
+
+  it("**改回 1× 要把字段整个删掉**，不留 {num:1,den:1}", () => {
+    // 取帧那条"不乘不除"的原路径判的是这个字段，见 MediaClip.speed
+    const fast = setClipSpeed(speedTimeline(), "a", SPEED_2X).timeline;
+    const back = setClipSpeed(fast, "a", { num: 1, den: 1 }).timeline;
+    const c = media(findClip(back, "a")?.clip);
+    expect("speed" in c).toBe(false);
+    // 长度也回到原样
+    expect(c.timelineOut).toBe(100);
+  });
+
+  it("从 2× 改到 4×：新长度按老速度算，不是按原始长度", () => {
+    const fast = setClipSpeed(speedTimeline(), "a", SPEED_2X).timeline; // 50 帧
+    const faster = setClipSpeed(fast, "a", { num: 4, den: 1 }).timeline;
+    expect(media(findClip(faster, "a")?.clip).timelineOut).toBe(25);
+  });
+
+  it("倍数会归一化（4/2 就是 2×）", () => {
+    const c = media(findClip(setClipSpeed(speedTimeline(), "a", { num: 4, den: 2 }).timeline, "a")?.clip);
+    expect(c.speed).toEqual(SPEED_2X);
+  });
+
+  it("同一个速度再设一次是「值没变」，不是失败", () => {
+    const fast = setClipSpeed(speedTimeline(), "a", SPEED_2X).timeline;
+    const again = setClipSpeed(fast, "a", SPEED_2X);
+    expect(again.changed).toBe(false);
+    expect(again.reason).toBeUndefined();
+  });
+
+  it("**放不下就拒绝，不隐式推走后面的片段**", () => {
+    // 变慢要变长，撞到后面那个片段。静默波纹是"选了 A 拿到 B"
+    const tl = timeline([
+      { id: "V1", kind: "video", clips: [clip("a", 0, 100), clip("b", 100, 200)] },
+    ]);
+    const r = setClipSpeed(tl, "a", SPEED_HALF);
+    expect(r.changed).toBe(false);
+    expect(r.reason).toContain("放不下");
+    // 后面那个片段一个字段都没动
+    expect(findClip(r.timeline, "b")?.clip.timelineIn).toBe(100);
+  });
+
+  it("倒放和 0 一律拒绝", () => {
+    for (const bad of [{ num: -2, den: 1 }, { num: 0, den: 1 }, { num: 1, den: -2 }]) {
+      const r = setClipSpeed(speedTimeline(), "a", bad);
+      expect(r.changed).toBe(false);
+      expect(r.reason).toContain("正数");
+    }
+  });
+
+  it("超出范围拒绝，不夹紧", () => {
+    // 夹紧的话用户输入 100× 会拿到 8×，而输入框里还写着 100
+    const r = setClipSpeed(speedTimeline(), "a", { num: 100, den: 1 });
+    expect(r.changed).toBe(false);
+    expect(r.reason).toContain("速度只支持");
+  });
+
+  it("文字片段不能变速", () => {
+    const tl = timeline([{ id: "T1", kind: "video", clips: [textClip("t", 0, 100)] }]);
+    expect(setClipSpeed(tl, "t", SPEED_2X).reason).toContain("只有素材片段");
+  });
+
+  it("锁定轨道上不能变速", () => {
+    const tl = timeline([
+      { id: "V1", kind: "video", clips: [clip("a", 0, 100)], locked: true },
+    ]);
+    expect(setClipSpeed(tl, "a", SPEED_2X).reason).toContain("锁定");
+  });
+
+  it("关键帧**不跟着缩**", () => {
+    // 偏移相对片段起点、单位是时间轴帧，属于时间轴侧。缩了的话"第 10 帧放大"
+    // 会变成一个用户没打过的位置
+    const tl = timeline([
+      {
+        id: "V1",
+        kind: "video",
+        clips: [{ ...clip("a", 0, 100), keyframes: { scaleX: [{ frame: 10, value: 1.2 }] } }],
+      },
+    ]);
+    const c = media(findClip(setClipSpeed(tl, "a", SPEED_2X).timeline, "a")?.clip);
+    expect(c.keyframes?.scaleX?.[0]?.frame).toBe(10);
+  });
+});
+
+describe("变速片段的裁切与切分", () => {
+  function fast(): Timeline {
+    return timeline([
+      { id: "V1", kind: "video", clips: [{ ...clip("a", 0, 50), speed: SPEED_2X }] },
+    ]);
+  }
+
+  it("裁入点：时间轴裁 1 帧，源片跳 2 帧", () => {
+    const c = media(findClip(trimClip(fast(), "a", "in", 10).timeline, "a")?.clip);
+    expect(c.timelineIn).toBe(10);
+    expect(c.sourceIn).toBe(20);
+  });
+
+  it("裁出点：**源片够不够长要按速度算**", () => {
+    // 源片只有 120 帧，2× 下 100 帧占位就要 199 帧源片——漏乘的表现是
+    // 允许拉出去，而那几帧解不出来 = 那一层画面静默消失
+    const tl = timeline(
+      [{ id: "V1", kind: "video", clips: [{ ...clip("a", 0, 50), speed: SPEED_2X }] }],
+      120,
+    );
+    const r = trimClip(tl, "a", "out", 20);
+    expect(r.changed).toBe(false);
+    expect(r.reason).toContain("源片末尾");
+    // 原速的同一个片段拉得出去（证明拒绝来自速度，不是来自别的边界）
+    const slow = timeline(
+      [{ id: "V1", kind: "video", clips: [clip("a", 0, 50)] }],
+      120,
+    );
+    expect(trimClip(slow, "a", "out", 20).changed).toBe(true);
+  });
+
+  it("切分：右半段的源片起点按速度推进", () => {
+    const r = splitClipAt(fast(), "a", 20);
+    const halves = r.timeline.tracks[0]!.clips.map((c) => media(c));
+    const right = halves.find((c) => c.timelineIn === 20)!;
+    expect(right.sourceIn).toBe(40);
+    expect(right.speed).toEqual(SPEED_2X);
   });
 });

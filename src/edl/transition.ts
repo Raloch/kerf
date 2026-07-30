@@ -42,7 +42,7 @@
  */
 
 import type { Clip, MediaClip, Transition } from "./types";
-import { clipDuration } from "./types";
+import { clipDuration, clipSourceFrames, clipSpeed, unscaleBySpeed } from "./types";
 
 /** 转场时长的下限。低于 2 帧对称窗口就退化成空。 */
 export const MIN_TRANSITION_FRAMES = 2;
@@ -146,11 +146,7 @@ export function frozenFrames(
   const clip = role === "from" ? window.from : window.to;
   if (clip.kind !== "media") return 0;
   const need = window.frames / 2;
-  const available =
-    role === "from"
-      ? sourceDurationFrames - (clip.sourceIn + clipDuration(clip))
-      : clip.sourceIn;
-  return Math.max(0, Math.min(need, need - available));
+  return Math.max(0, Math.min(need, need - availableHandle(clip, role, sourceDurationFrames)));
 }
 
 /**
@@ -214,16 +210,22 @@ export function clipRenderSpan(
 }
 
 /**
- * 素材片段在转场窗口里能借到的余量（帧）。给编辑层做提示用。
+ * 素材片段在转场窗口里能借到的余量，单位是**时间轴帧**。给编辑层做提示用。
  *
  * 与 `frozenFrames` 的区别：这个只问素材本身有多少，不问窗口要多少。
+ *
+ * **余量在源片侧算、报出来时换成时间轴帧**（`unscaleBySpeed`）。两者在变速下不是
+ * 一回事：2× 的片段有 30 帧源片余量，只够铺 15 个时间轴帧。混着用不报错，表现是
+ * 界面说"余量够 30 帧"而窗口开到第 16 帧就开始定格。
  */
 export function availableHandle(
   clip: MediaClip,
   role: "from" | "to",
   sourceDurationFrames: number,
 ): number {
-  return role === "from"
-    ? Math.max(0, sourceDurationFrames - (clip.sourceIn + clipDuration(clip)))
-    : Math.max(0, clip.sourceIn);
+  const inSource =
+    role === "from"
+      ? sourceDurationFrames - (clip.sourceIn + clipSourceFrames(clip))
+      : clip.sourceIn;
+  return Math.max(0, unscaleBySpeed(inSource, clipSpeed(clip)));
 }

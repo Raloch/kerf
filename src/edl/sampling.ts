@@ -23,8 +23,10 @@
 
 import {
   clipAt,
+  clipSpeed,
   findLut,
   findSource,
+  isNormalSpeed,
   sourceDurationFrames,
   sourceGridFps,
   type AvSource,
@@ -45,7 +47,12 @@ import {
   type TransitionWindow,
 } from "./transition";
 import { isShaderTransition, type ShaderTransitionKind } from "../compose/transition-shader";
-import { frameDurationMicros, frameToMicros, MICROS_PER_SECOND } from "../time/timebase";
+import {
+  frameDurationMicros,
+  frameToMicros,
+  frameToMicrosScaled,
+  MICROS_PER_SECOND,
+} from "../time/timebase";
 import { resolveColor, resolveTransform } from "../anim/keyframes";
 import type { ColorAdjust } from "../compose/color";
 import type { LayerTransform } from "../compose/compositor";
@@ -62,10 +69,18 @@ export function sourceMicrosAt(
   timelineFps: Rational,
   sourceFps: Rational,
 ): number {
-  return (
-    frameToMicros(clip.sourceIn, sourceFps) +
-    frameToMicros(timelineFrame - clip.timelineIn, timelineFps)
-  );
+  // 入点用**源片自己的**栅格，走过的时间用**时间轴**栅格——两个 fps 不是一回事。
+  // 速度只作用于后一项：把 `sourceIn` 也乘进去的表现是"裁过入点的片段一变速就
+  // 跳到别的地方"，而入点为 0 的片段完全正常（同 D35 那个被乘以零的因子）
+  const base = frameToMicros(clip.sourceIn, sourceFps);
+  const elapsedFrames = timelineFrame - clip.timelineIn;
+  // 原速走不乘不除的原路径。见 `MediaClip.speed`：这不是性能，是保证没变速的
+  // 项目逐像素、逐样本与加变速之前完全相同
+  if (isNormalSpeed(clip)) return base + frameToMicros(elapsedFrames, timelineFps);
+  // 帧 → 微秒 → 乘倍率，**只取整一次**（`frameToMicrosScaled` 的文件注释里有
+  // 取整两次的实测后果）。不要先把帧差乘成帧数：那会量化到整帧，于是 1.5× 下
+  // 相邻两帧算出同一个源片位置，画面一顿一顿而单帧看起来完全正常
+  return base + frameToMicrosScaled(elapsedFrames, timelineFps, clipSpeed(clip));
 }
 
 /**

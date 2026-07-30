@@ -50,6 +50,30 @@ export function frameToMicros(frame: number, fps: Rational): number {
   return Math.round((frame * fps.den * MICROS_PER_SECOND) / fps.num);
 }
 
+/**
+ * 帧号 → 微秒，再乘一个有理数倍率，**全程只取整一次**（变速用，D39）。
+ *
+ * 不能写成 `Math.round(frameToMicros(f, fps) * num / den)`：那是取整两次，而两次
+ * 取整的误差会**逐帧交替**。实测 30fps 下 1.5×，相邻两帧的源片位置差在
+ * 50000µs 和 50001µs 之间跳（因为 `frameToMicros(1)=33333` 已经丢了 1/3 微秒，
+ * 再乘 1.5 把它放大成 0.5 而 `round` 把 0.5 推上去）。落在画面上看不出来
+ * （一帧有 33000µs 宽），落在音频上是每帧一个亚微秒相位抖动——同 `exactSeconds`
+ * 那条"微秒取整在 48kHz 上是 0.048 个样本"，那次实测差了 5.22e-4。
+ *
+ * **乘法顺序不能改。** 先把三个小因子乘起来再乘 1e6：8_000_000 帧 × 1001 ×
+ * 8（速度上限）≈ 6.4e10，再 × 1e6 就爆过 2^53 了，所以分子自己也要判一次安全范围
+ * ——溢出的表现是位置突然错几秒，而 `Math.round` 不会抱怨。
+ */
+export function frameToMicrosScaled(frame: number, fps: Rational, scale: Rational): number {
+  assertFrame(frame);
+  const num = frame * fps.den * scale.num;
+  const den = fps.num * scale.den;
+  if (Math.abs(num) > Number.MAX_SAFE_INTEGER / MICROS_PER_SECOND) {
+    throw new Error(`帧号 ${frame} 在 ${scale.num}/${scale.den} 倍速下超出安全范围`);
+  }
+  return Math.round((num * MICROS_PER_SECOND) / den);
+}
+
 /** 微秒 → 帧号（就近取整）。 */
 export function microsToFrame(micros: number, fps: Rational): number {
   if (!Number.isFinite(micros)) throw new Error(`微秒必须是有限数：${micros}`);

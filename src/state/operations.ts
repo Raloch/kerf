@@ -34,8 +34,12 @@ import { isManagedFamily } from "../compose/font-registry";
 import type { TextStyle } from "../compose/text-raster";
 import {
   clipDuration,
+  clipSourceFrames,
+  clipSpeed,
   findFont,
+  scaleBySpeed,
   sourceDurationFrames,
+  SPEED_RANGE,
   transitionFitsTrack,
   type Clip,
   type ClipId,
@@ -58,6 +62,7 @@ import {
   frozenFrames,
   transitionWindow,
 } from "../edl/transition";
+import { rational, toNumber, type Rational } from "../time/rational";
 
 /** 操作失败时返回原对象，并给出原因，便于 UI 提示而不是静默无反应。 */
 export interface EditResult {
@@ -355,7 +360,10 @@ export function trimClip(
     // deltaFrames 为负时触发，那时 newIn 一定还小于 timelineOut
     if (newIn >= clip.timelineOut) return reject(timeline, "片段至少要保留 1 帧");
     if (clip.kind === "media") {
-      const newSourceIn = clip.sourceIn + deltaFrames;
+      // 变速片段：时间轴上裁掉 Δ 帧，源片要跳过 Δ×speed 帧。取整只在
+      // `scaleBySpeed` 一处发生（1.5× 下一帧对不上整数源片帧，量化误差 < 0.5 帧、
+      // 看不出来；散着取整两次才会变成"裁一帧、画面动两帧"）
+      const newSourceIn = clip.sourceIn + scaleBySpeed(deltaFrames, clipSpeed(clip));
       if (newSourceIn < 0) return reject(timeline, "已经到源片开头，没有更多素材");
       next = { ...clip, timelineIn: newIn, sourceIn: newSourceIn };
     } else {
@@ -373,7 +381,11 @@ export function trimClip(
       const sourceLimit = source
         ? sourceDurationFrames(source, timeline.fps)
         : Number.MAX_SAFE_INTEGER;
-      const usedSourceFrames = clip.sourceIn + (newOut - clip.timelineIn);
+      // 变速片段消耗的源片帧数不等于占位帧数（`clipSourceFrames`，原速下逐值相同）。
+      // 漏乘的表现是 2× 下能把出点拉到源片之外，而那几帧解不出来 =
+      // **那一层画面静默消失**（同 D37 记的那个形态）
+      const usedSourceFrames =
+        clip.sourceIn + clipSourceFrames({ ...clip, timelineOut: newOut });
       if (usedSourceFrames > sourceLimit) return reject(timeline, "已经到源片末尾，没有更多素材");
     }
     next = { ...clip, timelineOut: newOut };
@@ -422,8 +434,10 @@ export function splitClipAt(timeline: Timeline, clipId: ClipId, frame: number): 
           ...clip,
           id: rightId,
           timelineIn: frame,
-          // 右半段引用源片的起点要跟着推进，否则右半段会重播左半段的内容
-          sourceIn: clip.sourceIn + cut,
+          // 右半段引用源片的起点要跟着推进，否则右半段会重播左半段的内容。
+          // 变速片段推进的是 cut×speed（同裁入点）——漏乘的表现是"切一刀，
+          // 右半段从中间跳回去了"，而 1× 的项目上完全正常
+          sourceIn: clip.sourceIn + scaleBySpeed(cut, clipSpeed(clip)),
         }
       // 文字层没有源片游标，两半段显示同一段文字
       : { ...clip, id: rightId, timelineIn: frame };
@@ -933,6 +947,77 @@ export function setClipVolume(timeline: Timeline, clipId: ClipId, volume: number
 
   const next = clamped === VOLUME_RANGE.fallback ? undefined : clamped;
   return ok(replaceClip(timeline, found.track.id, setOptional(found.clip, "volume", next)));
+}
+
+/**
+ * 给素材片段设速度倍数。
+ *
+ * **语义是"保内容、改长度"**：源片跨度不变，片段在时间轴上按 `1/speed` 缩放
+ * （2× → 占位减半）。另一种语义是"保长度、改用到多少源片"，但那会让"加速"
+ * 变成"后面凭空多一段空白"，而用户想要的正是那一段整体变短。
+ *
+ * **放不下就拒绝，不做隐式波纹。** 变慢要变长，撞到后面的片段时静默推走整轨
+ * 是硬规则 10 那种"选了 A 拿到 B"——波纹该是用户自己选的动作（`rippleDeleteClip`
+ * 那样显式）。变快永远放得下。
+ *
+ * **关键帧不跟着缩**：偏移相对片段起点、单位是时间轴帧，属于时间轴侧。缩了的话
+ * "在第 10 帧放大到 1.2 倍"会变成一个用户没打过的位置；落到新长度之外的点照旧
+ * 保留不删（`valueAt` 区间外取端点值，同 `shiftKeyframes` 那条）。
+ *
+ * **回到 1× 要把字段整个删掉**（同 `setClipVolume`）：取帧那条"不乘不除"的原路径
+ * 判的是这个字段。
+ */
+export function setClipSpeed(timeline: Timeline, clipId: ClipId, speed: Rational): EditResult {
+  const found = findClip(timeline, clipId);
+  if (!found) return reject(timeline, `找不到片段 ${clipId}`);
+  if (found.track.locked) return reject(timeline, "轨道已锁定");
+  const { clip, track } = found;
+  // 图片片段没有"源片的哪一刻"，它要停多久是改长度；文字同理。见 `MediaClip.speed`
+  if (clip.kind !== "media") return reject(timeline, "只有素材片段能变速");
+  if (!Number.isFinite(speed.num) || !Number.isFinite(speed.den)) {
+    return reject(timeline, "速度必须是有限数");
+  }
+  // 倒放不做（`VideoTrackReader` 只能向前，硬规则 3 的前提）。0 会让源片时刻恒等于
+  // 入点——那不是"停住"而是"整段都是同一帧"，且长度算出来是 Infinity
+  if (speed.num <= 0 || speed.den <= 0) return reject(timeline, "速度必须是正数，不支持倒放");
+
+  const wanted = rational(speed.num, speed.den);
+  const factor = toNumber(wanted);
+  if (factor < SPEED_RANGE.min || factor > SPEED_RANGE.max) {
+    return reject(timeline, `速度只支持 ${SPEED_RANGE.min}× 到 ${SPEED_RANGE.max}×`);
+  }
+
+  const current = clipSpeed(clip);
+  // 值没变：不进撤销栈也不算失败（预设按钮会重复点同一个值）
+  if (current.num * wanted.den === wanted.num * current.den) return unchanged(timeline);
+
+  const oldFrames = clipDuration(clip);
+  // 保内容：oldFrames × 老速度 == newFrames × 新速度。整数乘除，不过浮点秒
+  const newFrames = Math.max(
+    1,
+    Math.round((oldFrames * current.num * wanted.den) / (current.den * wanted.num)),
+  );
+  const next = setOptional(
+    { ...clip, timelineOut: clip.timelineIn + newFrames },
+    "speed",
+    wanted.num === wanted.den ? undefined : wanted,
+  );
+
+  const hits = collisionsIn(track, next);
+  if (hits.length > 0) {
+    return reject(timeline, `放不下：会和「${hits[0]!.name ?? hits[0]!.id}」重叠`);
+  }
+  // 保内容意味着源片跨度不变，所以这一条只可能被上面那次取整推出去一帧。仍然要判：
+  // 越界那一帧解不出来，而它的表现是成片尾部少一层画面、不报错
+  const source = timeline.sources.find((s) => s.id === clip.sourceId);
+  if (source) {
+    const limit = sourceDurationFrames(source, timeline.fps);
+    if (clip.sourceIn + clipSourceFrames(next) > limit) {
+      return reject(timeline, "变速后会超出源片末尾，先把出点往回收一帧");
+    }
+  }
+
+  return ok(replaceClip(timeline, track.id, next));
 }
 
 /** 把某个属性的关键帧序列换成新的；空序列会连通道一起删掉。 */

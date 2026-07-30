@@ -5,6 +5,7 @@ import {
   MAX_SAFE_FRAME,
   frameDurationMicros,
   frameToMicros,
+  frameToMicrosScaled,
   frameToSeconds,
   framesToTimecode,
   microsToFrame,
@@ -217,5 +218,46 @@ describe("时间码（NDF）", () => {
   it("负帧号保留符号", () => {
     expect(framesToTimecode(-30, FPS.ndf2997)).toBe("-00:00:01:00");
     expect(timecodeToFrames("-00:00:01:00", FPS.ndf2997)).toBe(-30);
+  });
+});
+
+describe("帧号 → 微秒 × 有理数倍率（变速，D39）", () => {
+  const ONE = { num: 1, den: 1 };
+
+  it("**倍率为 1 时与 frameToMicros 逐值相同**", () => {
+    // 这是承重的那一条：没变速的项目走的是 frameToMicros，两者必须完全一致，
+    // 否则加变速会让 M0 那条音画同步断言开始漂，而漂的原因和变速毫无关系
+    for (const fps of [FPS.ndf2997, FPS.ntsc30, FPS.pal25, FPS.film24]) {
+      for (const f of [0, 1, 2, 29, 30, 1799, 54000, -30]) {
+        expect(frameToMicrosScaled(f, fps, ONE)).toBe(frameToMicros(f, fps));
+      }
+    }
+  });
+
+  it("**只取整一次：1.5× 下步长恒定**", () => {
+    // 取整两次（先 frameToMicros 再乘倍率）会让相邻差在 50000/50001 之间交替
+    const steps = new Set<number>();
+    for (let f = 1; f < 20; f++) {
+      steps.add(
+        frameToMicrosScaled(f, FPS.ntsc30, { num: 3, den: 2 }) -
+          frameToMicrosScaled(f - 1, FPS.ntsc30, { num: 3, den: 2 }),
+      );
+    }
+    expect([...steps]).toEqual([50_000]);
+  });
+
+  it("倍率照常生效，且负帧号对称", () => {
+    expect(frameToMicrosScaled(30, FPS.ntsc30, { num: 2, den: 1 })).toBe(2_000_000);
+    expect(frameToMicrosScaled(30, FPS.ntsc30, { num: 1, den: 2 })).toBe(500_000);
+    expect(frameToMicrosScaled(-30, FPS.ntsc30, { num: 2, den: 1 })).toBe(-2_000_000);
+  });
+
+  it("乘积超出安全整数范围时**抛错，不静默算错**", () => {
+    // 溢出的表现是位置突然偏几秒，而 Math.round 一个字都不说
+    expect(() => frameToMicrosScaled(MAX_SAFE_FRAME, FPS.ndf2997, { num: 8, den: 1 })).toThrow(
+      /超出安全范围/,
+    );
+    // 同一个帧号在原速下是合法的（证明拒绝来自倍率，不是来自帧号本身）
+    expect(() => frameToMicrosScaled(MAX_SAFE_FRAME, FPS.ndf2997, ONE)).not.toThrow();
   });
 });
