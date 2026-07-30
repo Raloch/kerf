@@ -34,6 +34,7 @@ import { resolveVolume, type KeyframeChannels } from "../anim/keyframes";
 import { clipRenderSpan, trackTransitionWindows } from "../edl/transition";
 import { microsToSeconds, sourceMicrosAt } from "../edl/sampling";
 import {
+  clipPreservesPitch,
   clipSpeed,
   isAudioTransition,
   isNormalSpeed,
@@ -160,6 +161,44 @@ export interface AudioJob {
     /** 相对导出区间起点，恒等于 `whenSeconds`；显式给出免得读的人去推。 */
     readonly startSeconds: number;
     readonly durationSeconds: number;
+  };
+  /**
+   * 走保音高的时间伸缩时才有（**D40**）。`clipPreservesPitch()` 为假时**字段不存在**，
+   * 于是接线那边连伸缩器都不建——同 `speed` 那条。
+   *
+   * ## 为什么要在这一层算，而不是让 `mixdown.ts` 现推
+   *
+   * 伸缩器的输出轴锚在**片段音频的起点**（`clip.timelineIn`），而 `AudioJob` 别的字段
+   * 全在**导出坐标系**或**源片坐标系**里。两个坐标系之差是 `clip.timelineIn - range.inFrame`
+   * ——一个纯帧号减法，正是这个文件存在的理由；放到接线那边现推，写错的表现是
+   * "整段声音偏移了一个片段起点的量"，而**片段恰好从导出区间起点开始时完全正常**
+   * （同 `sampleGainCurve` 里那条坐标系陷阱，第二次踩同一块地）。
+   *
+   * ## 为什么不把 `whenSeconds` 直接拿来用
+   *
+   * `whenSeconds` 回答"这段 PCM 该从哪一刻开始播"，是亚采样精确的（`exactSeconds`）。
+   * 伸缩路径的起播时刻**必须落在整数输出样本上**：伸缩的输出栅格是整数样本号，相邻两段
+   * 各自取整之后如果起播时刻不按同一把尺子对齐，两段的相位就差不到一个样本却对不上
+   * ——那正是 `sampleAlignFrames` 记过的那声咔哒，而 RMS 断言对它免疫。所以这里给出
+   * **原点**和**片段本地区间**两个量，让接线那边按源片采样率取整一次再相加。
+   */
+  readonly stretch?: {
+    /**
+     * 片段音频起点在**导出坐标系**里的位置（秒）。
+     * **可以是负数**——片段向前一个转场借出余量时，它的起点在导出区间之前。
+     */
+    readonly originSeconds: number;
+    /** 这段 PCM 覆盖**片段本地输出时间**的哪一段（秒）。同样可以为负。 */
+    readonly fromSeconds: number;
+    readonly toSeconds: number;
+    /**
+     * 片段入点在源片里的位置（秒），也就是伸缩器源片轴的原点。
+     *
+     * 走 `exactSeconds` 而不是 `microsToSeconds(sourceMicrosAt(...))`：伸缩路径上所有
+     * 源片位置都是"这个原点 + 整数样本 / 采样率"，多绕一道微秒取整只会白加 0.024 个
+     * 样本的相位误差（同这个文件顶上 `exactSeconds` 的注释）。
+     */
+    readonly sourceOriginSeconds: number;
   };
 }
 
@@ -338,6 +377,17 @@ export function planAudioJobs(timeline: Timeline, range: RenderRange): AudioJob[
         volume: clip.volume ?? 1,
         // 原速不带这个字段，接线那边就不碰 `playbackRate`（见 `AudioJob.speed`）
         ...(isNormalSpeed(clip) ? {} : { speed: clipSpeed(clip) }),
+        // 不保音高就不带这个字段，接线那边连伸缩器都不建（见 `AudioJob.stretch`）
+        ...(clipPreservesPitch(clip)
+          ? {
+              stretch: {
+                originSeconds: seconds(clip.timelineIn - range.inFrame),
+                fromSeconds: seconds(firstFrame - clip.timelineIn),
+                toSeconds: seconds(lastFrame - clip.timelineIn),
+                sourceOriginSeconds: exactSeconds(clip.sourceIn, grid),
+              },
+            }
+          : {}),
         ...(sampleGainCurve(clip, seconds, range.inFrame, baseGain, spans, firstFrame, lastFrame) ??
           {}),
       });

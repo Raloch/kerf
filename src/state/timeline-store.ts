@@ -51,6 +51,7 @@ import {
   rippleDeleteClip,
   setClipColor,
   setClipLut,
+  setClipPreservePitch,
   setClipSpeed,
   setClipVolume,
   setTransition,
@@ -157,6 +158,8 @@ export interface TimelineState {
   setClipVolume: (clipId: ClipId, volume: number) => void;
   /** 改片段速度。**片段长度会跟着变**（保内容），放不下会被拒。见 `setClipSpeed`。 */
   setClipSpeed: (clipId: ClipId, speed: Rational) => void;
+  /** 开关变速保持音高。不改长度、不动速度，见 `setClipPreservePitch`。 */
+  setClipPreservePitch: (clipId: ClipId, on: boolean) => void;
   /** 把一张解析好的 LUT 加进项目库。 */
   addLut: (lut: LutSource) => void;
   /** 给片段挂上 / 摘掉 LUT。传 undefined 表示摘掉。 */
@@ -404,6 +407,11 @@ export const useTimeline = create<TimelineState>((set, get) => {
 
     setClipSpeed(clipId, speed) {
       apply(setClipSpeed(get().timeline(), clipId, speed), "变速", `speed:${clipId}`);
+    },
+
+    setClipPreservePitch(clipId, on) {
+      // 不给合并键：这是一次点击，不是连续拖拽
+      apply(setClipPreservePitch(get().timeline(), clipId, on), on ? "保持音高" : "允许变调");
     },
 
     addLut(lut) {

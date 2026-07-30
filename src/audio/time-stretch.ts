@@ -38,6 +38,13 @@
  * 而不是加窗——加了窗就要除以 `w[n]`，而 `w[0] = 0`，第一个样本会变成 0/0。
  * 拷贝的接法是精确的：接缝处 `w[hop] = 1`、`w[0] = 0`，正好续上。
  *
+ * ## 输出轴锚在"片段音频的起点"，所以位置可以是负数
+ *
+ * 锚点必须是**片段自己的**属性，不能是"这次导出第一次问到它的位置"：后者会随导出区间
+ * 变，于是同一个项目导全片和导一段得到不同的相位。而片段向两侧转场借出的余量落在
+ * `clip.timelineIn` **之前**（`clipRenderSpan()`），所以输出样本号会到负数——这里
+ * 不拦它。拦了的表现是"带转场的片段一开保音高就在入场那一侧静音"。
+ *
  * ## 倒放不做
  *
  * 同 D39：`VideoTrackReader` 的"取帧只能向前"是硬规则 3 的前提，负速度在这里
@@ -61,9 +68,16 @@ export const SEARCH_SECONDS = 0.01;
 /** 相似度比较的长度（秒）。不超过 hop——比过 hop 就把下一块的地盘也算进去了。 */
 export const CORRELATION_SECONDS = 0.01;
 
+/**
+ * 一段样本。写成 `Float32Array<ArrayBuffer>` 而不是裸 `Float32Array`：后者默认是
+ * `ArrayBufferLike`（含 `SharedArrayBuffer`），而 `AudioBuffer.copyToChannel()` 只收
+ * 普通 `ArrayBuffer` 上的视图——用裸类型的话接线那一行才编译不过，而错在这里。
+ */
+export type Samples = Float32Array<ArrayBuffer>;
+
 /** 源片的一段样本。`channels[c][0]` 对应绝对源片样本号 `origin`。 */
 export interface StretchSource {
-  readonly channels: readonly Float32Array[];
+  readonly channels: readonly Samples[];
   readonly origin: number;
 }
 
@@ -103,7 +117,7 @@ export interface TimeStretcher {
    * `outStart` 可以落在上次请求的区间里（相邻两段重叠），那一截从回看队列里给；
    * 落在队列之外就报错——那是"链要往回走"，不是能补的事。
    */
-  process(outStart: number, outEnd: number, source: StretchSource): Float32Array[];
+  process(outStart: number, outEnd: number, source: StretchSource): Samples[];
 }
 
 export function createTimeStretcher(options: StretchOptions): TimeStretcher {
@@ -141,14 +155,14 @@ export function createTimeStretcher(options: StretchOptions): TimeStretcher {
   /** 链是从哪个输出样本起的。回看能给到哪儿要按它算，不能按 0 算——链可以从中间起。 */
   let chainStart = 0;
   /** 上一块右半加窗后的结果，等着和下一块左半相加。长度 hop。 */
-  let carry: Float32Array[] | null = null;
+  let carry: Samples[] | null = null;
   /** 上一块内容"往后 hop 个样本"起的那一小段（单声道），下一块要跟它对相位。 */
-  let corrTarget: Float32Array | null = null;
+  let corrTarget: Samples | null = null;
 
   // 回看队列：一条滑动窗口，末端始终是 producedEnd。多留一个 window 是因为
   // 每次调用会产出到块边界，可能比请求的 outEnd 多出最多一个 hop
   const histLength = passthrough ? 0 : lookback + windowSamples;
-  const hist: Float32Array[] = [];
+  const hist: Samples[] = [];
   if (histLength > 0) {
     for (let ch = 0; ch < channelCount; ch++) hist.push(new Float32Array(histLength));
   }
@@ -157,16 +171,23 @@ export function createTimeStretcher(options: StretchOptions): TimeStretcher {
     return Math.round((block * hop * speed.num) / speed.den);
   }
 
+  /**
+   * 链从哪一块起。**不要往前多退一块。**
+   *
+   * 第一版写的是 `floor(outStart / hop) - 1`，理由是"请求的起点通常落在块中间，退一块
+   * 让它落在已经重叠相加过的区间里"——而那和"第一块左半原样拷贝"是**同一条边的两个
+   * 补偿**，叠起来就错了：退一块之后原样拷贝落在**上一块**上，于是起点那一截只有单块的
+   * 加窗内容、被上升 Hann 衰减。原来靠 `Math.max(0, …)` 把它挡住了（outStart = 0 时退不动），
+   * 放开负数位置之后立刻暴露，实测包络平整度从 1.0000 掉到 **0.6124**。
+   */
   function firstBlockFor(outStart: number): number {
-    // 往前退一块：请求的起点通常落在块中间，退一块让它落在已经重叠相加过的区间里
-    return Math.max(0, Math.floor(outStart / hop) - 1);
+    return Math.floor(outStart / hop);
   }
 
   function assertRange(outStart: number, outEnd: number): void {
     if (!Number.isInteger(outStart) || !Number.isInteger(outEnd)) {
       throw new Error(`输出区间必须是整数样本号：[${outStart}, ${outEnd})`);
     }
-    if (outStart < 0) throw new Error(`输出起点不能为负：${outStart}`);
     if (outEnd < outStart) throw new Error(`输出区间反了：[${outStart}, ${outEnd})`);
   }
 
@@ -184,13 +205,13 @@ export function createTimeStretcher(options: StretchOptions): TimeStretcher {
     return { from: nominalAt(from) - search, to: nominalAt(last) + search + windowSamples };
   }
 
-  function process(outStart: number, outEnd: number, source: StretchSource): Float32Array[] {
+  function process(outStart: number, outEnd: number, source: StretchSource): Samples[] {
     assertRange(outStart, outEnd);
     if (source.channels.length !== channelCount) {
       throw new Error(`声道数不符：说好 ${channelCount}，给了 ${source.channels.length}`);
     }
     const length = outEnd - outStart;
-    const out: Float32Array[] = [];
+    const out: Samples[] = [];
     for (let ch = 0; ch < channelCount; ch++) out.push(new Float32Array(length));
     if (length === 0) return out;
 
@@ -241,8 +262,8 @@ export function createTimeStretcher(options: StretchOptions): TimeStretcher {
     while (producedEnd < outEnd) {
       const place = placeBlock(block, mono, source.origin);
       const left = carry;
-      const emitted: Float32Array[] = [];
-      const nextCarry: Float32Array[] = [];
+      const emitted: Samples[] = [];
+      const nextCarry: Samples[] = [];
       for (let ch = 0; ch < channelCount; ch++) {
         const src = source.channels[ch]!;
         const head = new Float32Array(hop);
@@ -278,7 +299,7 @@ export function createTimeStretcher(options: StretchOptions): TimeStretcher {
   }
 
   /** 挑第 k 块从源片哪里取。第一块没有参照，就用标称位置。 */
-  function placeBlock(block: number, mono: Float32Array, origin: number): number {
+  function placeBlock(block: number, mono: Samples, origin: number): number {
     const nominal = nominalAt(block);
     const target = corrTarget;
     if (!target) return nominal;
@@ -304,10 +325,10 @@ export function createTimeStretcher(options: StretchOptions): TimeStretcher {
    * 除它不改变名次，白算一遍。
    */
   function similarity(
-    mono: Float32Array,
+    mono: Samples,
     origin: number,
     at: number,
-    target: Float32Array,
+    target: Samples,
   ): number {
     let dot = 0;
     let energy = 0;
@@ -321,17 +342,17 @@ export function createTimeStretcher(options: StretchOptions): TimeStretcher {
   }
 
   function sliceMono(
-    mono: Float32Array,
+    mono: Samples,
     origin: number,
     at: number,
     count: number,
-  ): Float32Array {
+  ): Samples {
     const out = new Float32Array(count);
     for (let n = 0; n < count; n++) out[n] = sampleAt(mono, origin, at + n);
     return out;
   }
 
-  function writeHistory(emitted: readonly Float32Array[]): void {
+  function writeHistory(emitted: readonly Samples[]): void {
     if (histLength === 0) return;
     for (let ch = 0; ch < channelCount; ch++) {
       const h = hist[ch]!;
@@ -355,7 +376,7 @@ export function createTimeStretcher(options: StretchOptions): TimeStretcher {
  * 区间伸出源片两端是常态（转场借余量、片段头尾），同 `ClipAudioCursor.read`：
  * 解不到的部分留成零 = 静音。这里报错的话，一个正常的片段头就会让整段混音倒下。
  */
-function sampleAt(data: Float32Array, origin: number, at: number): number {
+function sampleAt(data: Samples, origin: number, at: number): number {
   const idx = at - origin;
   return idx >= 0 && idx < data.length ? data[idx]! : 0;
 }
@@ -366,7 +387,7 @@ function sampleAt(data: Float32Array, origin: number, at: number): number {
  * 相似度必须在混合信号上算：各声道各挑一个偏移的话，同一时刻的左右声道会来自源片
  * 不同位置，立体声像会左右乱晃——而每一路自己听都是对的。
  */
-function buildMono(source: StretchSource, channelCount: number): Float32Array {
+function buildMono(source: StretchSource, channelCount: number): Samples {
   const first = source.channels[0]!;
   if (channelCount === 1) return first;
   const mono = new Float32Array(first.length);

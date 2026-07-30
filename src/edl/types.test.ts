@@ -8,6 +8,7 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  clipPreservesPitch,
   clipSourceFrames,
   clipSourceId,
   clipSpeed,
@@ -140,6 +141,22 @@ describe("速度是不是原速", () => {
     // 会掉出那条"不乘不除"的原路径，而它本该是原速
     expect(isNormalSpeed(mediaClip({ speed: { num: 2, den: 2 } }))).toBe(true);
     expect(isNormalSpeed(mediaClip({ speed: { num: 3, den: 2 } }))).toBe(false);
+  });
+});
+
+describe("要不要走保音高的时间伸缩", () => {
+  it("两个条件都要：开关开着，而且速度不是原速", () => {
+    expect(clipPreservesPitch(mediaClip())).toBe(false);
+    expect(clipPreservesPitch(mediaClip({ speed: { num: 2, den: 1 } }))).toBe(false);
+    // **开着但原速** → 仍然要走那条"不乘不除"的原路径。少判这一条不报错（伸缩器
+    // 自己对原速也直通），但"没变速的项目连代码路径都相同"这句话就不成立了
+    expect(clipPreservesPitch(mediaClip({ preservePitch: true }))).toBe(false);
+    expect(
+      clipPreservesPitch(mediaClip({ preservePitch: true, speed: { num: 2, den: 2 } })),
+    ).toBe(false);
+    expect(
+      clipPreservesPitch(mediaClip({ preservePitch: true, speed: { num: 2, den: 1 } })),
+    ).toBe(true);
   });
 });
 

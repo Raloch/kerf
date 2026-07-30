@@ -27,7 +27,7 @@ import {
   type Clip,
   type Timeline,
 } from "../edl/types";
-import { addSource, setClipSpeed } from "../state/operations";
+import { addSource, setClipPreservePitch, setClipSpeed } from "../state/operations";
 import { EMPTY_TIMELINE } from "../state/timeline-store";
 import { crossfadeGain } from "../audio/crossfade";
 import { createMixer, MIX_CHANNELS, MIX_SAMPLE_RATE } from "../audio/mixdown";
@@ -289,6 +289,7 @@ export async function verifyM0(options: VerifyOptions = {}): Promise<VerifyResul
 
   // ---- 8. 变速（D39）----
   checks.push(...(await verifySpeed()));
+  checks.push(...(await verifyPitch()));
 
   return {
     checks,
@@ -456,31 +457,17 @@ async function verifySpeed(): Promise<Check[]> {
     const normalFrom = at(SPEED_NORMAL_START);
     const normalTo = at(SPEED_NORMAL_START + originalFrames);
 
-    /** 一组起始沿的相邻间隔，用来对比"每几秒一声"。 */
-    const intervalCheck = (name: string, expected: number, from: number, to: number): void => {
-      const onsets = onsetsBetween(audio, from, to);
-      const gaps = onsets.slice(1).map((t, i) => t - onsets[i]!);
-      // 丢掉第一个间隔（见 `SPEED_INTERVAL_TOLERANCE`），但**照样印出来**：
-      // 藏起来的话下次它变成 40ms 也没人知道
-      const judged = gaps.slice(1);
-      const worst = judged.reduce((m, g) => Math.max(m, Math.abs(g - expected)), 0);
-      checks.push(
-        check(
-          name,
-          `每 ${(expected * 1000).toFixed(0)}ms 一声（|Δ| < ${SPEED_INTERVAL_TOLERANCE * 1000}ms）`,
-          // 每一声的位置都印出来：只印最大偏差时"少了一声"和"间隔不对"长得一样
-          `${onsets.length} 声 @ ${onsets.map((t) => (t * 1000).toFixed(0)).join("/")}ms` +
-            ` · 间隔 ${gaps.map((g) => (g * 1000).toFixed(0)).join("/")}ms` +
-            `（首个不计）· 最大偏差 ${(worst * 1000).toFixed(1)}ms`,
-          judged.length >= 2 && worst < SPEED_INTERVAL_TOLERANCE,
-        ),
-      );
-    };
-
     // 核心判据。漏设 `playbackRate` 时这里量到的是 1000ms
-    intervalCheck("变速：2× 段里每半秒一声（源片每秒一声）", 0.5, fastFrom, fastTo);
+    pushIntervalCheck(checks, audio, "变速：2× 段里每半秒一声（源片每秒一声）", 0.5, fastFrom, fastTo);
     // 对照组：同一个源文件、同一条管线，只有速度不同
-    intervalCheck("变速：同一次导出里的 1× 对照段仍是每秒一声", 1, normalFrom, normalTo);
+    pushIntervalCheck(
+      checks,
+      audio,
+      "变速：同一次导出里的 1× 对照段仍是每秒一声",
+      1,
+      normalFrom,
+      normalTo,
+    );
 
     // 漏设 `playbackRate` 时那段 PCM 会放满 4 秒，于是拖到片段占位之外——
     // 只判间隔的话这一条抓不到"区间对了但速度没设"以外的另一半
@@ -497,6 +484,262 @@ async function verifySpeed(): Promise<Check[]> {
     input.dispose();
   }
   await removeExportFile(SPEED_OUT);
+
+  return checks;
+}
+
+/**
+ * 把"每几秒一声"这条断言推进 `checks`。变速和保音高两组共用。
+ *
+ * 判**间隔**而不是绝对位置，理由见 `SPEED_INTERVAL_TOLERANCE`；第一个间隔丢掉但照样印。
+ */
+function pushIntervalCheck(
+  checks: Check[],
+  audio: { readonly pcm: Float32Array; readonly rate: number },
+  name: string,
+  expected: number,
+  from: number,
+  to: number,
+): void {
+  const onsets = onsetsBetween(audio, from, to);
+  const gaps = onsets.slice(1).map((t, i) => t - onsets[i]!);
+  const judged = gaps.slice(1);
+  const worst = judged.reduce((m, g) => Math.max(m, Math.abs(g - expected)), 0);
+  checks.push(
+    check(
+      name,
+      `每 ${(expected * 1000).toFixed(0)}ms 一声（|Δ| < ${SPEED_INTERVAL_TOLERANCE * 1000}ms）`,
+      // 每一声的位置都印出来：只印最大偏差时"少了一声"和"间隔不对"长得一样
+      `${onsets.length} 声 @ ${onsets.map((t) => (t * 1000).toFixed(0)).join("/")}ms` +
+        ` · 间隔 ${gaps.map((g) => (g * 1000).toFixed(0)).join("/")}ms` +
+        `（首个不计）· 最大偏差 ${(worst * 1000).toFixed(1)}ms`,
+      judged.length >= 2 && worst < SPEED_INTERVAL_TOLERANCE,
+    ),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 保音高（D40）
+// ---------------------------------------------------------------------------
+
+const PITCH_OUT = "kerf-verify-pitch.mp4";
+/** 素材里那声提示音的频率（`makeSampleAudio` 的 beeps 就是 1kHz / 80ms / 幅度 0.25）。 */
+const PITCH_SOURCE_HZ = 1000;
+/**
+ * 量基频的窗口：从起始沿往后跳一点再取一段，**必须整个落在提示音里**。
+ *
+ * 提示音在源片里是 80ms，2× 之后输出只有 **40ms**——skip + window 超过它就会量到
+ * 静音段，那时零交叉计数给出的是个小数字，看起来像"音高变低了"。所以这两个常数
+ * 是按 2× 定的，改速度倍率要跟着重算。
+ */
+const PITCH_SKIP_SECONDS = 0.006;
+const PITCH_WINDOW_SECONDS = 0.024;
+/**
+ * 基频容差（Hz）。24ms 窗上零交叉计数的分辨率是 ±42Hz，取 150 留一倍余量。
+ *
+ * 它要分开的是 1000Hz 和 2000Hz，相距 1000Hz——所以这个容差松一个数量级也照样有牙齿。
+ */
+const PITCH_TOLERANCE_HZ = 150;
+/**
+ * 第一声相对片段起点的容差（秒）。
+ *
+ * 健康值实测 **34ms**——那是提示音起振加上 AAC 的变换窗，长在源片时间里、不是产品的
+ * 偏移（同 `SPEED_INTERVAL_TOLERANCE` 那条第一个间隔的成因）。取 100ms 留三倍余量，
+ * 而它要抓的坐标系混用是**整整一个片段起点**的量（这里是 1000ms）。
+ */
+const PITCH_ONSET_TOLERANCE = 0.1;
+
+/**
+ * 一段 PCM 的基频（Hz），按**上升零交叉计数**。
+ *
+ * 纯音上够准，而且完全不依赖被测代码——这一条是判据本身，不能用产品里的任何东西算。
+ */
+function fundamentalBetween(
+  audio: { readonly pcm: Float32Array; readonly rate: number },
+  from: number,
+  to: number,
+): number {
+  const start = Math.max(0, Math.round(from * audio.rate));
+  const end = Math.min(audio.pcm.length, Math.round(to * audio.rate));
+  if (end - start < 2) return 0;
+  let crossings = 0;
+  for (let i = start + 1; i < end; i++) {
+    if (audio.pcm[i - 1]! <= 0 && audio.pcm[i]! > 0) crossings++;
+  }
+  return (crossings * audio.rate) / (end - start);
+}
+
+/**
+ * 保音高在音频上的端到端护栏（**D40**）。
+ *
+ * **判据是提示音自己的频率**，而不是它出现在哪儿——后者由变速那一组管着。素材是
+ * 1kHz，2× 重采样播出来是 2kHz，保音高播出来仍该是 1kHz。
+ *
+ * 对照段**只差那一个开关**：同一个源文件、同一条管线、同样 2×，只是没开保音高。
+ * 于是它必须量到 2kHz——那一条同时证明**这个量法确实量得到音高**（不然"两段都 1kHz"
+ * 也可能只是因为零交叉计数根本没在测频率），也证明**变化来自那个开关**。
+ * 同那条"先量一遍被测对象之外的那一半"。
+ *
+ * 顺带还留着一条间隔断言：保音高走的是完全另一条路径（伸缩器算长度，`playbackRate`
+ * 留在 1），把速度弄坏了完全可能——而那时音高照样是对的。
+ */
+async function verifyPitch(): Promise<Check[]> {
+  const checks: Check[] = [];
+
+  const videoSample = await makeSampleVideo({
+    durationFrames: SPEED_TOTAL_FRAMES,
+    withAudio: false,
+  });
+  const musicSample = await makeSampleAudio({ seconds: SPEED_SOURCE_SECONDS, shape: "beeps" });
+  const video = (await probeAvFile(videoSample.file)).source;
+  const music = (await probeFile(musicSample.file)).source;
+
+  const withVideo = addSource(EMPTY_TIMELINE, { source: video, timelineIn: 0 });
+  const placed = addSource(withVideo.timeline, { source: music, timelineIn: SPEED_FAST_START });
+  if (!placed.changed) throw new Error(`保音高自检放不下片段：${placed.reason ?? "未知原因"}`);
+  const keptId = `${music.id}-a`;
+
+  // 走真正的编辑入口，两步：先变速，再开保音高
+  const sped = setClipSpeed(placed.timeline, keptId, { num: 2, den: 1 });
+  if (!sped.changed) throw new Error(`保音高自检设不上速度：${sped.reason ?? "未知原因"}`);
+  const preserved = setClipPreservePitch(sped.timeline, keptId, true);
+  if (!preserved.changed) {
+    throw new Error(`保音高自检开不了开关：${preserved.reason ?? "未知原因"}`);
+  }
+
+  const keptClip = preserved.timeline.tracks.flatMap((t) => t.clips).find((c) => c.id === keptId);
+  const fastFrames = keptClip ? keptClip.timelineOut - keptClip.timelineIn : 0;
+
+  // 对照段手搓：`addSource` 不会把同一个素材放第二遍。它和上面那段**只差 preservePitch**
+  const control: Clip = {
+    id: "pitch-control",
+    kind: "media",
+    sourceId: music.id,
+    name: "对照（2× 重采样）",
+    timelineIn: SPEED_NORMAL_START,
+    timelineOut: SPEED_NORMAL_START + fastFrames,
+    sourceIn: 0,
+    speed: { num: 2, den: 1 },
+  };
+  const timeline: Timeline = {
+    ...preserved.timeline,
+    durationFrames: SPEED_TOTAL_FRAMES,
+    tracks: preserved.timeline.tracks.map((t) =>
+      t.id === "A1" ? { ...t, clips: [...t.clips, control] } : t,
+    ),
+  };
+
+  await removeExportFile(PITCH_OUT);
+  const run = startExport(
+    {
+      timeline,
+      range: { inFrame: 0, outFrame: SPEED_TOTAL_FRAMES },
+      container: "mp4",
+      videoBitrate: 4e6,
+      audioBitrate: 128e3,
+      includeAudio: true,
+      target: { kind: "opfs", name: PITCH_OUT },
+      autoDownload: false,
+    },
+    () => undefined,
+  );
+  const done = await run.done;
+  if (!done) throw new Error("保音高自检的导出被取消");
+
+  const r = done.residency;
+  const leaked = r.leakedSamples + r.leakedCursors + r.leakedInputs;
+  checks.push(
+    check(
+      "保音高：导出泄漏为 0",
+      "leaked 0",
+      `帧 ${r.leakedSamples} · 游标 ${r.leakedCursors} · Input ${r.leakedInputs}`,
+      leaked === 0,
+    ),
+  );
+
+  const file = await readExportFile(PITCH_OUT);
+  const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(file) });
+  try {
+    const track = await input.getPrimaryAudioTrack();
+    if (!track) {
+      checks.push(check("保音高：成片里有音轨", true, false));
+      return checks;
+    }
+    const at = (frames: number) => frameToSeconds(frames, timeline.fps);
+    const audio = await decodeTrackToPcm(track, at(SPEED_TOTAL_FRAMES) + 1);
+
+    const keptFrom = at(SPEED_FAST_START);
+    const keptTo = at(SPEED_FAST_START + fastFrames);
+    const controlFrom = at(SPEED_NORMAL_START);
+    const controlTo = at(SPEED_NORMAL_START + fastFrames);
+
+    /** 量某一段里**第二声**的基频。跳过第一声：它贴着入点，起振被 AAC 抹过一点。 */
+    const toneOf = (from: number, to: number): { hz: number; onset: number | null } => {
+      const onsets = onsetsBetween(audio, from, to);
+      const onset = onsets[1] ?? onsets[0] ?? null;
+      if (onset === null) return { hz: 0, onset: null };
+      return {
+        hz: fundamentalBetween(
+          audio,
+          onset + PITCH_SKIP_SECONDS,
+          onset + PITCH_SKIP_SECONDS + PITCH_WINDOW_SECONDS,
+        ),
+        onset,
+      };
+    };
+
+    const kept = toneOf(keptFrom, keptTo);
+    const resampled = toneOf(controlFrom, controlTo);
+    checks.push(
+      check(
+        "保音高：2× 之后提示音仍是 1kHz",
+        `${PITCH_SOURCE_HZ}Hz ± ${PITCH_TOLERANCE_HZ}`,
+        `${kept.hz.toFixed(0)}Hz（第二声 @ ${((kept.onset ?? 0) * 1000).toFixed(0)}ms）`,
+        Math.abs(kept.hz - PITCH_SOURCE_HZ) < PITCH_TOLERANCE_HZ,
+      ),
+      // 量法自证 + 变化来自那个开关：只差 preservePitch 的对照段必须翻一倍
+      check(
+        "保音高：只差这个开关的对照段是 2kHz（证明量法量得到音高）",
+        `${PITCH_SOURCE_HZ * 2}Hz ± ${PITCH_TOLERANCE_HZ}`,
+        `${resampled.hz.toFixed(0)}Hz（第二声 @ ${((resampled.onset ?? 0) * 1000).toFixed(0)}ms）`,
+        Math.abs(resampled.hz - PITCH_SOURCE_HZ * 2) < PITCH_TOLERANCE_HZ,
+      ),
+    );
+
+    // 保音高走的是另一条算长度的路径，速度可能被弄坏而音高照样对
+    pushIntervalCheck(checks, audio, "保音高：段里仍是每半秒一声", 0.5, keptFrom, keptTo);
+
+    // **位置的直接判据。** 伸缩路径的起播时刻由排期层给的两个坐标（片段本地 + 导出
+    // 原点）拼出来，混用它们的表现是"整段声音偏移了一个片段起点的量"。间隔断言只能
+    // **间接**看见那件事（窗口里数不够声数），实测忘减 `clip.timelineIn` 时它报的是
+    // 「3 声 @ 2028ms」而最大偏差只有 0.4ms——读数里看得出来，但红的理由不是位置。
+    // 所以这里按 D35 配乐那组的口径直接量一次，两个操作数都印出来
+    const firstOnset = onsetsBetween(audio, keptFrom, keptTo)[0] ?? null;
+    const drift = firstOnset === null ? Infinity : firstOnset - keptFrom;
+    checks.push(
+      check(
+        "保音高：第一声落在片段起点上（起播时刻由两个坐标拼出来）",
+        `片段起点 ${(keptFrom * 1000).toFixed(0)}ms，偏差 < ${PITCH_ONSET_TOLERANCE * 1000}ms`,
+        firstOnset === null
+          ? "这一段里一声都没有"
+          : `第一声 @ ${(firstOnset * 1000).toFixed(0)}ms · 偏差 ${(drift * 1000).toFixed(0)}ms`,
+        Math.abs(drift) < PITCH_ONSET_TOLERANCE,
+      ),
+    );
+
+    const tailPeak = peakBetween(audio, keptTo + 0.1, controlFrom - 0.1);
+    checks.push(
+      check(
+        "保音高：段结束之后是静音（伸缩没有产出多余长度）",
+        "峰值 < 0.02",
+        tailPeak.toFixed(4),
+        tailPeak < 0.02,
+      ),
+    );
+  } finally {
+    input.dispose();
+  }
+  await removeExportFile(PITCH_OUT);
 
   return checks;
 }
@@ -941,7 +1184,39 @@ async function verifyMixSegmentation(timeline: Timeline, total: number): Promise
   return [
     ...(await compare("无转场", withoutAudioTransitions(timeline), SEGMENT_MATCH_TOLERANCE)),
     ...(await compare("带淡化", timeline, SEGMENT_ENVELOPE_TOLERANCE)),
+    // **保音高（D40）**：伸缩器带一条只能向前的对齐链，段边界打断它就是接缝上的相位
+    // 跳变。单测已经逐样本钉住算法本身，这一组钉的是**接线**——回看队列按
+    // `2 × pad × 速度 + 窗和搜索的余量` 开得够不够、起播时刻有没有按同一把尺子对齐到
+    // 整数样本。回看不够的表现正是 D22 记过的那个：**除第一段外全部静音**，不报错。
+    // 容差用严的那个：伸缩是确定性的，两种切法本该逐样本相同（不是"接近"）
+    ...(await compare(
+      "保音高 2×",
+      withPreservedPitch(withoutAudioTransitions(timeline)),
+      SEGMENT_MATCH_TOLERANCE,
+    )),
   ];
+}
+
+/**
+ * 把音频轨上的片段全都设成 2× + 保音高。**长度刻意不动**——这一组只比"分段与不分段"，
+ * 时间轴长什么样无关，而改长度会引出碰撞和源片越界这些跟被测对象无关的东西。
+ */
+function withPreservedPitch(timeline: Timeline): Timeline {
+  return {
+    ...timeline,
+    tracks: timeline.tracks.map((track) =>
+      track.kind !== "audio"
+        ? track
+        : {
+            ...track,
+            clips: track.clips.map((clip) =>
+              clip.kind === "media"
+                ? { ...clip, speed: { num: 2, den: 1 }, preservePitch: true }
+                : clip,
+            ),
+          },
+    ),
+  };
 }
 
 /** 自检里给片段设的音量。取 0.5 而不是 0.9：偏差要比浮点噪声大好几个数量级。 */

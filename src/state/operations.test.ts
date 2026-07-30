@@ -31,6 +31,7 @@ import {
   removeKeyframe,
   rippleDeleteClip,
   setClipColor,
+  setClipPreservePitch,
   setClipSpeed,
   setClipVolume,
   staticValueOf,
@@ -1912,5 +1913,74 @@ describe("变速片段的裁切与切分", () => {
     const right = halves.find((c) => c.timelineIn === 20)!;
     expect(right.sourceIn).toBe(40);
     expect(right.speed).toEqual(SPEED_2X);
+  });
+});
+
+describe("setClipPreservePitch：只换算法，不动长度", () => {
+  it("开关不改长度也不动速度", () => {
+    const fast = setClipSpeed(speedTimeline(), "a", SPEED_2X).timeline;
+    const on = setClipPreservePitch(fast, "a", true);
+    expect(on.changed).toBe(true);
+    const c = media(findClip(on.timeline, "a")?.clip);
+    expect(c.preservePitch).toBe(true);
+    expect(c.timelineOut).toBe(50);
+    expect(c.speed).toEqual(SPEED_2X);
+  });
+
+  it("**关掉要把字段整个删掉**，不留 preservePitch: false", () => {
+    const on = setClipPreservePitch(speedTimeline(), "a", true).timeline;
+    const off = setClipPreservePitch(on, "a", false).timeline;
+    expect("preservePitch" in media(findClip(off, "a")?.clip)).toBe(false);
+  });
+
+  it("原速下也能开——那是用户表达过的偏好，调回 1× 不该把它清掉", () => {
+    // 调到 2× → 开保音高 → 调回 1× → 再调到 2×，勾选必须还在
+    const on = setClipPreservePitch(setClipSpeed(speedTimeline(), "a", SPEED_2X).timeline, "a", true)
+      .timeline;
+    const back = setClipSpeed(on, "a", { num: 1, den: 1 }).timeline;
+    expect(media(findClip(back, "a")?.clip).preservePitch).toBe(true);
+    const again = setClipSpeed(back, "a", SPEED_2X).timeline;
+    expect(media(findClip(again, "a")?.clip).preservePitch).toBe(true);
+  });
+
+  it("值没变时既不进撤销栈也不算失败", () => {
+    const r = setClipPreservePitch(speedTimeline(), "a", false);
+    expect(r.changed).toBe(false);
+    expect(r.reason).toBeUndefined();
+  });
+
+  it("无音轨的素材上拒绝——设了没反应比拒绝更难查", () => {
+    // 显式造一个 AvSource：`{...source(), hasAudio:false}` 会把判别联合摊平成
+    // "共有字段"，编译不过（同 D35 那条分配式 Omit）
+    const silent: Timeline = {
+      ...speedTimeline(),
+      sources: [
+        {
+          id: "src",
+          kind: "av",
+          name: "src.mp4",
+          file: new File([], "src.mp4"),
+          fps: FPS.ndf2997,
+          width: 1920,
+          height: 1080,
+          durationFrames: 1000,
+          hasAudio: false,
+          videoCodec: "avc",
+          audioCodec: null,
+        },
+      ],
+    };
+    expect(setClipPreservePitch(silent, "a", true).reason).toMatch(/没有音轨/);
+  });
+
+  it("文字片段拒绝", () => {
+    const withText = addTextClip(speedTimeline(), { timelineIn: 200, durationFrames: 90, text: "字" });
+    const textId = withText.clipId!;
+    expect(setClipPreservePitch(withText.timeline, textId, true).reason).toMatch(/只有素材片段/);
+  });
+
+  it("锁定轨道上拒绝", () => {
+    const locked = timeline([{ id: "V1", kind: "video", locked: true, clips: [clip("a", 0, 100)] }]);
+    expect(setClipPreservePitch(locked, "a", true).reason).toMatch(/锁定/);
   });
 });

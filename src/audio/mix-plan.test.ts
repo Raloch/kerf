@@ -469,3 +469,72 @@ describe("变速（D39）", () => {
     expect(job.ramps[0]?.durationSeconds).toBeCloseTo((20 * FPS.ndf2997.den) / FPS.ndf2997.num, 6);
   });
 });
+
+describe("保音高（D40）", () => {
+  const stretched = (extra: Partial<MediaClip>): MediaClip => ({
+    ...clip("a", 100, 200, 300),
+    speed: { num: 2, den: 1 },
+    preservePitch: true,
+    ...extra,
+  });
+
+  it("没开保音高时字段整个不存在——接线那边据此决定建不建伸缩器", () => {
+    const jobs = planAudioJobs(
+      timeline([{ ...clip("a", 100, 200, 300), speed: { num: 2, den: 1 } }]),
+      FULL,
+    );
+    expect(jobs[0]?.stretch).toBeUndefined();
+  });
+
+  it("原速下开着也不给 stretch——原速必须走不乘不除的原路径", () => {
+    const jobs = planAudioJobs(
+      timeline([{ ...clip("a", 100, 200, 300), preservePitch: true }]),
+      FULL,
+    );
+    expect(jobs[0]?.stretch).toBeUndefined();
+  });
+
+  it("原点在导出坐标系、区间在片段本地坐标系，两个坐标系不能混", () => {
+    // 片段从第 100 帧起、占 100 帧、入点在源片第 300 帧、2×
+    const jobs = planAudioJobs(timeline([stretched({})]), FULL);
+    const job = jobOf(jobs, "a");
+    expect(job.stretch?.originSeconds).toBeCloseTo(100 * FRAME_SECONDS, US);
+    // 片段本地：这段 PCM 从片段自己的第 0 帧起，到第 100 帧
+    expect(job.stretch?.fromSeconds).toBeCloseTo(0, US);
+    expect(job.stretch?.toSeconds).toBeCloseTo(100 * FRAME_SECONDS, US);
+    // 源片轴的原点就是入点，**不含**任何速度换算（速度作用在"走了多久"上）
+    expect(job.stretch?.sourceOriginSeconds).toBeCloseTo(300 * FRAME_SECONDS, US);
+    // 起播时刻由接线那边按 origin + 整数样本算，所以这里两者之和要等于 whenSeconds
+    expect(job.stretch!.originSeconds + job.stretch!.fromSeconds).toBeCloseTo(job.whenSeconds, US);
+  });
+
+  it("导出区间从片段中间切过去时，原点为负而片段本地区间照旧从那一帧算", () => {
+    // 只导 [150, 400)：片段起点在区间之前，所以 originSeconds 必须是负的
+    const jobs = planAudioJobs(timeline([stretched({})]), { inFrame: 150, outFrame: 400 });
+    const job = jobOf(jobs, "a");
+    expect(job.stretch?.originSeconds).toBeCloseTo(-50 * FRAME_SECONDS, US);
+    expect(job.stretch?.fromSeconds).toBeCloseTo(50 * FRAME_SECONDS, US);
+    expect(job.stretch!.originSeconds + job.stretch!.fromSeconds).toBeCloseTo(job.whenSeconds, US);
+  });
+
+  it("转场借余量时片段本地区间会到负数——伸缩器不许拦它", () => {
+    // b 从 100 起并挂 20 帧淡化 → 窗口 [90, 110)，于是 b 要解到自己的第 −10 帧
+    const jobs = planAudioJobs(
+      timeline([
+        clip("a", 0, 100, 200),
+        {
+          ...clip("b", 100, 200, 500, { kind: "xfade-power", frames: 20 }),
+          speed: { num: 2, den: 1 },
+          preservePitch: true,
+        },
+      ]),
+      FULL,
+    );
+    expect(jobOf(jobs, "b").stretch?.fromSeconds).toBeCloseTo(-10 * FRAME_SECONDS, US);
+  });
+
+  it("速度字段照样在——伸缩器要按它建，而 playbackRate 留在 1", () => {
+    const jobs = planAudioJobs(timeline([stretched({})]), FULL);
+    expect(jobOf(jobs, "a").speed).toEqual({ num: 2, den: 1 });
+  });
+});

@@ -20,6 +20,7 @@
 import { describe, expect, it } from "vitest";
 import { rational } from "../time/rational";
 import {
+  type Samples,
   type StretchSource,
   type TimeStretcher,
   WINDOW_SECONDS,
@@ -48,14 +49,14 @@ function cancellationFreq(hop: number, rate = RATE): number {
   return (rate / hop) * 4.5;
 }
 
-function sine(freq: number, count: number, amp = 0.5, rate = RATE): Float32Array {
+function sine(freq: number, count: number, amp = 0.5, rate = RATE): Samples {
   const out = new Float32Array(count);
   for (let i = 0; i < count; i++) out[i] = amp * Math.sin((2 * Math.PI * freq * i) / rate);
   return out;
 }
 
 /** 两个不成简单倍数关系的音叠起来：纯正弦上任何取块位置都对得上，测不出对齐 */
-function chord(count: number): Float32Array {
+function chord(count: number): Samples {
   const a = sine(440, count, 0.35);
   const b = sine(617, count, 0.25);
   const out = new Float32Array(count);
@@ -68,8 +69,8 @@ function pull(
   stretcher: TimeStretcher,
   from: number,
   to: number,
-  full: readonly Float32Array[],
-): Float32Array[] {
+  full: readonly Samples[],
+): Samples[] {
   const range = stretcher.sourceRangeFor(from, to);
   const origin = Math.max(0, range.from);
   const end = Math.min(full[0]!.length, Math.max(origin, range.to));
@@ -81,7 +82,7 @@ function pull(
 }
 
 /** 上升零交叉计数 → 基频（Hz）。纯音上足够准，且完全不依赖被测代码 */
-function fundamental(x: Float32Array, rate = RATE): number {
+function fundamental(x: Samples, rate = RATE): number {
   let crossings = 0;
   for (let i = 1; i < x.length; i++) {
     if (x[i - 1]! <= 0 && x[i]! > 0) crossings++;
@@ -89,7 +90,7 @@ function fundamental(x: Float32Array, rate = RATE): number {
   return (crossings * rate) / x.length;
 }
 
-function rms(x: Float32Array): number {
+function rms(x: Samples): number {
   let sum = 0;
   for (const v of x) sum += v * v;
   return Math.sqrt(sum / x.length);
@@ -103,7 +104,7 @@ function rms(x: Float32Array): number {
  * 交叉淡化），失配表现为重叠区里两块相互抵消，也就是**幅度周期性塌陷**。实测把整个
  * 对齐搜索关掉，"最大跳变"那条纹丝不动，而这一条从 0.98 掉到 0.35。
  */
-function envelopeFlatness(x: Float32Array, window: number): number {
+function envelopeFlatness(x: Samples, window: number): number {
   let lo = Infinity;
   let hi = 0;
   for (let at = 0; at + window <= x.length; at += window) {
@@ -340,8 +341,8 @@ describe("声道", () => {
     const count = 300_000;
     const a = sine(440, count, 0.35);
     const b = sine(617, count, 0.25);
-    const left = new Float32Array(count);
-    const right = new Float32Array(count);
+    const left: Samples = new Float32Array(count);
+    const right: Samples = new Float32Array(count);
     for (let i = 0; i < count; i++) {
       left[i] = a[i]! + b[i]!;
       right[i] = a[i]! - b[i]!;
@@ -375,5 +376,31 @@ describe("源片之外", () => {
     // 源片只有 4000 个样本，2× 下 2000 个输出样本之后就没东西了
     expect(rms(out[0]!.subarray(0, 1_500))).toBeGreaterThan(0.01);
     expect(rms(out[0]!.subarray(10_000))).toBe(0);
+  });
+});
+
+describe("请求区间的两条边", () => {
+  it("首次请求的起点落在块中间时，起点那一截不许被衰减", () => {
+    // 这一条是回归护栏：`firstBlockFor` 曾经往前多退一块，而那和"第一块左半原样拷贝"
+    // 是同一条边的两个补偿，叠起来的表现是**开头一个 hop 被上升 Hann 衰减**——实测
+    // 包络平整度从 1.0000 掉到 0.6124，而"分段与不分段一致"那三条**照样全绿**
+    // （两种切法都同样被衰减）。
+    const st = createTimeStretcher({ speed: rational(2, 1), sampleRate: RATE, channelCount: 1 });
+    const src = sine(cancellationFreq(st.hopSamples), 300_000);
+    const offset = st.hopSamples + 137; // 刻意不是 hop 的整数倍
+    const out = pull(st, offset, offset + RATE, [src])[0]!;
+    expect(envelopeFlatness(out, st.hopSamples)).toBeGreaterThan(0.95);
+    // 起点那一截确实有内容，不是"整段都平但整段都轻"
+    expect(rms(out.subarray(0, st.hopSamples))).toBeGreaterThan(0.3);
+  });
+
+  it("输出位置可以是负数（转场借余量落在片段起点之前）", () => {
+    const st = createTimeStretcher({ speed: rational(2, 1), sampleRate: RATE, channelCount: 1 });
+    const src = chord(300_000);
+    // −4800 起：源片轴上对应 −9600，用例里那截不存在，所以当零
+    const out = pull(st, -4_800, 4_800, [src])[0]!;
+    expect(out.length).toBe(9_600);
+    expect(rms(out.subarray(0, 4_000))).toBe(0);
+    expect(rms(out.subarray(5_600))).toBeGreaterThan(0.05);
   });
 });

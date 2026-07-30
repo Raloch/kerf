@@ -374,6 +374,20 @@ export interface MediaClip extends ClipBase {
    * 前提，整个解码架构建在顺序解码上。范围由 `SPEED_RANGE` 夹。
    */
   readonly speed?: Rational;
+  /**
+   * 变速时是否保持音高（时间伸缩，**D40**）。缺省 = 不保持 = 重采样（声音跟着变调）。
+   *
+   * **缺省刻意是"不保持"**：重采样变调是多数剪辑器的行为（Premiere 也要勾"保持音高"），
+   * 而保音高有 CPU 开销和瞬态代价；把默认改掉等于让所有现存项目的声音换一种算法。
+   *
+   * **它只在 `speed` 不是原速时有意义**，原速下整条伸缩路径根本不进（`isNormalSpeed`
+   * 先短路）。但字段**不跟着 `speed` 一起删**：用户调到 2×、勾上保音高、再调回 1×、
+   * 又调到 2×，勾选该还在——那是他表达过的偏好，清掉是"我没动过它却变了"。
+   *
+   * 关掉时要把字段整个 `delete`（同 `speed` / `volume` / `transform`）：合成路径判的是
+   * 值，所以这不是正确性问题；但"这个片段有没有开过保音高"要能在数据层一眼看出来。
+   */
+  readonly preservePitch?: boolean;
 }
 
 /**
@@ -572,6 +586,17 @@ export function clipSpeed(clip: MediaClip): Rational {
 export function isNormalSpeed(clip: MediaClip): boolean {
   const s = clip.speed;
   return s === undefined || s.num === s.den;
+}
+
+/**
+ * 这个片段要不要走保音高的时间伸缩（**D40**）。
+ *
+ * **两个条件都要**：开关开着，**而且**速度不是原速。少判后一条不会报错——伸缩器自己
+ * 对原速也走直通——但那会让"没变速的项目连代码路径都和以前相同"这句话不再成立，
+ * 而它正是 M0 那条音画同步断言不漂的地基（同 `isNormalSpeed` 存在的全部理由）。
+ */
+export function clipPreservesPitch(clip: MediaClip): boolean {
+  return clip.preservePitch === true && !isNormalSpeed(clip);
 }
 
 /**

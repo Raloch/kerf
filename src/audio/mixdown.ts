@@ -35,6 +35,13 @@ import { toNumber } from "../time/rational";
 import { crossfadeCurve } from "./crossfade";
 import { planAudioJobs, type AudioJob } from "./mix-plan";
 import { planMixSegments, type MixSegment } from "./mix-segments";
+import {
+  SEARCH_SECONDS,
+  WINDOW_SECONDS,
+  createTimeStretcher,
+  type Samples,
+  type TimeStretcher,
+} from "./time-stretch";
 
 /** AudioBuffer 的字节数：f32，每声道每帧 4 字节。 */
 function bufferBytes(buffer: AudioBuffer): number {
@@ -209,8 +216,13 @@ export async function createMixer(
   // 取所有 job 里最大的那个速度而不是 `SPEED_RANGE.max`：后者会让没变速的项目
   // 也白留 8 倍的回看队列，而这个队列的长度直接是内存。
   const maxSpeed = jobs.reduce((m, job) => Math.max(m, job.speed ? toNumber(job.speed) : 1), 1);
+  // 保音高时伸缩器要的源片比"输出 × 速度"再宽一点：左边一个搜索半径、右边一个窗
+  // （`sourceRangeFor`）。不加的表现和漏乘速度是同一个——回看不够，除第一段外静音
+  const stretchMargin = jobs.some((job) => job.stretch)
+    ? WINDOW_SECONDS + SEARCH_SECONDS
+    : 0;
   const backlogSeconds =
-    ((2 * plan.padFrames * timeline.fps.den) / timeline.fps.num) * maxSpeed + 0.5;
+    ((2 * plan.padFrames * timeline.fps.den) / timeline.fps.num) * maxSpeed + stretchMargin + 0.5;
   const pool = new ClipCursorPool(fileOf, backlogSeconds);
   let at = 0;
 
@@ -287,6 +299,18 @@ class ClipAudioCursor {
   ) {
     this.input = new Input({ formats: ALL_FORMATS, source: new BlobSource(file) });
     residency.openInput();
+  }
+
+  /** 源片自身的采样率 / 声道数。`open()` 成功之后才有意义。伸缩器要按它建。 */
+  get sampleRate(): number {
+    return this.rate;
+  }
+  get channelCount(): number {
+    return this.channels;
+  }
+  /** 回看长度（源片秒数）。伸缩器的输出侧队列按同一个量开，见 `stretchedBuffer`。 */
+  get lookbackSeconds(): number {
+    return this.backlogSeconds;
   }
 
   /** 准备好解码器。这条轨解不了就返回 false，调用方跳过这个片段。 */
@@ -407,11 +431,28 @@ class ClipAudioCursor {
  */
 class ClipCursorPool {
   private readonly open = new Map<ClipId, ClipAudioCursor>();
+  /**
+   * 保音高的伸缩器，和游标**同生同死**（D40）。
+   *
+   * 它带一条只能向前的对齐链，所以必须跨段活着——每段新建一个就是"每次调用重新起链"，
+   * 而那正是段边界上的相位跳变。反过来只还游标不还伸缩器更坏：下次借到的是一条链停在
+   * 旧位置的伸缩器，`process` 会当场抛"只能向前"。所以两个 Map 只在这一个类里成对进出。
+   */
+  private readonly stretchers = new Map<ClipId, TimeStretcher>();
 
   constructor(
     private readonly fileOf: ReadonlyMap<SourceId, File>,
     private readonly backlogSeconds: number,
   ) {}
+
+  /** 拿这个片段的伸缩器，没有就用 `make` 建一个。 */
+  stretcher(clipId: ClipId, make: () => TimeStretcher): TimeStretcher {
+    const existing = this.stretchers.get(clipId);
+    if (existing) return existing;
+    const created = make();
+    this.stretchers.set(clipId, created);
+    return created;
+  }
 
   async acquire(clipId: ClipId, sourceId: SourceId): Promise<ClipAudioCursor | null> {
     const existing = this.open.get(clipId);
@@ -431,7 +472,12 @@ class ClipCursorPool {
     for (const [clipId, cursor] of [...this.open]) {
       if (keep.has(clipId)) continue;
       this.open.delete(clipId);
+      this.stretchers.delete(clipId);
       await cursor.dispose();
+    }
+    // 借了伸缩器但游标没开成（源片解不出来）时也要清掉
+    for (const clipId of [...this.stretchers.keys()]) {
+      if (!keep.has(clipId)) this.stretchers.delete(clipId);
     }
   }
 
@@ -500,22 +546,27 @@ async function renderSegment(
   for (const job of jobs) {
     const cursor = await pool.acquire(job.clipId, job.sourceId);
     if (!cursor) continue;
-    const pcm = await cursor.read(job.srcStartSeconds, job.srcEndSeconds);
-    if (!pcm) continue;
+
+    const prepared = job.stretch
+      ? await stretchedBuffer(job, job.stretch, cursor, pool)
+      : await resampledBuffer(job, cursor);
+    if (!prepared) continue;
 
     const node = ctx.createBufferSource();
-    node.buffer = pcm;
+    node.buffer = prepared.buffer;
     node.connect(envelopeInput(ctx, job));
     // 变速：源片区间已经是 `时长 × speed`（`sourceMicrosAt` 里做的），这里只把
     // "要在多短的时间里放完"告进音频图，两者相乘正好等于片段的占位。**原速不碰
     // 这个属性**——`playbackRate` 缺省就是 1，赋一遍在算术上无害，但那会让"没变速
     // 的项目连代码路径都和以前相同"这句话不再成立（同音量为 1 时一个采样点都不碰）。
-    // 代价：声音**跟着变调**（这就是重采样），保音高是另一件事，界面上要说出来
-    if (job.speed) node.playbackRate.value = toNumber(job.speed);
+    //
+    // 保音高那条路**已经把时间轴压好了**（伸缩器输出的就是最终长度），所以那里
+    // `playbackRate` 必须留在 1——两处都乘一遍的表现是速度变成平方，而画面照旧
+    if (job.speed && !job.stretch) node.playbackRate.value = toNumber(job.speed);
     // 采样率不同由音频图重采样，单声道由音频图上混到立体声——都不用我们插手
-    node.start(job.whenSeconds);
-    scheduledBytes += bufferBytes(pcm);
-    residency.retainMixBytes(bufferBytes(pcm));
+    node.start(prepared.whenSeconds);
+    scheduledBytes += bufferBytes(prepared.buffer);
+    residency.retainMixBytes(bufferBytes(prepared.buffer));
   }
 
   const rendered = await withRenderWatchdog(ctx.startRendering(), segment.index);
@@ -554,6 +605,89 @@ async function renderSegment(
  *
  * 取 60 秒不是为了卡性能，是为了把**永远不回来**和"这台机器慢"分开。
  */
+/** 挂到音频图上的那份 PCM，以及它该在什么时候起播。 */
+interface PreparedAudio {
+  readonly buffer: AudioBuffer;
+  readonly whenSeconds: number;
+}
+
+/** 原路径：整段源片原样交给音频图，由 `playbackRate` 去压缩时间（声音跟着变调）。 */
+async function resampledBuffer(
+  job: AudioJob,
+  cursor: ClipAudioCursor,
+): Promise<PreparedAudio | null> {
+  const pcm = await cursor.read(job.srcStartSeconds, job.srcEndSeconds);
+  return pcm ? { buffer: pcm, whenSeconds: job.whenSeconds } : null;
+}
+
+/**
+ * 保音高路径：先把源片按倍率**时间伸缩**，再以 `playbackRate = 1` 放（D40）。
+ *
+ * 三件事和原路径不同，每一件漏掉都不报错：
+ *
+ * 1. **要读多少源片由伸缩器说**（`sourceRangeFor`），不是 `job.srcStart/EndSeconds`。
+ *    后者刚好是"输出 × 倍率"，而伸缩器还要左边一个搜索半径、右边一个窗；按前者读的
+ *    表现是每段末尾那一个窗拿到零，也就是**每段结尾一小段静音**。
+ * 2. **起播时刻要对齐到整数输出样本**（`origin + m0 / rate`），不能用 `job.whenSeconds`。
+ *    理由见 `AudioJob.stretch` 的注释——差不到一个样本，但相邻两段对不上就是一声咔哒。
+ * 3. **源片那份 PCM 用完立刻销账**：它不再挂在音频图上（挂的是拉伸结果），所以
+ *    记账点要跟着"最后一个引用消失"走，同混音里那次少报一整份的教训。
+ */
+async function stretchedBuffer(
+  job: AudioJob,
+  stretch: NonNullable<AudioJob["stretch"]>,
+  cursor: ClipAudioCursor,
+  pool: ClipCursorPool,
+): Promise<PreparedAudio | null> {
+  const rate = cursor.sampleRate;
+  const channelCount = cursor.channelCount;
+  if (rate <= 0 || channelCount <= 0) return null;
+
+  const from = Math.round(stretch.fromSeconds * rate);
+  const to = Math.round(stretch.toSeconds * rate);
+  if (to <= from) return null;
+
+  const stretcher = pool.stretcher(job.clipId, () =>
+    createTimeStretcher({
+      speed: job.speed ?? { num: 1, den: 1 },
+      sampleRate: rate,
+      channelCount,
+      // 相邻两段的**输出**区间重叠 2 × pad，那一截要从回看队列里给。游标那边量的是
+      // 源片秒数（所以乘了速度），这里量的是输出样本，两者不是同一把尺子
+      lookbackSamples: Math.ceil(cursor.lookbackSeconds * rate),
+    }),
+  );
+
+  const need = stretcher.sourceRangeFor(from, to);
+  const pcm = await cursor.read(
+    stretch.sourceOriginSeconds + need.from / rate,
+    stretch.sourceOriginSeconds + need.to / rate,
+  );
+  if (!pcm) return null;
+
+  const pcmBytes = bufferBytes(pcm);
+  residency.retainMixBytes(pcmBytes);
+  let channels: Samples[];
+  try {
+    channels = stretcher.process(from, to, {
+      // `read` 按源片自己的声道数开缓冲，所以这里恒等于 channelCount
+      channels: Array.from({ length: channelCount }, (_, ch) => pcm.getChannelData(ch)),
+      origin: need.from,
+    });
+  } finally {
+    residency.releaseMixBytes(pcmBytes);
+  }
+
+  const buffer = new AudioBuffer({
+    length: to - from,
+    numberOfChannels: channelCount,
+    sampleRate: rate,
+  });
+  for (let ch = 0; ch < channelCount; ch++) buffer.copyToChannel(channels[ch]!, ch);
+
+  return { buffer, whenSeconds: stretch.originSeconds + from / rate };
+}
+
 const RENDER_TIMEOUT_MS = 60_000;
 
 /**

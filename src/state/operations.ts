@@ -1020,6 +1020,35 @@ export function setClipSpeed(timeline: Timeline, clipId: ClipId, speed: Rational
   return ok(replaceClip(timeline, track.id, next));
 }
 
+/**
+ * 开关这个片段的"变速保持音高"（**D40**）。
+ *
+ * **不改片段长度、不动 `speed`**——它换的只是"同样的源片区间用哪种算法铺到同样长的
+ * 输出上"。所以这里不需要碰碰撞检测，也不可能超出源片末尾。
+ *
+ * **允许在原速下开关**：字段是用户表达过的偏好，`clipPreservesPitch()` 会先判速度，
+ * 所以原速下开着它不产生任何效果。反过来"原速不许开"会让"调到 1× 再调回 2×"丢掉勾选。
+ */
+export function setClipPreservePitch(
+  timeline: Timeline,
+  clipId: ClipId,
+  on: boolean,
+): EditResult {
+  const found = findClip(timeline, clipId);
+  if (!found) return reject(timeline, `找不到片段 ${clipId}`);
+  if (found.track.locked) return reject(timeline, "轨道已锁定");
+  const { clip, track } = found;
+  if (clip.kind !== "media") return reject(timeline, "只有素材片段有声音");
+  const source = timeline.sources.find((s) => s.id === clip.sourceId);
+  // 无声素材上这个开关没有意义，而"设了没反应"比拒绝更难查
+  if (!source?.hasAudio) return reject(timeline, "这个素材没有音轨");
+  if ((clip.preservePitch === true) === on) return unchanged(timeline);
+
+  // 关掉要把字段整个删掉，不留 `preservePitch: false`
+  const next = setOptional(clip, "preservePitch", on ? true : undefined);
+  return ok(replaceClip(timeline, track.id, next));
+}
+
 /** 把某个属性的关键帧序列换成新的；空序列会连通道一起删掉。 */
 function withChannel(
   clip: Clip,
