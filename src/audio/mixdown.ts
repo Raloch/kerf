@@ -31,6 +31,7 @@
 import { ALL_FORMATS, AudioSampleSink, BlobSource, Input, type AudioSample } from "mediabunny";
 import type { ClipId, RenderRange, SourceId, Timeline } from "../edl/types";
 import { residency } from "../export/residency";
+import { toNumber } from "../time/rational";
 import { crossfadeCurve } from "./crossfade";
 import { planAudioJobs, type AudioJob } from "./mix-plan";
 import { planMixSegments, type MixSegment } from "./mix-segments";
@@ -200,8 +201,16 @@ export async function createMixer(
   });
 
   // 相邻两段的源片区间重叠 2 × pad，游标要留够这么长的回看；多给半秒余量，
-  // 免得包边界正好卡在临界上
-  const backlogSeconds = (2 * plan.padFrames * timeline.fps.den) / timeline.fps.num + 0.5;
+  // 免得包边界正好卡在临界上。
+  //
+  // **变速要乘进去**（D39）：pad 是**输出**帧数，而回看队列量的是**源片**秒数，
+  // 2× 的片段在同样长的输出重叠里消耗两倍源片。漏乘的表现正是 D22 记过的那个——
+  // 队列不够长时**除第一段外全部静音**，波形打出来是一排 0.000，而且不报错。
+  // 取所有 job 里最大的那个速度而不是 `SPEED_RANGE.max`：后者会让没变速的项目
+  // 也白留 8 倍的回看队列，而这个队列的长度直接是内存。
+  const maxSpeed = jobs.reduce((m, job) => Math.max(m, job.speed ? toNumber(job.speed) : 1), 1);
+  const backlogSeconds =
+    ((2 * plan.padFrames * timeline.fps.den) / timeline.fps.num) * maxSpeed + 0.5;
   const pool = new ClipCursorPool(fileOf, backlogSeconds);
   let at = 0;
 
@@ -497,6 +506,12 @@ async function renderSegment(
     const node = ctx.createBufferSource();
     node.buffer = pcm;
     node.connect(envelopeInput(ctx, job));
+    // 变速：源片区间已经是 `时长 × speed`（`sourceMicrosAt` 里做的），这里只把
+    // "要在多短的时间里放完"告进音频图，两者相乘正好等于片段的占位。**原速不碰
+    // 这个属性**——`playbackRate` 缺省就是 1，赋一遍在算术上无害，但那会让"没变速
+    // 的项目连代码路径都和以前相同"这句话不再成立（同音量为 1 时一个采样点都不碰）。
+    // 代价：声音**跟着变调**（这就是重采样），保音高是另一件事，界面上要说出来
+    if (job.speed) node.playbackRate.value = toNumber(job.speed);
     // 采样率不同由音频图重采样，单声道由音频图上混到立体声——都不用我们插手
     node.start(job.whenSeconds);
     scheduledBytes += bufferBytes(pcm);

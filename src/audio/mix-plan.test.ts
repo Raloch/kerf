@@ -407,3 +407,65 @@ describe("画面转场落在音频轨上", () => {
     expect(jobOf(jobs, "b").baseGain).toBe(1);
   });
 });
+
+describe("变速（D39）", () => {
+  const fast = (speed: { num: number; den: number }, over: Partial<MediaClip> = {}): Timeline =>
+    timeline([{ ...clip("a", 0, 60), ...over, speed }]);
+
+  it("原速**不带 speed 字段**——接线那边据此完全不碰 playbackRate", () => {
+    const job = jobOf(planAudioJobs(timeline([clip("a", 0, 60)]), FULL), "a");
+    expect("speed" in job).toBe(false);
+  });
+
+  it("**归一化的 1× 也不带**（{num:2,den:2} 是原速）", () => {
+    expect("speed" in jobOf(planAudioJobs(fast({ num: 2, den: 2 }), FULL), "a")).toBe(false);
+  });
+
+  it("变速带上倍率，原样传下去不提前转成 float", () => {
+    expect(jobOf(planAudioJobs(fast({ num: 3, den: 2 }), FULL), "a").speed).toEqual({
+      num: 3,
+      den: 2,
+    });
+  });
+
+  it("**源片区间跟着变长，起播时刻不动**", () => {
+    // 起播在导出坐标系（不受速度影响），源片区间在源片坐标系（× speed）。
+    // 混淆的表现是"声音提前/延后整段开始"或"放完了还在放"
+    const normal = jobOf(planAudioJobs(timeline([clip("a", 0, 60)]), FULL), "a");
+    const doubled = jobOf(planAudioJobs(fast({ num: 2, den: 1 }), FULL), "a");
+    expect(doubled.whenSeconds).toBe(normal.whenSeconds);
+    const normalSpan = normal.srcEndSeconds - normal.srcStartSeconds;
+    const fastSpan = doubled.srcEndSeconds - doubled.srcStartSeconds;
+    expect(fastSpan / normalSpan).toBeCloseTo(2, 6);
+  });
+
+  it("**源片区间长度 ÷ 速度 == 片段在时间轴上的占位**", () => {
+    // 这条是那个不变量本身：两者相乘不等的话，声音会比画面长或短，而各自看都"对"
+    for (const speed of [{ num: 2, den: 1 }, { num: 1, den: 2 }, { num: 3, den: 2 }]) {
+      const job = jobOf(planAudioJobs(fast(speed), FULL), "a");
+      const outSeconds = (job.srcEndSeconds - job.srcStartSeconds) / (speed.num / speed.den);
+      // 片段占 60 帧 @29.97
+      expect(outSeconds).toBeCloseTo((60 * FPS.ndf2997.den) / FPS.ndf2997.num, 5);
+    }
+  });
+
+  it("裁过入点的变速片段：入点不乘速度", () => {
+    // sourceIn 是源片自己栅格里的帧号；乘进去的表现是"一变速就跳到别处"，
+    // 而入点为 0 的片段完全正常
+    const job = jobOf(planAudioJobs(fast({ num: 2, den: 1 }, { sourceIn: 30 }), FULL), "a");
+    const at30 = (30 * FPS.ndf2997.den) / FPS.ndf2997.num;
+    expect(job.srcStartSeconds).toBeCloseTo(at30, 5);
+  });
+
+  it("变速不影响淡化包络的时间（包络在输出坐标系）", () => {
+    const tl = timeline([
+      clip("a", 0, 100),
+      { ...clip("b", 100, 200), speed: { num: 2, den: 1 }, transitionIn: { kind: "xfade-power", frames: 20 } },
+    ]);
+    const job = jobOf(planAudioJobs(tl, FULL), "b");
+    expect(job.ramps).toHaveLength(1);
+    // 窗口 [90,110) → 起播于第 90 帧，包络也从那里开始，与速度无关
+    expect(job.ramps[0]?.startSeconds).toBeCloseTo((90 * FPS.ndf2997.den) / FPS.ndf2997.num, 6);
+    expect(job.ramps[0]?.durationSeconds).toBeCloseTo((20 * FPS.ndf2997.den) / FPS.ndf2997.num, 6);
+  });
+});

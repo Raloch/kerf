@@ -34,7 +34,9 @@ import { resolveVolume, type KeyframeChannels } from "../anim/keyframes";
 import { clipRenderSpan, trackTransitionWindows } from "../edl/transition";
 import { microsToSeconds, sourceMicrosAt } from "../edl/sampling";
 import {
+  clipSpeed,
   isAudioTransition,
+  isNormalSpeed,
   sourceGridFps,
   type ClipId,
   type RenderRange,
@@ -42,6 +44,7 @@ import {
   type Timeline,
 } from "../edl/types";
 import { frameToMicros } from "../time/timebase";
+import type { Rational } from "../time/rational";
 
 /**
  * 帧数 → 秒，**不经过微秒**。
@@ -112,6 +115,24 @@ export interface AudioJob {
    * **音量被打了关键帧时这个字段仍然是静态值**，实际生效的是下面的 `gainCurve`。
    */
   readonly volume: number;
+  /**
+   * 播放速率（变速，D39）。**原速时这个字段不存在**，于是接线那边连
+   * `playbackRate` 都不碰——同"恒等增益不穿 `GainNode`"，为的是没变速的项目
+   * 逐样本与加变速之前完全相同。
+   *
+   * **它不需要改动 `srcStartSeconds` / `srcEndSeconds` 的算法**：那两个已经走
+   * `sourceMicrosAt`，速度进了那个函数，源片区间自动变成 `时长 × speed`。所以这里
+   * 只是把"同样长的一段源片要在多短的时间里放完"告诉音频图，两者相乘恰好等于
+   * 片段在时间轴上的占位。漏了这个字段的表现是**声音变慢/变快到和画面对不上**，
+   * 而且不报错——区间是对的，只是放的速度不对。
+   *
+   * `ramps` / `gainCurve` **在导出坐标系里，不受它影响**：`playbackRate` 只改
+   * "buffer 里的哪一点对应输出的哪一刻"，包络挂在 `GainNode` 上，仍按输出时间走。
+   *
+   * 是 `Rational` 而不是 `number`，理由同 `MediaClip.speed`：精确值留到最后一步
+   * （`playbackRate.value` 才是 float），中间不引入第二次量化。
+   */
+  readonly speed?: Rational;
   /**
    * 淡化 × 音量的**合成曲线**，只在音量有关键帧时才有。有它的时候
    * `baseGain` / `ramps` 都不再喂给 `AudioParam`——那三样加起来就是这一条。
@@ -315,6 +336,8 @@ export function planAudioJobs(timeline: Timeline, range: RenderRange): AudioJob[
         baseGain,
         ramps,
         volume: clip.volume ?? 1,
+        // 原速不带这个字段，接线那边就不碰 `playbackRate`（见 `AudioJob.speed`）
+        ...(isNormalSpeed(clip) ? {} : { speed: clipSpeed(clip) }),
         ...(sampleGainCurve(clip, seconds, range.inFrame, baseGain, spans, firstFrame, lastFrame) ??
           {}),
       });

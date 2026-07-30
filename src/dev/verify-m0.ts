@@ -27,7 +27,7 @@ import {
   type Clip,
   type Timeline,
 } from "../edl/types";
-import { addSource } from "../state/operations";
+import { addSource, setClipSpeed } from "../state/operations";
 import { EMPTY_TIMELINE } from "../state/timeline-store";
 import { crossfadeGain } from "../audio/crossfade";
 import { createMixer, MIX_CHANNELS, MIX_SAMPLE_RATE } from "../audio/mixdown";
@@ -287,6 +287,9 @@ export async function verifyM0(options: VerifyOptions = {}): Promise<VerifyResul
   // ---- 7. 纯音频素材（配乐）----
   checks.push(...(await verifyAudioOnlySource()));
 
+  // ---- 8. 变速（D39）----
+  checks.push(...(await verifySpeed()));
+
   return {
     checks,
     passed: checks.every((c) => c.pass),
@@ -294,6 +297,208 @@ export async function verifyM0(options: VerifyOptions = {}): Promise<VerifyResul
     exportedBytes: exported.bytesWritten,
     realtimeFactor,
   };
+}
+
+// ---------------------------------------------------------------------------
+// 变速（D39）
+// ---------------------------------------------------------------------------
+
+const SPEED_OUT = "kerf-verify-speed.mp4";
+/** 配乐素材长度（秒）。`beeps` 每秒一声，所以"间隔"这个判据的分辨率就是 1 秒。 */
+const SPEED_SOURCE_SECONDS = 5;
+/** 2× 那段放在第几帧。刻意不是 0——放在 0 时"整体平移"和"没平移"给出同一个位置。 */
+const SPEED_FAST_START = 30;
+/** 1× 对照段放在第几帧，与上面那段错开不重叠。 */
+const SPEED_NORMAL_START = 200;
+const SPEED_TOTAL_FRAMES = 380;
+/**
+ * 相邻两声的间隔容差。
+ *
+ * 判的是**间隔**而不是绝对位置，所以起始沿的检测偏差（阈值 0.05 对幅度 0.25，
+ * 正弦起振要走几个样本）在两个操作数上同向出现、相减约掉，容差可以收得很紧。
+ * 它要抓的是"漏设 `playbackRate`"——那时间隔是 1000ms 而不是 500ms，差 500ms。
+ *
+ * **第一个间隔要丢掉，那是量法的偏差不是产品的。** 实测第一声比后面那串隐含的
+ * 栅格晚 **20ms**（1× 组间隔 980/1000/1000），而 2× 组是 **10ms**（490/500/500）
+ * ——**恰好一半**。这个 2 倍关系说明偏差长在**源片时间**里（第一声的起振被 AAC
+ * 的变换窗抹掉一点，而它正好贴着片段的入点），被 `playbackRate` 一起压缩了。
+ * 也就是说它是被测对象之外那一半，同「先量一遍被测对象之外的那一半」。
+ * 把容差放宽到 25ms 也能全绿，但那是把已知偏差藏起来；丢掉那一个间隔是把它剥出去。
+ */
+const SPEED_INTERVAL_TOLERANCE = 0.015;
+/** 找下一声时要跳过的距离：必须 > 提示音本身的 80ms，且 < 2× 下的 500ms 间隔。 */
+const SPEED_ONSET_SKIP = 0.25;
+
+/** `from`–`to` 之间每一声的起点（秒）。 */
+function onsetsBetween(
+  audio: { readonly pcm: Float32Array; readonly rate: number },
+  from: number,
+  to: number,
+): number[] {
+  const out: number[] = [];
+  let at = from;
+  for (;;) {
+    const onset = firstOnsetAfter(audio, at);
+    if (onset === null || onset >= to) break;
+    out.push(onset);
+    at = onset + SPEED_ONSET_SKIP;
+  }
+  return out;
+}
+
+/**
+ * 变速在音频上的端到端护栏。
+ *
+ * **判据是相邻两声的间隔**：素材每秒一声，2× 播出来就该每半秒一声。这个判据同时
+ * 钉住两件独立的事——源片区间要按速度撑开（`sourceMicrosAt`），以及那段 PCM 要按
+ * 速度放（`AudioJob.speed` → `playbackRate`）。漏掉后者时**区间是对的、声音全在、
+ * 泄漏为 0、不抛错**，只是间隔仍然是 1 秒而画面已经快了一倍：一个只能靠听发现的错。
+ *
+ * 同一次导出里放一个 **1× 对照段**（同一个源文件、同一条管线），于是"间隔变了"
+ * 不可能是素材或量法造成的。同那条"先量一遍被测对象之外的那一半"。
+ *
+ * 画面素材刻意不带音轨，理由同配乐那一组：成片里每一点声音都只能来自这个配乐。
+ * 用 `beeps` 而不是 `tone`——连续音上"放快了"完全测不出来。
+ */
+async function verifySpeed(): Promise<Check[]> {
+  const checks: Check[] = [];
+
+  const videoSample = await makeSampleVideo({
+    durationFrames: SPEED_TOTAL_FRAMES,
+    withAudio: false,
+  });
+  const musicSample = await makeSampleAudio({ seconds: SPEED_SOURCE_SECONDS, shape: "beeps" });
+  const video = (await probeAvFile(videoSample.file)).source;
+  const music = (await probeFile(musicSample.file)).source;
+
+  // 走真正的编辑入口：`addSource` 放片段、`setClipSpeed` 变速。手搓时间轴的话
+  // "变速之后片段该多长"就变成我自己写进去的答案，而那正是要测的东西之一
+  const withVideo = addSource(EMPTY_TIMELINE, { source: video, timelineIn: 0 });
+  const placed = addSource(withVideo.timeline, { source: music, timelineIn: SPEED_FAST_START });
+  if (!placed.changed) throw new Error(`变速自检放不下片段：${placed.reason ?? "未知原因"}`);
+  const fastId = `${music.id}-a`;
+  const originalFrames = sourceDurationFrames(music, placed.timeline.fps);
+
+  const sped = setClipSpeed(placed.timeline, fastId, { num: 2, den: 1 });
+  if (!sped.changed) throw new Error(`变速自检设不上速度：${sped.reason ?? "未知原因"}`);
+  const fastClip = sped.timeline.tracks
+    .flatMap((t) => t.clips)
+    .find((c) => c.id === fastId);
+  const fastFrames = fastClip ? fastClip.timelineOut - fastClip.timelineIn : 0;
+  checks.push(
+    check(
+      "变速：2× 之后片段占位减半（保内容、改长度）",
+      `${Math.round(originalFrames / 2)} 帧`,
+      `${fastFrames} 帧（原 ${originalFrames}）`,
+      fastFrames === Math.round(originalFrames / 2),
+    ),
+  );
+
+  // 1× 对照段手搓：`addSource` 不会把同一个素材放第二遍（那会被"已经在项目里了"拒掉）
+  const control: Clip = {
+    id: "speed-control",
+    kind: "media",
+    sourceId: music.id,
+    name: "对照（原速）",
+    timelineIn: SPEED_NORMAL_START,
+    timelineOut: SPEED_NORMAL_START + originalFrames,
+    sourceIn: 0,
+  };
+  const timeline: Timeline = {
+    ...sped.timeline,
+    durationFrames: SPEED_TOTAL_FRAMES,
+    tracks: sped.timeline.tracks.map((t) =>
+      t.id === "A1" ? { ...t, clips: [...t.clips, control] } : t,
+    ),
+  };
+
+  await removeExportFile(SPEED_OUT);
+  const run = startExport(
+    {
+      timeline,
+      range: { inFrame: 0, outFrame: SPEED_TOTAL_FRAMES },
+      container: "mp4",
+      videoBitrate: 4e6,
+      audioBitrate: 128e3,
+      includeAudio: true,
+      target: { kind: "opfs", name: SPEED_OUT },
+      autoDownload: false,
+    },
+    () => undefined,
+  );
+  const done = await run.done;
+  if (!done) throw new Error("变速自检的导出被取消");
+
+  const r = done.residency;
+  const leaked = r.leakedSamples + r.leakedCursors + r.leakedInputs;
+  checks.push(
+    check(
+      "变速：导出泄漏为 0",
+      "leaked 0",
+      `帧 ${r.leakedSamples} · 游标 ${r.leakedCursors} · Input ${r.leakedInputs}`,
+      leaked === 0,
+    ),
+  );
+
+  const file = await readExportFile(SPEED_OUT);
+  const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(file) });
+  try {
+    const track = await input.getPrimaryAudioTrack();
+    if (!track) {
+      checks.push(check("变速：成片里有音轨", true, false));
+      return checks;
+    }
+    const at = (frames: number) => frameToSeconds(frames, timeline.fps);
+    const audio = await decodeTrackToPcm(track, at(SPEED_TOTAL_FRAMES) + 1);
+
+    const fastFrom = at(SPEED_FAST_START);
+    const fastTo = at(SPEED_FAST_START + fastFrames);
+    const normalFrom = at(SPEED_NORMAL_START);
+    const normalTo = at(SPEED_NORMAL_START + originalFrames);
+
+    /** 一组起始沿的相邻间隔，用来对比"每几秒一声"。 */
+    const intervalCheck = (name: string, expected: number, from: number, to: number): void => {
+      const onsets = onsetsBetween(audio, from, to);
+      const gaps = onsets.slice(1).map((t, i) => t - onsets[i]!);
+      // 丢掉第一个间隔（见 `SPEED_INTERVAL_TOLERANCE`），但**照样印出来**：
+      // 藏起来的话下次它变成 40ms 也没人知道
+      const judged = gaps.slice(1);
+      const worst = judged.reduce((m, g) => Math.max(m, Math.abs(g - expected)), 0);
+      checks.push(
+        check(
+          name,
+          `每 ${(expected * 1000).toFixed(0)}ms 一声（|Δ| < ${SPEED_INTERVAL_TOLERANCE * 1000}ms）`,
+          // 每一声的位置都印出来：只印最大偏差时"少了一声"和"间隔不对"长得一样
+          `${onsets.length} 声 @ ${onsets.map((t) => (t * 1000).toFixed(0)).join("/")}ms` +
+            ` · 间隔 ${gaps.map((g) => (g * 1000).toFixed(0)).join("/")}ms` +
+            `（首个不计）· 最大偏差 ${(worst * 1000).toFixed(1)}ms`,
+          judged.length >= 2 && worst < SPEED_INTERVAL_TOLERANCE,
+        ),
+      );
+    };
+
+    // 核心判据。漏设 `playbackRate` 时这里量到的是 1000ms
+    intervalCheck("变速：2× 段里每半秒一声（源片每秒一声）", 0.5, fastFrom, fastTo);
+    // 对照组：同一个源文件、同一条管线，只有速度不同
+    intervalCheck("变速：同一次导出里的 1× 对照段仍是每秒一声", 1, normalFrom, normalTo);
+
+    // 漏设 `playbackRate` 时那段 PCM 会放满 4 秒，于是拖到片段占位之外——
+    // 只判间隔的话这一条抓不到"区间对了但速度没设"以外的另一半
+    const tailPeak = peakBetween(audio, fastTo + 0.1, normalFrom - 0.1);
+    checks.push(
+      check(
+        "变速：2× 段结束之后是静音（没有拖长）",
+        "峰值 < 0.02",
+        tailPeak.toFixed(4),
+        tailPeak < 0.02,
+      ),
+    );
+  } finally {
+    input.dispose();
+  }
+  await removeExportFile(SPEED_OUT);
+
+  return checks;
 }
 
 // ---------------------------------------------------------------------------
