@@ -56,6 +56,8 @@ import {
   pasteClips,
   setClipPreservePitch,
   setClipSpeed,
+  setTrackFlag,
+  trackFlagLabel,
   setClipVolume,
   setTransition,
   setClipTransform,
@@ -72,6 +74,7 @@ import {
   type EditResult,
   type MoveOptions,
   type TextStylePatch,
+  type TrackFlag,
   type TransformPatch,
   type ClipboardEntry,
   type TrimEdge,
@@ -194,6 +197,11 @@ export interface TimelineState {
   setClipSpeed: (clipId: ClipId, speed: Rational) => void;
   /** 开关变速保持音高。不改长度、不动速度，见 `setClipPreservePitch`。 */
   setClipPreservePitch: (clipId: ClipId, on: boolean) => void;
+  /**
+   * 开关轨道的锁定 / 静音 / 隐藏。**进撤销栈**——这三个字段在 `Timeline` 里，
+   * 而静音和隐藏会改变成片，理由见 `setTrackFlag`。
+   */
+  setTrackFlag: (trackId: TrackId, flag: TrackFlag, on: boolean) => void;
   /** 把选中的（可能多个）片段放进剪贴板。**不进撤销栈**——它什么都没改。 */
   copySelected: () => void;
   /** 把剪贴板那一组粘到播放头，各自落回原轨。放不下就整组拒绝。 */
@@ -513,6 +521,10 @@ export const useTimeline = create<TimelineState>((set, get) => {
     setClipPreservePitch(clipId, on) {
       // 不给合并键：这是一次点击，不是连续拖拽
       apply(setClipPreservePitch(get().timeline(), clipId, on), on ? "保持音高" : "允许变调");
+    },
+
+    setTrackFlag(trackId, flag, on) {
+      apply(setTrackFlag(get().timeline(), trackId, flag, on), trackFlagLabel(flag, on));
     },
 
     copySelected() {

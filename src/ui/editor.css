@@ -993,6 +993,29 @@
     rgba(255, 255, 255, 0.028) calc(var(--pxf) * 30)
   );
 }
+/* 静音 / 隐藏的轨道：片段淡下去。
+   开关不能只体现在轨道头那个图标上——用户看的是片段，而"这条轨不进成片"是一件
+   会让人反复怀疑自己的事（导出少了一层画面，而界面上一切正常）。用 opacity 作用在
+   片段上而不是整条 lane：网格线和播放头要保持原样，否则整条轨看起来像被禁用了。 */
+.ed .trk.off .clip {
+  opacity: 0.34;
+}
+/* 锁定的轨道：斜纹。用伪元素叠在 lane 上，不动 .lane 自己的网格背景
+   （两者写在一个 background 里就要每次改动都重排那一串渐变）。 */
+.ed .trk.lk .lane::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 4;
+  background: repeating-linear-gradient(
+    -45deg,
+    transparent 0,
+    transparent 5px,
+    rgba(255, 255, 255, 0.045) 5px,
+    rgba(255, 255, 255, 0.045) 7px
+  );
+}
 .ed .trk.h-video .lane, .ed .trk.h-video .th {
   height: 54px;
 }
@@ -1248,6 +1271,61 @@
   right: 0;
   pointer-events: none;
 }
+/* ---------- 右键菜单 ---------- */
+/* `position: fixed` 是刻意的：菜单要能盖出时间轴的滚动容器，放在 .lane 里会被剪掉。
+   z-index 取得比对话框低、比时间轴里的一切高——它不该盖住导出对话框。 */
+.ed .ctxm {
+  position: fixed;
+  z-index: 60;
+  /* **必须是 max-content，不能让它 shrink-to-fit。** fixed 元素不给宽度时按可用空间收缩，
+     于是贴着视口右边打开时它被挤到 min-width，而夹紧那一步量到的就是这个被挤过的宽度
+     ——挪回视口内之后它又长回自然宽度，结果右边缘正好压线（实测差 6px）。
+     `max-content` 让"量出来的尺寸"与"它现在在哪"无关，那才是夹紧能算对的前提。 */
+  width: max-content;
+  min-width: 168px;
+  padding: 4px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+  font-size: 12px;
+}
+.ed .ctxm-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--line-2);
+}
+.ed .ctxm-row button {
+  width: 100%;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--tx);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.ed .ctxm-row button:hover:not(:disabled) {
+  background: var(--panel-3);
+}
+.ed .ctxm-row button:disabled {
+  color: var(--tx-faint);
+  cursor: default;
+}
+.ed .ctxm-row .l {
+  flex: 1 1 auto;
+}
+/* 灰掉的原因写在行内，不只靠 title：hover 才看得见的解释等于没解释 */
+.ed .ctxm-row .w {
+  flex: none;
+  font-size: 10.5px;
+  color: var(--tx-faint);
+}
+
 /* ---------- 底部状态栏 ---------- */
 .ed-foot {
   flex: none;

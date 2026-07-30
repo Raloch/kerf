@@ -8,7 +8,7 @@
  * 本步只做渲染 + 点选 + 播放头，拖拽/裁切留在 M1 子步骤 3（复用 operations.ts）。
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import {
   clipDuration,
   clipSourceFrames,
@@ -21,12 +21,13 @@ import {
   type TrackId,
 } from "../edl/types";
 import { trackTransitionWindows } from "../edl/transition";
-import { TRANSITION_LABELS } from "../state/operations";
+import { findClip, TRANSITION_LABELS } from "../state/operations";
 import { framesToTimecode, secondsToFrameCount } from "../time/timebase";
 import { toNumber } from "../time/rational";
 import { useTimeline } from "../state/timeline-store";
 import { ghostsForTrack, useClipDrag, type ClipDragApi, type Ghost } from "./use-clip-drag";
 import { useMarquee } from "./use-marquee";
+import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { buildStrip, cachedStrip, drawStrip } from "../media/thumbnails";
 import { decodeImage, decodedImage } from "../compose/image-store";
 import {
@@ -44,7 +45,7 @@ import {
   type Keyframe,
 } from "../anim/keyframes";
 import { PROPERTY_LABELS, PROPERTY_RANGES } from "../state/operations";
-import { IconCut, IconEye, IconFilm, IconImage, IconLock, IconMagnet, IconMute, IconPlus, IconText, IconTrash, IconVolume, IconWave } from "./icons";
+import { IconCut, IconEye, IconEyeOff, IconFilm, IconImage, IconLock, IconMagnet, IconMute, IconPlus, IconText, IconTrash, IconUnlock, IconVolume, IconWave } from "./icons";
 
 /** 片段内缩略图条高度，与 .strip 的 CSS 保持一致。 */
 const STRIP_HEIGHT = 32;
@@ -87,11 +88,34 @@ export function TimelinePanel() {
   const zoom = useTimeline((s) => s.zoom);
   const setZoom = useTimeline((s) => s.setZoom);
   const addTextClip = useTimeline((s) => s.addTextClip);
+  const copySelected = useTimeline((s) => s.copySelected);
+  const duplicateSelected = useTimeline((s) => s.duplicateSelected);
+  const paste = useTimeline((s) => s.paste);
+  // 只订阅长度而不是整个剪贴板：内容变了但个数没变时不该让整条时间轴重渲染
+  const clipboardCount = useTimeline((s) => s.clipboard.length);
 
   const pxPerFrame = zoom / 100;
   const ticksRef = useRef<HTMLDivElement>(null);
   const drag = useClipDrag(pxPerFrame);
   const marquee = useMarquee(pxPerFrame);
+
+  /**
+   * 右键菜单的落点。**开在 TimelinePanel 这一层而不是片段里**：菜单是 fixed 定位的，
+   * 放进 `.lane` 会被它的 `overflow` 和层叠上下文剪掉，而那种 bug 只在滚动之后才看得见。
+   */
+  const [menuAt, setMenuAt] = useState<{ x: number; y: number } | null>(null);
+  const closeMenu = useCallback(() => setMenuAt(null), []);
+  const onClipContextMenu = useCallback(
+    (event: ReactMouseEvent<HTMLElement>, clip: Clip) => {
+      event.preventDefault();
+      // **右键的那个片段不在选中里就先选中它**：不然菜单作用的是别处那一组，
+      // 而用户指着的是这一个（同真实 NLE）。已经在选中里则保住整组
+      const state = useTimeline.getState();
+      if (!state.selectedClipIds.includes(clip.id)) state.select(clip.id);
+      setMenuAt({ x: event.clientX, y: event.clientY });
+    },
+    [],
+  );
 
   /**
    * 代理就绪的 URL 表。
@@ -137,6 +161,49 @@ export function TimelinePanel() {
     },
     [scrubTo],
   );
+
+  /**
+   * 菜单项。**只灰掉"确定做不到"的那些并写出原因**（同 D3：纯置灰不解释是黑箱）。
+   *
+   * 删除刻意**不灰**：多选可以横跨锁定和未锁定的轨道，那时它是"部分做得到"，
+   * 而灰掉等于把能做的那部分也一起挡了——该由 `removeClips` 做完再报没做成的那些（D42）。
+   */
+  const menuItems = useMemo((): MenuItem[] => {
+    const n = selectedClipIds.length;
+    const many = n > 1 ? ` ${n} 个片段` : "";
+    const splittable = selectedClipIds.some((id) => {
+      const found = findClip(timeline, id);
+      return found ? playhead > found.clip.timelineIn && playhead < found.clip.timelineOut : false;
+    });
+    return [
+      { label: `复制${many} ⌘C`, onSelect: copySelected },
+      { label: `做副本${many} ⌘D`, onSelect: duplicateSelected },
+      {
+        // 落点写在标签里：菜单是在指针处打开的，不说清楚的话用户会以为粘在这儿
+        label: "粘贴到播放头 ⌘V",
+        ...(clipboardCount === 0 ? { disabledReason: "剪贴板是空的" } : {}),
+        onSelect: paste,
+      },
+      {
+        label: "在播放头切分 ⌘K",
+        separatorBefore: true,
+        ...(splittable ? {} : { disabledReason: "播放头不在片段内" }),
+        onSelect: () => splitAtPlayhead(),
+      },
+      { label: `删除${many} ⌫`, separatorBefore: true, onSelect: () => removeSelected(false) },
+      { label: `波纹删除${many} ⇧⌫`, onSelect: () => removeSelected(true) },
+    ];
+  }, [
+    clipboardCount,
+    copySelected,
+    duplicateSelected,
+    paste,
+    playhead,
+    removeSelected,
+    selectedClipIds,
+    splitAtPlayhead,
+    timeline,
+  ]);
 
   return (
     <div className="tl" style={{ ["--pxf" as string]: String(pxPerFrame) }}>
@@ -252,6 +319,7 @@ export function TimelinePanel() {
                 onSelect={select}
                 drag={drag}
                 onLanePointerDown={marquee.onLanePointerDown}
+                onClipContextMenu={onClipContextMenu}
                 proxyUrls={proxyUrls}
               />
             ))}
@@ -278,6 +346,9 @@ export function TimelinePanel() {
           </div>
         </div>
       </div>
+      {menuAt && (
+        <ContextMenu x={menuAt.x} y={menuAt.y} items={menuItems} onClose={closeMenu} />
+      )}
     </div>
   );
 }
@@ -333,6 +404,7 @@ function TrackRow({
   onSelect,
   drag,
   onLanePointerDown,
+  onClipContextMenu,
   proxyUrls,
 }: {
   track: Track;
@@ -342,9 +414,13 @@ function TrackRow({
   onSelect: (id: string) => void;
   drag: ClipDragApi;
   onLanePointerDown: (event: ReactPointerEvent<HTMLElement>) => void;
+  onClipContextMenu: (event: ReactMouseEvent<HTMLElement>, clip: Clip) => void;
   proxyUrls: Record<string, string>;
 }) {
   const isAudio = track.kind === "audio";
+  // 从 store 直接取而不是穿 props：zustand 的 action 是稳定引用，穿一层只会让
+  // TrackRow 的签名变长（同 `useClipDrag` 内部那几个）
+  const setTrackFlag = useTimeline((s) => s.setTrackFlag);
   const ghosts = ghostsForTrack(drag.ghosts, track.id);
   // 关键帧轨只给**这条轨上被选中的那个片段**展开，而且**只在恰好选中一个时**：全都展开
   // 的话一条有动画的字幕轨能顶出十几行；多选时展开谁的更是没有答案（两个片段可以在
@@ -356,7 +432,14 @@ function TrackRow({
 
   return (
     <>
-    <div className={`trk h-${track.kind}`}>
+    {/* 开关的状态必须**在轨道上**看得见，不能只体现在轨道头那个图标上：用户看的是片段，
+        而"这条轨不进成片"是一件会让人反复怀疑自己的事（成片少一层画面，界面上一切正常）。
+        `off` 淡化片段、`lk` 给 lane 铺斜纹，见 editor.css */}
+    <div
+      className={`trk h-${track.kind}${track.locked ? " lk" : ""}${
+        (isAudio ? track.muted : track.hidden) ? " off" : ""
+      }`}
+    >
       <div className="th">
         <div className="lb">
           <div className="k">{track.id}</div>
@@ -379,23 +462,50 @@ function TrackRow({
             <Diamond />
           </button>
         )}
+        {/* 静音 / 隐藏。**开关的文案要说"按下去会发生什么"而不是这个开关叫什么**：
+            标题写死「静音」的话，已经静音的轨道上它读起来像"这里是静音的"，
+            而用户按它其实是取消静音 */}
         <button
           type="button"
           className="ib sm"
           aria-pressed={isAudio ? Boolean(track.muted) : Boolean(track.hidden)}
-          title={isAudio ? "静音" : "隐藏"}
-          disabled
+          title={
+            isAudio
+              ? track.muted
+                ? "取消静音（这条轨的声音不进成片）"
+                : "静音这条轨"
+              : track.hidden
+                ? "取消隐藏（这条轨的画面不进成片）"
+                : "隐藏这条轨"
+          }
+          onClick={() =>
+            setTrackFlag(
+              track.id,
+              isAudio ? "muted" : "hidden",
+              !(isAudio ? track.muted : track.hidden),
+            )
+          }
         >
-          {isAudio ? track.muted ? <IconMute /> : <IconVolume /> : <IconEye />}
+          {isAudio ? (
+            track.muted ? (
+              <IconMute />
+            ) : (
+              <IconVolume />
+            )
+          ) : track.hidden ? (
+            <IconEyeOff />
+          ) : (
+            <IconEye />
+          )}
         </button>
         <button
           type="button"
           className="ib sm"
           aria-pressed={Boolean(track.locked)}
-          title="锁定"
-          disabled
+          title={track.locked ? "解锁这条轨" : "锁定这条轨（编辑会被拒绝）"}
+          onClick={() => setTrackFlag(track.id, "locked", !track.locked)}
         >
-          <IconLock />
+          {track.locked ? <IconLock /> : <IconUnlock />}
         </button>
       </div>
       {/* data-track-id 供拖拽时做几何命中测试，判断落在哪条轨道 */}
@@ -411,6 +521,7 @@ function TrackRow({
             trackId={track.id}
             pxPerFrame={pxPerFrame}
             selected={selectedClipIds.includes(clip.id)}
+            onContextMenu={onClipContextMenu}
             onSelect={onSelect}
             drag={drag}
             proxyUrl={clip.kind === "media" ? proxyUrls[clip.sourceId] : undefined}
@@ -641,6 +752,7 @@ function ClipView({
   pxPerFrame,
   selected,
   onSelect,
+  onContextMenu,
   drag,
   proxyUrl,
 }: {
@@ -651,6 +763,7 @@ function ClipView({
   pxPerFrame: number;
   selected: boolean;
   onSelect: (id: string) => void;
+  onContextMenu: (event: ReactMouseEvent<HTMLElement>, clip: Clip) => void;
   drag: ClipDragApi;
   proxyUrl: string | undefined;
 }) {
@@ -856,6 +969,7 @@ function ClipView({
             : "var(--c-audio-hi)",
       }}
       onPointerDown={(e) => drag.onClipPointerDown(e, clip, trackId)}
+      onContextMenu={(e) => onContextMenu(e, clip)}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();

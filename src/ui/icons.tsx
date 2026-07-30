@@ -64,6 +64,14 @@ export const IconEye = () => (
   </svg>
 );
 
+/** 隐藏状态的眼睛。和 `IconMute` 一个路子：在原图形上划一道，别只靠颜色说状态。 */
+export const IconEyeOff = () => (
+  <svg viewBox="0 0 16 16" aria-hidden="true" {...stroke} strokeWidth={1.3}>
+    <path d="M1.5 8S4 4 8 4s6.5 4 6.5 4-2.5 4-6.5 4S1.5 8 1.5 8z" />
+    <path d="M2.6 13.4L13.4 2.6" />
+  </svg>
+);
+
 export const IconVolume = () => (
   <svg viewBox="0 0 16 16" aria-hidden="true" {...stroke} strokeWidth={1.3}>
     <path d="M8 3L4.8 5.8H2.5v4.4h2.3L8 13z" />
@@ -82,6 +90,14 @@ export const IconLock = () => (
   <svg viewBox="0 0 16 16" aria-hidden="true" {...stroke} strokeWidth={1.3}>
     <rect x="3.5" y="7" width="9" height="6.5" rx="1.2" />
     <path d="M5.6 7V5.2a2.4 2.4 0 014.8 0V7" />
+  </svg>
+);
+
+/** 没锁的锁：搭扣是开的。锁上/没锁只靠颜色区分的话，一眼扫过去分不出来。 */
+export const IconUnlock = () => (
+  <svg viewBox="0 0 16 16" aria-hidden="true" {...stroke} strokeWidth={1.3}>
+    <rect x="3.5" y="7" width="9" height="6.5" rx="1.2" />
+    <path d="M5.6 7V5.2a2.4 2.4 0 014.8-.6" />
   </svg>
 );
 

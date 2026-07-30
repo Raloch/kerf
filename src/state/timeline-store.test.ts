@@ -747,3 +747,46 @@ describe("多选", () => {
     expect(s().selectedClipIds).toEqual(["src1-a"]);
   });
 });
+
+describe("轨道开关", () => {
+  beforeEach(reset);
+
+  it("**进撤销栈**——这三个字段在 Timeline 里，历史存的是整份快照", () => {
+    // 不进撤销栈是做不到的：绕过 apply 直接改的话，之后任何一次撤销都会把这个开关
+    // 连带回滚，表现是"我明明静音了，撤销一下别的操作它又响了"
+    const s = () => useTimeline.getState();
+    s().addSource(source(300));
+    s().setTrackFlag("A1", "muted", true);
+    expect(s().timeline().tracks.find((t) => t.id === "A1")!.muted).toBe(true);
+    expect(s().undoLabel()).toBe("静音");
+    s().undo();
+    expect(s().timeline().tracks.find((t) => t.id === "A1")!.muted).toBeUndefined();
+  });
+
+  it("解锁标签是「取消锁定」，不是「锁定」", () => {
+    const s = () => useTimeline.getState();
+    s().addSource(source(300));
+    s().setTrackFlag("V1", "locked", true);
+    s().setTrackFlag("V1", "locked", false);
+    expect(s().undoLabel()).toBe("取消锁定");
+  });
+
+  it("装错了走 lastRejection，不静默存一个不生效的字段", () => {
+    const s = () => useTimeline.getState();
+    s().addSource(source(300));
+    s().setTrackFlag("V1", "muted", true);
+    expect(s().lastRejection).toMatch(/只有音频轨/);
+    expect(s().timeline().tracks.find((t) => t.id === "V1")!.muted).toBeUndefined();
+  });
+
+  it("**锁定之后编辑真的被拒**，而这条路径此前在产品里不可达", () => {
+    // 界面上原来没有锁定开关，所以 removeClips 那条"部分成功"分支只有单测走到过
+    const s = () => useTimeline.getState();
+    s().addSource(source(300));
+    s().setTrackFlag("V1", "locked", true);
+    s().select("src1-v");
+    s().removeSelected();
+    expect(findClip(s().timeline(), "src1-v")).toBeDefined();
+    expect(s().lastRejection).toMatch(/锁定/);
+  });
+});

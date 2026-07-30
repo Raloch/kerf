@@ -1887,6 +1887,66 @@ function placeOnFirstFittingTrack(
 }
 
 // ---------------------------------------------------------------------------
+// 轨道开关
+// ---------------------------------------------------------------------------
+
+/** 轨道上的三个开关。`muted` 只对音频轨、`hidden` 只对画面轨、`locked` 两种都行。 */
+export type TrackFlag = "locked" | "muted" | "hidden";
+
+const TRACK_FLAG_LABELS: Record<TrackFlag, string> = {
+  locked: "锁定",
+  muted: "静音",
+  hidden: "隐藏",
+};
+
+/**
+ * 开关一条轨道的锁定 / 静音 / 隐藏。
+ *
+ * **这三个字段都在 `Timeline` 里，所以它必须走撤销栈**（`apply()`），没有第二种选择：
+ * 历史里存的是整份 `Timeline`，绕过去直接改的话，之后任何一次撤销都会把这个开关
+ * 连带回滚——"改了但撤销不了"和"没改但被撤销掉了"是同一个坑的两面。
+ * 而它本来就该是编辑：**静音和隐藏会改变成片**（`mix-plan` 跳过静音音轨、
+ * `videoTracksInDrawOrder` 跳过隐藏画面轨），撤销得回去才对。
+ *
+ * 三条纪律：
+ *
+ * - **`locked` 不能被"轨道已锁定"挡住。** 其他每个编辑操作都要判 `track.locked` 并拒绝，
+ *   而这一个如果照着写，锁上之后就再也解不开了。这是唯一一处例外。
+ * - **`muted` 只能给音频轨、`hidden` 只能给画面轨，装错了要拒绝。** 给画面轨设 `muted`
+ *   不会报错、也不会有任何效果（混音只看音频轨），于是界面上那个按钮亮着而声音照旧
+ *   ——那是 D19 记的"存了但不生效"同一类（界面显示有转场、画面上没有）。
+ * - **关掉要把字段整个删掉**，不留 `false`（`setOptional`）。同 `transform` 那条：
+ *   合成器判的是值，但"这条轨动过没有"要能在数据层一眼看出来。
+ */
+export function setTrackFlag(
+  timeline: Timeline,
+  trackId: TrackId,
+  flag: TrackFlag,
+  on: boolean,
+): EditResult {
+  const track = findTrack(timeline, trackId);
+  if (!track) return reject(timeline, `找不到轨道 ${trackId}`);
+
+  // 刻意**不判** track.locked：见文件注释第一条
+  if (flag === "muted" && track.kind !== "audio") {
+    return reject(timeline, "只有音频轨能静音");
+  }
+  if (flag === "hidden" && track.kind !== "video") {
+    return reject(timeline, "只有画面轨能隐藏");
+  }
+  if ((track[flag] === true) === on) return unchanged(timeline);
+
+  const next = setOptional(track, flag, on ? true : undefined);
+  return ok(replaceTracks(timeline, timeline.tracks.map((t) => (t.id === trackId ? next : t))));
+}
+
+/** 撤销栈里那一步叫什么。开和关是两句话——"锁定"和"解锁"读起来完全不同。 */
+export function trackFlagLabel(flag: TrackFlag, on: boolean): string {
+  const name = TRACK_FLAG_LABELS[flag];
+  return on ? name : `取消${name}`;
+}
+
+// ---------------------------------------------------------------------------
 // 框选
 // ---------------------------------------------------------------------------
 

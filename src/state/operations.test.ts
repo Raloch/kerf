@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { FPS } from "../time/rational";
 import { clipSourceFrames, clipsUsingEffects } from "../edl/types";
+import { videoTracksInDrawOrder } from "../edl/sampling";
 import type { LutSource } from "../edl/types";
 import type {
   AudioOnlySource,
@@ -30,6 +31,8 @@ import {
   removeClip,
   removeClips,
   clipsInBox,
+  setTrackFlag,
+  trackFlagLabel,
   moveClips,
   copyClips,
   pasteClips,
@@ -378,6 +381,74 @@ describe("文字片段", () => {
     expect(
       computeDuration([{ id: "T1", kind: "video", clips: [textClip("t", 0, 320)] }]),
     ).toBe(320);
+  });
+});
+
+describe("轨道开关", () => {
+  const base = () =>
+    timeline([
+      { id: "V1", kind: "video", clips: [clip("a", 0, 100)] },
+      { id: "A1", kind: "audio", clips: [clip("m", 0, 100)] },
+    ]);
+  const track = (t: Timeline, id: string) => t.tracks.find((x) => x.id === id)!;
+
+  it("隐藏画面轨 / 静音音频轨", () => {
+    const hidden = setTrackFlag(base(), "V1", "hidden", true);
+    expect(hidden.changed).toBe(true);
+    expect(track(hidden.timeline, "V1").hidden).toBe(true);
+
+    const muted = setTrackFlag(base(), "A1", "muted", true);
+    expect(track(muted.timeline, "A1").muted).toBe(true);
+  });
+
+  it("**关掉要把字段整个删掉**，不留 false", () => {
+    const on = setTrackFlag(base(), "V1", "hidden", true).timeline;
+    const off = setTrackFlag(on, "V1", "hidden", false).timeline;
+    expect("hidden" in track(off, "V1")).toBe(false);
+  });
+
+  it("**锁定不能被「轨道已锁定」挡住**，否则锁上就再也解不开", () => {
+    // 其他每个编辑操作都判 track.locked 并拒绝，这一个是唯一的例外
+    const locked = setTrackFlag(base(), "V1", "locked", true).timeline;
+    expect(track(locked, "V1").locked).toBe(true);
+    const unlocked = setTrackFlag(locked, "V1", "locked", false);
+    expect(unlocked.changed).toBe(true);
+    expect("locked" in track(unlocked.timeline, "V1")).toBe(false);
+  });
+
+  it("锁定的轨道照样能静音 / 隐藏", () => {
+    // 锁定管的是"改片段"，不管"这条轨参不参与成片"
+    const locked = setTrackFlag(base(), "A1", "locked", true).timeline;
+    expect(setTrackFlag(locked, "A1", "muted", true).changed).toBe(true);
+  });
+
+  it("**静音只能给音频轨、隐藏只能给画面轨**——存了不生效的字段是 D19 那一类", () => {
+    expect(setTrackFlag(base(), "V1", "muted", true).reason).toMatch(/只有音频轨/);
+    expect(setTrackFlag(base(), "A1", "hidden", true).reason).toMatch(/只有画面轨/);
+  });
+
+  it("值没变时既不算失败也不进历史（第三种结果）", () => {
+    const r = setTrackFlag(base(), "V1", "hidden", false);
+    expect(r.changed).toBe(false);
+    expect(r.reason).toBeUndefined();
+  });
+
+  it("找不到轨道时拒绝", () => {
+    expect(setTrackFlag(base(), "没有这条轨", "locked", true).reason).toMatch(/找不到轨道/);
+  });
+
+  it("撤销栈的标签分开和关（「锁定」和「取消锁定」读起来完全不同）", () => {
+    expect(trackFlagLabel("locked", true)).toBe("锁定");
+    expect(trackFlagLabel("locked", false)).toBe("取消锁定");
+    expect(trackFlagLabel("muted", true)).toBe("静音");
+    expect(trackFlagLabel("hidden", false)).toBe("取消隐藏");
+  });
+
+  it("**隐藏之后下游真的不画它了**（判据在 sampling，这里只钉住字段被认）", () => {
+    const hidden = setTrackFlag(base(), "V1", "hidden", true).timeline;
+    expect(videoTracksInDrawOrder(hidden).map((t) => t.id)).not.toContain("V1");
+    const shown = setTrackFlag(hidden, "V1", "hidden", false).timeline;
+    expect(videoTracksInDrawOrder(shown).map((t) => t.id)).toContain("V1");
   });
 });
 
