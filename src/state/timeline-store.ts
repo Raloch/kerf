@@ -67,6 +67,7 @@ import {
   setClipsProperty,
   resetClipsProperties,
   PROPERTY_LABELS,
+  setMark,
   setTrackFlag,
   trackFlagLabel,
   setClipVolume,
@@ -254,6 +255,18 @@ export interface TimelineState {
    * 只动 Timeline，资产库里的字节交给"孤儿 + 够老"的清理（见 `removeSource`）。
    */
   removeSource: (sourceId: SourceId) => void;
+  /**
+   * 在**当前播放头**打入点 / 出点。**进撤销栈**——字段在 `Timeline` 里（D43），
+   * 而导出范围会改变成片。同一端连着打会合并成一条历史。
+   *
+   * 播放头由这里自己读（`get().playhead`），**不从调用方传进来**：同
+   * `freezeAtPlayhead` / `splitAtPlayhead`。键盘处理器里那个 `playhead` 来自 React
+   * 闭包，比 store 慢一拍——浏览器里实测过，`setPlayhead(60)` 之后立刻按 I 打出来的
+   * 是第 0 帧。传参数的写法把这类错误留在了每一个调用点上。
+   */
+  markAtPlayhead: (edge: "in" | "out") => void;
+  /** 清掉一端的标记。没有那一端时什么都不做（不进栈、不报错）。 */
+  clearMark: (edge: "in" | "out") => void;
   /** 把选中的（可能多个）片段放进剪贴板。**不进撤销栈**——它什么都没改。 */
   copySelected: () => void;
   /** 把剪贴板那一组粘到播放头，各自落回原轨。放不下就整组拒绝。 */
@@ -363,6 +376,20 @@ export const useTimeline = create<TimelineState>((set, get) => {
     if (result.changed && result.skippedReason !== undefined) {
       set({ lastRejection: result.skippedReason });
     }
+  }
+
+  /**
+   * 打或清一个标记，带上标签和合并键（D50）。
+   *
+   * 合并键按**端**给（`mark:in` / `mark:out`），所以"拖着播放头连打几次入点"合成
+   * 一条历史。不给的话每按一次 I 都是一条，⌘Z 要按到手酸才回到上一次真编辑。
+   *
+   * **两端不能共用一个键**：合并只发生在紧邻的上一条上，共用键会让"打入点、紧接着
+   * 打出点"被合成一条——那时 ⌘Z 一下把两端一起撤掉，而用户只想撤回一个。
+   */
+  function commitMark(timeline: Timeline, edge: "in" | "out", frame: number | null): void {
+    const name = edge === "in" ? "入点" : "出点";
+    apply(setMark(timeline, edge, frame), frame === null ? `清除${name}` : name, `mark:${edge}`);
   }
 
   /** 撤销 / 重做之后，选中集合里可能有片段已经不在了。**逐个过滤，不整体清空。** */
@@ -632,6 +659,15 @@ export const useTimeline = create<TimelineState>((set, get) => {
         set((s) => ({ selectedClipIds: liveSelection(result.timeline, s.selectedClipIds) }));
       }
       apply(result, `删除素材 ${name}`);
+    },
+
+    markAtPlayhead(edge) {
+      const state = get();
+      commitMark(state.timeline(), edge, state.playhead);
+    },
+
+    clearMark(edge) {
+      commitMark(get().timeline(), edge, null);
     },
 
     copySelected() {

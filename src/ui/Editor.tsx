@@ -95,6 +95,8 @@ export function Editor({
   const paste = useTimeline((s) => s.paste);
   const duplicateSelected = useTimeline((s) => s.duplicateSelected);
   const removeSelected = useTimeline((s) => s.removeSelected);
+  const markAtPlayhead = useTimeline((s) => s.markAtPlayhead);
+  const clearMark = useTimeline((s) => s.clearMark);
   const removeSource = useTimeline((s) => s.removeSource);
   const selectAll = useTimeline((s) => s.selectAll);
   const select = useTimeline((s) => s.select);
@@ -375,6 +377,24 @@ export function Editor({
         removeSelected(e.shiftKey);
         return;
       }
+      /*
+        I / O 打入点 / 出点，⌥I / ⌥O 清掉一端（**D50**）。
+
+        判 `e.code` 不判 `e.key`：macOS 上 ⌥I 是死键（`key` 会变成 `Dead` 或 `î`），
+        按 `key` 写的话"清除入点"在 mac 上直接不响应，而在别的平台上是好的——
+        那种只在一个平台上缺的快捷键最难被发现。
+      */
+      if (e.code === "KeyI") {
+        e.preventDefault();
+        // 播放头由 store 自己读（见 `markAtPlayhead`）——这个闭包里的 `playhead` 慢一拍
+        e.altKey ? clearMark("in") : markAtPlayhead("in");
+        return;
+      }
+      if (e.code === "KeyO") {
+        e.preventDefault();
+        e.altKey ? clearMark("out") : markAtPlayhead("out");
+        return;
+      }
       if (e.key === "ArrowLeft") {
         e.preventDefault();
         setPlayhead(playhead - (e.shiftKey ? 10 : 1));
@@ -396,6 +416,8 @@ export function Editor({
     select,
     selectAll,
     removeSelected,
+    markAtPlayhead,
+    clearMark,
     setPlayhead,
     splitAtPlayhead,
     undo,

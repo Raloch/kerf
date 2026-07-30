@@ -43,7 +43,7 @@ import {
   type EnvironmentFacts,
 } from "../media/preflight";
 import { loadSample, predict, sampleFromExport, saveSample } from "../export/throughput";
-import { clipsUsingEffects, type RenderRange, type Timeline } from "../edl/types";
+import { clipsUsingEffects, markedRange, type RenderRange, type Timeline } from "../edl/types";
 import { observedCapabilities } from "../compose/backend";
 import { formatDuration, frameToSeconds } from "../time/timebase";
 import { formatFps } from "../time/rational";
@@ -54,6 +54,9 @@ type Phase =
   | { readonly kind: "running"; readonly progress: ExportProgress }
   | { readonly kind: "done"; readonly result: ExportDone }
   | { readonly kind: "error"; readonly message: string };
+
+/** 导出哪一段的来源。三选一，见 `scope`。 */
+type ExportScope = "all" | "marked" | "selection";
 
 export interface ExportDialogProps {
   readonly timeline: Timeline;
@@ -66,7 +69,17 @@ export interface ExportDialogProps {
 export function ExportDialog({ timeline, caps, selectedRange, onClose }: ExportDialogProps) {
   const [container, setContainer] = useState<ContainerChoice>("mp4");
   const [presetId, setPresetId] = useState(DEFAULT_PRESET_ID);
-  const [wholeTimeline, setWholeTimeline] = useState(true);
+  /**
+   * 导出哪一段。**三选一而不是一个布尔**（D50）：加了入点 / 出点之后有三种来源
+   * （整条 / 标记区间 / 选中片段），布尔加布尔能构造出"两个都为真"这种不存在的状态。
+   *
+   * **有标记时默认选标记区间**——打标记这个动作的全部意义就是"我要导这一段"，
+   * 默认还停在"整条时间轴"就等于让用户每次都要再选一次，而漏选的后果是导出一条
+   * 长得多的片子（几分钟之后才发现）。
+   */
+  const [scope, setScope] = useState<ExportScope>(() =>
+    markedRange(timeline) ? "marked" : "all",
+  );
   const [baseName, setBaseName] = useState(() => defaultName(timeline));
   const [phase, setPhase] = useState<Phase>({ kind: "settings" });
   const handleRef = useRef<ExportHandle | null>(null);
@@ -149,13 +162,15 @@ export function ExportDialog({ timeline, caps, selectedRange, onClose }: ExportD
   // 而"每导出一次建一个 WebGL 上下文"正是要避免的事（见 export/client.ts）
   useEffect(() => releaseExportResources, []);
 
-  const range: RenderRange = useMemo(
-    () =>
-      wholeTimeline || !selectedRange
-        ? { inFrame: 0, outFrame: timeline.durationFrames }
-        : selectedRange,
-    [selectedRange, timeline.durationFrames, wholeTimeline],
-  );
+  /** 标记区间；`markedRange()` 是"只打了一端算到哪儿"的唯一答案（D50）。 */
+  const marked = useMemo(() => markedRange(timeline), [timeline]);
+  const range: RenderRange = useMemo(() => {
+    // 选中的那一档失效时回落到整条，**不静默用别的区间顶替**：选中被清掉之后
+    // 面板上那一项也跟着消失，回落到"整条"是唯一还看得见的选择
+    if (scope === "selection" && selectedRange) return selectedRange;
+    if (scope === "marked" && marked) return marked;
+    return { inFrame: 0, outFrame: timeline.durationFrames };
+  }, [marked, scope, selectedRange, timeline.durationFrames]);
 
   const preset = PRESETS.find((p) => p.id === presetId) ?? PRESETS[0]!;
   const resolved = resolvePreset(preset, timeline.width, timeline.height, timeline.fps);
@@ -350,12 +365,19 @@ export function ExportDialog({ timeline, caps, selectedRange, onClose }: ExportD
                       <select
                         className="sel-box"
                         aria-label="导出范围"
-                        value={wholeTimeline ? "all" : "selection"}
-                        onChange={(e) => setWholeTimeline(e.target.value === "all")}
+                        value={scope}
+                        onChange={(e) => setScope(e.target.value as ExportScope)}
                       >
                         <option value="all">
                           整条时间轴 · {formatDuration(timeline.durationFrames, timeline.fps)}
                         </option>
+                        {/* 没打标记时这一项整个不出现，同"选中片段"那一项 */}
+                        {marked && (
+                          <option value="marked">
+                            入点到出点 ·{" "}
+                            {formatDuration(marked.outFrame - marked.inFrame, timeline.fps)}
+                          </option>
+                        )}
                         {selectedRange && (
                           <option value="selection">
                             选中片段 ·{" "}

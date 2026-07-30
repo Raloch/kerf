@@ -1022,3 +1022,92 @@ describe("定格的 store 接线（D48）", () => {
     expect(clip.kind === "media" && clip.freeze).toBe(true);
   });
 });
+
+describe("入点 / 出点标记的 store 接线（D50）", () => {
+  beforeEach(reset);
+
+  it("打标记用的是**当前播放头**，不是调用方传进来的帧号", () => {
+    const s = () => useTimeline.getState();
+    s().addSource(source(300));
+    s().setPlayhead(60);
+    s().markAtPlayhead("in");
+    // 这一条是浏览器里抓出来的：键盘处理器闭包里的 playhead 比 store 慢一拍，
+    // 于是"setPlayhead(60) 之后按 I"打出来的是第 0 帧
+    expect(s().timeline().markIn).toBe(60);
+    s().setPlayhead(240);
+    s().markAtPlayhead("out");
+    expect(s().timeline().markOut).toBe(240);
+  });
+
+  it("打标记进撤销栈，撤销之后标记回来", () => {
+    const s = () => useTimeline.getState();
+    s().addSource(source(300));
+    const before = s().history.past.length;
+    s().setPlayhead(50);
+    s().markAtPlayhead("in");
+    expect(s().timeline().markIn).toBe(50);
+    expect(s().undoLabel()).toBe("入点");
+    expect(s().history.past.length).toBe(before + 1);
+    s().undo();
+    expect(s().timeline().markIn).toBeUndefined();
+    s().redo();
+    expect(s().timeline().markIn).toBe(50);
+  });
+
+  it("同一端连着打合成一条历史（合并键按端给）", () => {
+    const s = () => useTimeline.getState();
+    s().addSource(source(300));
+    const before = s().history.past.length;
+    for (const f of [10, 20, 30]) {
+      s().setPlayhead(f);
+      s().markAtPlayhead("in");
+    }
+    expect(s().timeline().markIn).toBe(30);
+    expect(s().history.past.length).toBe(before + 1);
+    // 一步撤销就回到"没有入点"，不是回到第 20 帧
+    s().undo();
+    expect(s().timeline().markIn).toBeUndefined();
+  });
+
+  it("两端不共用合并键：打完入点紧接着打出点是两条历史", () => {
+    const s = () => useTimeline.getState();
+    s().addSource(source(300));
+    const before = s().history.past.length;
+    s().setPlayhead(50);
+    s().markAtPlayhead("in");
+    s().setPlayhead(200);
+    s().markAtPlayhead("out");
+    expect(s().history.past.length).toBe(before + 2);
+    // 撤一步只撤掉出点，入点还在——共用一个键的话这里会两端一起消失
+    s().undo();
+    expect(s().timeline().markOut).toBeUndefined();
+    expect(s().timeline().markIn).toBe(50);
+  });
+
+  it("被拒绝时报到 lastRejection 且不进撤销栈", () => {
+    const s = () => useTimeline.getState();
+    s().addSource(source(300));
+    s().setPlayhead(100);
+    s().markAtPlayhead("out");
+    const before = s().history.past.length;
+    s().setPlayhead(150);
+    s().markAtPlayhead("in");
+    expect(s().lastRejection).toContain("100");
+    expect(s().history.past.length).toBe(before);
+    expect(s().timeline().markIn).toBeUndefined();
+  });
+
+  it("清一端的标签写的是「清除入点」，而清一个本来没有的不进栈也不报错", () => {
+    const s = () => useTimeline.getState();
+    s().addSource(source(300));
+    s().setPlayhead(50);
+    s().markAtPlayhead("in");
+    s().clearMark("in");
+    expect(s().undoLabel()).toBe("清除入点");
+    expect(s().timeline().markIn).toBeUndefined();
+    const before = s().history.past.length;
+    s().clearMark("out");
+    expect(s().history.past.length).toBe(before);
+    expect(s().lastRejection).toBeNull();
+  });
+});

@@ -269,6 +269,15 @@
   border-color: rgba(240, 192, 90, 0.4);
   background: rgba(240, 192, 90, 0.1);
 }
+/*
+  入出点读数（D50）。**颜色要和标尺上那段区间同族**（蓝），不能沿用变速那个琥珀色：
+  读数和它描述的那个东西不同色时，用户得先把两者对上才知道这行字在说什么。
+*/
+.ed .chip.mk {
+  color: #8fd0ff;
+  border-color: rgba(120, 200, 255, 0.4);
+  background: rgba(120, 200, 255, 0.1);
+}
 .ed .chip-btn {
   font: inherit;
   font-family: var(--mono);
@@ -962,6 +971,43 @@
   color: var(--tx-faint);
   transform: translateX(3px);
   pointer-events: none;
+}
+/*
+  入点 / 出点标记（D50）。只画在标尺上——它是导出范围，不是"这一段被选中了"。
+  `pointer-events: none` 是必须的：标尺按下要擦洗播放头，挡住的话在标记区间内
+  点一下不动播放头，而那看起来像"标尺坏了"。
+*/
+.ed .markspan {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: rgba(120, 200, 255, 0.14);
+  border-top: 2px solid rgba(120, 200, 255, 0.75);
+  pointer-events: none;
+}
+.ed .markpin {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  border-left: 1px solid rgba(120, 200, 255, 0.9);
+  pointer-events: none;
+}
+.ed .markpin span {
+  position: absolute;
+  top: 0;
+  font-family: var(--mono);
+  font-size: 9px;
+  line-height: 1;
+  padding: 1px 2px;
+  color: #0d1b26;
+  background: rgba(120, 200, 255, 0.9);
+  border-radius: 0 2px 2px 0;
+}
+/* 出点的标签挂在线的左边：右边是区间外，挂过去会盖住后面的刻度 */
+.ed .markpin.out span {
+  right: 0;
+  border-radius: 2px 0 0 2px;
 }
 .ed .tracks {
   position: relative;

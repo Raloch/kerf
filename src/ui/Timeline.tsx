@@ -16,6 +16,7 @@ import {
   clipSourceFrames,
   clipSourceId,
   clipSpeed,
+  markedRange,
   sourceGridFps,
   type Clip,
   type Timeline as Tl,
@@ -101,6 +102,9 @@ export function TimelinePanel() {
   const clipboardCount = useTimeline((s) => s.clipboard.length);
 
   const pxPerFrame = zoom / 100;
+  // 入点 / 出点标记描述的区间（D50）。只问 `markedRange()`——"只打了一端算到哪儿"
+  // 这条规则在导出面板和状态栏也要用，各写一遍必然会漂
+  const markRange = useMemo(() => markedRange(timeline), [timeline]);
   const ticksRef = useRef<HTMLDivElement>(null);
   const drag = useClipDrag(pxPerFrame);
   const marquee = useMarquee(pxPerFrame);
@@ -353,6 +357,23 @@ export function TimelinePanel() {
 
         <div className="spacer" />
 
+        {/*
+          导出范围读数（D50）。**只在打了标记时出现**（同 D49 那条变速 chip）：
+          没打标记时"范围就是整条"，而那已经写在旁边那个 chip 上了。
+
+          标尺上画得出区间的位置，但画不出**它有多长**——而"我圈了多长一段"正是
+          打完标记最想知道的数，否则要开一次导出面板才看得到。
+        */}
+        {markRange && (
+          <span
+            className="chip mk"
+            title={`导出范围：第 ${markRange.inFrame} – ${markRange.outFrame} 帧。I / O 打标记，⌥I / ⌥O 清除`}
+          >
+            入出 {markRange.outFrame - markRange.inFrame} 帧 ·{" "}
+            {framesToTimecode(markRange.outFrame - markRange.inFrame, timeline.fps)}
+          </span>
+        )}
+
         <span className="chip m">
           {timeline.durationFrames} 帧 · {toNumber(timeline.fps).toFixed(2)} fps
         </span>
@@ -394,6 +415,37 @@ export function TimelinePanel() {
               }}
             >
               <Ticks timeline={timeline} pxPerFrame={pxPerFrame} />
+              {/*
+                入点 / 出点标记（D50）。画在标尺上而不是贯穿所有轨道：它是**导出范围**
+                不是"这一段被选中了"，铺满整个时间轴会读成后者（同 D43 那条"淡化片段
+                而不是整条 lane"）。区间由 `markedRange()` 给——只打了一端时的补全规则
+                只有那一个答案。
+              */}
+              {markRange && (
+                <div
+                  className="markspan"
+                  style={{
+                    left: `${markRange.inFrame * pxPerFrame}px`,
+                    width: `${(markRange.outFrame - markRange.inFrame) * pxPerFrame}px`,
+                  }}
+                  title={`导出范围 ${framesToTimecode(markRange.inFrame, timeline.fps)} – ${framesToTimecode(markRange.outFrame, timeline.fps)}`}
+                />
+              )}
+              {/*
+                两个标记各自画一个爪。**画的是字段本身不是 `markedRange` 的两端**：
+                只打了入点时区间的右端是时间轴末尾，在那儿画一个出点爪就是说了一件
+                用户没做的事（他还能再打一个真的出点）。
+              */}
+              {timeline.markIn !== undefined && (
+                <div className="markpin in" style={{ left: `${timeline.markIn * pxPerFrame}px` }}>
+                  <span>I</span>
+                </div>
+              )}
+              {timeline.markOut !== undefined && (
+                <div className="markpin out" style={{ left: `${timeline.markOut * pxPerFrame}px` }}>
+                  <span>O</span>
+                </div>
+              )}
               <div
                 className="playhead ph-head"
                 style={{ left: `${playhead * pxPerFrame}px` }}

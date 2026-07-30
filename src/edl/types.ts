@@ -512,12 +512,47 @@ export interface Timeline {
   readonly luts?: readonly LutSource[];
   /** 导入过的字体。文字片段用 `style.fontFamily` 引用，缺省为空数组。 */
   readonly fonts?: readonly FontSource[];
+  /**
+   * 入点 / 出点标记（**D50**），左闭右开，单位是时间轴帧。两个各自可以单独存在：
+   * 只有入点 = 从这里到末尾，只有出点 = 从头到这里。**"这两个字段描述哪一段"只有
+   * `markedRange()` 一个答案**——导出面板、状态栏读数、标尺overlay 三处都问它，
+   * 各写一遍"只设了一个怎么算"必然会漂。
+   *
+   * **它们在 `Timeline` 里，所以必须进撤销栈**（D43 那条：字段在 EDL 里就没得选，
+   * 绕过 `apply()` 之后任何一次撤销都会把标记连带回滚）。而它本来就该是编辑——
+   * 导出范围**会改变成片**，这正是 D43 判"静音 / 隐藏算编辑"用的那把尺子。
+   *
+   * 缺省是**字段整个不存在**，不是 0 / `durationFrames`：填了缺省值就分不出
+   * "用户把入点打在第 0 帧"和"没有入点"，而前者在时间轴上要画出来。
+   */
+  readonly markIn?: number;
+  readonly markOut?: number;
 }
 
 /** 导出范围，帧号，左闭右开。 */
 export interface RenderRange {
   readonly inFrame: number;
   readonly outFrame: number;
+}
+
+/**
+ * 入点 / 出点标记描述的区间；一个都没打时返回 null（**D50**）。
+ *
+ * **这是"标记指哪一段"的唯一答案。** 只设了一个的补全规则（入点 → 到末尾、
+ * 出点 → 从头开始）散写在三处调用点必然会漂，而漂了的表现是"导出面板说 5 秒、
+ * 状态栏说 8 秒"，两边都不报错。
+ *
+ * 夹回 `[0, durationFrames]` 是**兜底不是主判据**：主判据在 `setMark` 和归一化里
+ * （删片段之后标记会跟着夹）。这里再夹一次是因为快照可能是旧数据、也可能被别处
+ * 构造，而一个 `outFrame > durationFrames` 的区间会让导出多跑一段黑帧、并且把
+ * D25 那个耗时预测和空间预估一起算大。
+ */
+export function markedRange(timeline: Timeline): RenderRange | null {
+  const { markIn, markOut, durationFrames } = timeline;
+  if (markIn === undefined && markOut === undefined) return null;
+  const inFrame = Math.max(0, Math.min(durationFrames, markIn ?? 0));
+  const outFrame = Math.max(0, Math.min(durationFrames, markOut ?? durationFrames));
+  return outFrame > inFrame ? { inFrame, outFrame } : null;
 }
 
 export function clipDuration(clip: Clip): number {

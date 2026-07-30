@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { FPS } from "../time/rational";
-import { clipDuration, clipSourceFrames, clipsUsingEffects } from "../edl/types";
+import { clipDuration, clipSourceFrames, clipsUsingEffects, markedRange } from "../edl/types";
 import {
   layerLooks,
   sourceMicrosAt,
@@ -70,6 +70,7 @@ import {
   setKeyframe,
   setTextContent,
   setTextStyle,
+  setMark,
   snapDrag,
   snapFrame,
   snapTargets,
@@ -3358,5 +3359,173 @@ describe("新片段 id 不是模块级计数器", () => {
     expect(first.clipId).not.toMatch(/^text-\d+$/);
     const second = addTextClip(first.timeline, { timelineIn: 400, durationFrames: 60, text: "乙" });
     expect(second.clipId).not.toBe(first.clipId);
+  });
+});
+
+describe("入点 / 出点标记（D50）", () => {
+  describe("打与清", () => {
+    it("打入点和出点，缺省是字段整个不存在", () => {
+      const base = twoClipTimeline();
+      expect(base.markIn).toBeUndefined();
+      expect(base.markOut).toBeUndefined();
+
+      const withIn = setMark(base, "in", 50);
+      expect(withIn.changed).toBe(true);
+      expect(withIn.timeline.markIn).toBe(50);
+      expect(withIn.timeline.markOut).toBeUndefined();
+
+      const both = setMark(withIn.timeline, "out", 150);
+      expect(both.timeline.markIn).toBe(50);
+      expect(both.timeline.markOut).toBe(150);
+    });
+
+    it("第 0 帧的入点要留得住——它和「没有入点」是两件事", () => {
+      const r = setMark(twoClipTimeline(), "in", 0);
+      expect(r.changed).toBe(true);
+      expect(r.timeline.markIn).toBe(0);
+      // 缺省值填 0 的写法在这里就分不出来了
+      expect("markIn" in r.timeline).toBe(true);
+    });
+
+    it("清一端要把字段真的删掉，不是赋 undefined", () => {
+      const marked = setMark(setMark(twoClipTimeline(), "in", 50).timeline, "out", 150).timeline;
+      const cleared = setMark(marked, "in", null);
+      expect(cleared.changed).toBe(true);
+      expect("markIn" in cleared.timeline).toBe(false);
+      expect(cleared.timeline.markOut).toBe(150);
+    });
+
+    it("清一个本来就没有的标记算「值没变」，不是失败", () => {
+      const r = setMark(twoClipTimeline(), "out", null);
+      expect(r.changed).toBe(false);
+      expect(r.reason).toBeUndefined();
+    });
+
+    it("同一帧再打一次算「值没变」，不是失败", () => {
+      const marked = setMark(twoClipTimeline(), "in", 50).timeline;
+      const again = setMark(marked, "in", 50);
+      expect(again.changed).toBe(false);
+      expect(again.reason).toBeUndefined();
+    });
+  });
+
+  describe("拒绝的那些", () => {
+    it("非整数帧", () => {
+      const r = setMark(twoClipTimeline(), "in", 50.5);
+      expect(r.changed).toBe(false);
+      expect(r.reason).toBeTruthy();
+    });
+
+    it("落在时间轴之外", () => {
+      expect(setMark(twoClipTimeline(), "in", -1).reason).toBeTruthy();
+      expect(setMark(twoClipTimeline(), "out", 201).reason).toBeTruthy();
+    });
+
+    it("入点越过出点时拒绝，而且报出出点在哪儿——不夹紧、不顺手清掉对面", () => {
+      const marked = setMark(twoClipTimeline(), "out", 100).timeline;
+      const r = setMark(marked, "in", 120);
+      expect(r.changed).toBe(false);
+      expect(r.reason).toContain("100");
+      // 对面那一端一个字都没动
+      expect(r.timeline.markOut).toBe(100);
+    });
+
+    it("出点越过入点时同样拒绝（同一条规则的另一侧）", () => {
+      const marked = setMark(twoClipTimeline(), "in", 100).timeline;
+      const r = setMark(marked, "out", 80);
+      expect(r.changed).toBe(false);
+      expect(r.reason).toContain("100");
+      expect(r.timeline.markIn).toBe(100);
+    });
+
+    it("入点等于出点也拒绝：零长区间导不出任何东西", () => {
+      const marked = setMark(twoClipTimeline(), "out", 100).timeline;
+      expect(setMark(marked, "in", 100).changed).toBe(false);
+    });
+
+    it("一端都没有时，和时间轴自己比：入点不能打在末尾、出点不能打在第 0 帧", () => {
+      const base = twoClipTimeline();
+      expect(setMark(base, "in", 200).changed).toBe(false);
+      expect(setMark(base, "out", 0).changed).toBe(false);
+      // 差一帧就合法
+      expect(setMark(base, "in", 199).changed).toBe(true);
+      expect(setMark(base, "out", 1).changed).toBe(true);
+    });
+  });
+
+  describe("markedRange 是「标记指哪一段」的唯一答案", () => {
+    it("一个都没打时是 null", () => {
+      expect(markedRange(twoClipTimeline())).toBeNull();
+    });
+
+    it("只有入点 = 从这里到末尾", () => {
+      const t = setMark(twoClipTimeline(), "in", 50).timeline;
+      expect(markedRange(t)).toEqual({ inFrame: 50, outFrame: 200 });
+    });
+
+    it("只有出点 = 从头到这里", () => {
+      const t = setMark(twoClipTimeline(), "out", 150).timeline;
+      expect(markedRange(t)).toEqual({ inFrame: 0, outFrame: 150 });
+    });
+
+    it("两个都有就是它们本身", () => {
+      const t = setMark(setMark(twoClipTimeline(), "in", 50).timeline, "out", 150).timeline;
+      expect(markedRange(t)).toEqual({ inFrame: 50, outFrame: 150 });
+    });
+
+    it("脏数据给出反的区间时返回 null，而不是一个负长度的范围", () => {
+      // 快照可能是旧数据、也可能被别处构造，`setMark` 拦不住这一路
+      const t: Timeline = { ...twoClipTimeline(), markIn: 150, markOut: 50 };
+      expect(markedRange(t)).toBeNull();
+    });
+
+    it("超出末尾的标记在这里也夹一次（兜底，主判据在归一化里）", () => {
+      const t: Timeline = { ...twoClipTimeline(), markOut: 999 };
+      expect(markedRange(t)).toEqual({ inFrame: 0, outFrame: 200 });
+    });
+  });
+
+  describe("时间轴变短时标记跟着夹", () => {
+    /**
+     * 单轨两段：[0,100) 和 [100,200)。
+     *
+     * **不能用 `twoClipTimeline()`**——它的 A1 上还压着一个跨 [0,200) 的片段，
+     * 删掉 V1 的 b 之后总长仍是 200，于是"变短"这件事根本没发生（第一版就栽在
+     * 这里，读数是 200 而我期望 100）。
+     */
+    function oneTrack(): Timeline {
+      return timeline([
+        { id: "V1", kind: "video", clips: [clip("a", 0, 100), clip("b", 100, 200)] },
+      ]);
+    }
+
+    it("删掉最后一个片段，出点夹到新的末尾", () => {
+      const marked = setMark(oneTrack(), "out", 200).timeline;
+      const shorter = removeClip(marked, "b");
+      expect(shorter.timeline.durationFrames).toBe(100);
+      expect(shorter.timeline.markOut).toBe(100);
+    });
+
+    it("夹完站不住就把两端整个清掉，而不是留一个导不出东西的标记", () => {
+      const marked = setMark(setMark(oneTrack(), "in", 150).timeline, "out", 200).timeline;
+      // 只剩 [0,100)，入点 150 会被夹到 100，和出点撞在一起
+      const shorter = removeClip(marked, "b");
+      expect(shorter.timeline.markIn).toBeUndefined();
+      expect(shorter.timeline.markOut).toBeUndefined();
+    });
+
+    it("时间轴变长不动标记", () => {
+      const marked = setMark(oneTrack(), "out", 150).timeline;
+      // 第三个参数是**位移**不是落点：b 从 [100,200) 挪到 [300,400)
+      const longer = moveClip(marked, "b", 200);
+      expect(longer.timeline.durationFrames).toBe(400);
+      expect(longer.timeline.markOut).toBe(150);
+    });
+
+    it("没有标记的时间轴一个字段都不会被加上", () => {
+      const shorter = removeClip(oneTrack(), "b");
+      expect("markIn" in shorter.timeline).toBe(false);
+      expect("markOut" in shorter.timeline).toBe(false);
+    });
   });
 });

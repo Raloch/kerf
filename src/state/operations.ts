@@ -124,7 +124,39 @@ function collisionsIn(track: Track, candidate: Clip): Clip[] {
 }
 
 function replaceTracks(timeline: Timeline, tracks: readonly Track[]): Timeline {
-  return { ...timeline, tracks, durationFrames: computeDuration(tracks) };
+  const durationFrames = computeDuration(tracks);
+  return clampMarks({ ...timeline, tracks, durationFrames });
+}
+
+/**
+ * 把入点 / 出点标记夹回 `[0, durationFrames]`，夹完站不住就整个清掉（**D50**）。
+ *
+ * **每一次改片段列表都要过**（`replaceTracks` 是唯一出口，所以这里就够了），因为
+ * 时间轴会变短：出点标在第 300 帧、把最后一个片段删掉之后总长只有 200，那个标记
+ * 就悬在末尾之外。它不会报错——导出照样跑，只是**多渲染 100 帧黑画面**，而 D25 那个
+ * 耗时预测和空间预估都按区间算，于是一起算大。
+ *
+ * "站不住"包括两种：夹完之后区间变成零长（入点被夹到等于出点），以及标记本来就在
+ * 末尾之外、夹完两个撞在一起。那时清掉整个标记，因为"入点等于出点"导不出任何东西，
+ * 而留着一个导不出东西的标记会让导出面板出现一个选了就报错的选项。
+ */
+function clampMarks(timeline: Timeline): Timeline {
+  const { markIn, markOut, durationFrames } = timeline;
+  if (markIn === undefined && markOut === undefined) return timeline;
+  const nextIn = markIn === undefined ? undefined : Math.min(markIn, durationFrames);
+  const nextOut = markOut === undefined ? undefined : Math.min(markOut, durationFrames);
+  // 夹完之后还站得住吗：两个都在时要求严格有序，只有一个时要求它自己留出非零长度
+  const valid =
+    nextIn !== undefined && nextOut !== undefined
+      ? nextIn < nextOut
+      : nextIn !== undefined
+        ? nextIn < durationFrames
+        : nextOut !== undefined && nextOut > 0;
+  if (!valid) {
+    return setOptional(setOptional(timeline, "markIn", undefined), "markOut", undefined);
+  }
+  if (nextIn === markIn && nextOut === markOut) return timeline;
+  return setOptional(setOptional(timeline, "markIn", nextIn), "markOut", nextOut);
 }
 
 /**
@@ -2502,6 +2534,70 @@ export function setTrackFlag(
 export function trackFlagLabel(flag: TrackFlag, on: boolean): string {
   const name = TRACK_FLAG_LABELS[flag];
   return on ? name : `取消${name}`;
+}
+
+// ---------------------------------------------------------------------------
+// 入点 / 出点标记
+// ---------------------------------------------------------------------------
+
+/**
+ * 打或清一个标记（**D50**）。`frame` 给 null 表示清掉这一端。
+ *
+ * 一个函数带 `edge` 参数而不是 `setMarkIn` / `setMarkOut` 两个：**"入点必须严格小于
+ * 出点"这条规则只有一份**，两个函数各写一遍的话漏改一边的表现是"从出点那侧可以打出
+ * 一个反的区间"，而反的区间在 `markedRange()` 里被判成 null——于是标记看得见、导出
+ * 范围那一项却不出现，两边都不报错。
+ *
+ * **越过另一端时拒绝，不夹紧也不顺手清掉对面**（同 D46 那条对边裁剪之和超 100% 的
+ * 处理）：夹紧要么改用户刚点的那一帧、要么改另一端，两种都是"选了 A 拿到 B"；而
+ * "打入点时把出点悄悄清掉"是 NLE 里常见做法，但它会让一次误按毁掉另一端的标记，
+ * 而那一端没有任何提示。拒绝的代价只是多按一次 ⌥O。
+ *
+ * **不要求标记落在片段上**：入点打在空档里是合法的（导出会渲染黑画面 + 静音），
+ * 那是用户的选择，不是错误。
+ */
+export function setMark(
+  timeline: Timeline,
+  edge: "in" | "out",
+  frame: number | null,
+): EditResult {
+  const key = edge === "in" ? "markIn" : "markOut";
+  const current = edge === "in" ? timeline.markIn : timeline.markOut;
+
+  if (frame === null) {
+    if (current === undefined) return unchanged(timeline);
+    return ok(setOptional(timeline, key, undefined));
+  }
+  if (!Number.isInteger(frame)) return reject(timeline, "标记位置必须是整数帧");
+  if (frame < 0 || frame > timeline.durationFrames) {
+    return reject(timeline, `标记要落在 0 – ${timeline.durationFrames} 帧之间`);
+  }
+  if (current === frame) return unchanged(timeline);
+
+  // 另一端在的话要留出非零长度；一端都没有时和时间轴自己比
+  const other = edge === "in" ? timeline.markOut : timeline.markIn;
+  if (edge === "in") {
+    const limit = other ?? timeline.durationFrames;
+    if (frame >= limit) {
+      return reject(
+        timeline,
+        other === undefined
+          ? "入点不能打在时间轴末尾"
+          : `入点要在出点（第 ${other} 帧）之前，先清掉出点`,
+      );
+    }
+  } else {
+    const limit = other ?? 0;
+    if (frame <= limit) {
+      return reject(
+        timeline,
+        other === undefined
+          ? "出点不能打在第 0 帧"
+          : `出点要在入点（第 ${other} 帧）之后，先清掉入点`,
+      );
+    }
+  }
+  return ok(setOptional(timeline, key, frame));
 }
 
 // ---------------------------------------------------------------------------
