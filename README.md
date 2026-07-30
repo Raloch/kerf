@@ -73,7 +73,7 @@ pnpm dev
 其他命令：
 
 ```bash
-pnpm test         # 单元测试，939 项 / 33 个文件
+pnpm test         # 单元测试，966 项 / 33 个文件
 pnpm typecheck    # 类型检查（strict + noUncheckedIndexedAccess + exactOptionalPropertyTypes）
 pnpm build        # 生产构建（自带主 chunk 断言）
 pnpm gate         # 上面三条一起跑，CI 上跑的就是它
@@ -146,7 +146,7 @@ src/
 ├─ dev/         测试素材生成 + 六个自检脚本
 └─ types/       `showSaveFilePicker()` 的类型声明（TS 5.9 的 lib.dom 还没有）
 design/         界面设计稿
-docs/PLAN.md    技术方案（活文档：选型、架构、决策记录 D1–D44、风险清单）
+docs/PLAN.md    技术方案（活文档：选型、架构、决策记录 D1–D45、风险清单）
 ```
 
 ## 几个刻意的技术选择
@@ -194,10 +194,11 @@ docs/PLAN.md    技术方案（活文档：选型、架构、决策记录 D1–D
 | — | 片段复制 / 粘贴 / 副本（⌘C / ⌘V / ⌘D，决策见 D41） | ✅ 已落地 |
 | — | 多选与框选（⌘ 点选 / ⌘A / Esc / 橡皮筋、整组拖拽、批量删除与粘贴，决策见 D42） | ✅ 已落地 |
 | — | 轨道锁定 / 静音 / 隐藏、片段右键菜单（决策见 D43 / D44） | ✅ 已落地 |
+| — | 批量改属性（多选时改变换 / 调色 / 音量，值不一致显示「多个值」，决策见 D45） | ✅ 已落地 |
 
 ## 文档
 
-- [docs/PLAN.md](docs/PLAN.md) — 技术方案：选型理由、架构、兼容矩阵、设计决策记录（D1–D44，四段格式：决定 / 理由 / 放弃了什么 / 什么情况下重新评估）、风险清单与实施中踩到的坑
+- [docs/PLAN.md](docs/PLAN.md) — 技术方案：选型理由、架构、兼容矩阵、设计决策记录（D1–D45，四段格式：决定 / 理由 / 放弃了什么 / 什么情况下重新评估）、风险清单与实施中踩到的坑
 - [编辑器界面设计稿](https://raloch.github.io/kerf/) — 可交互，一个应用外壳承载剪辑台、素材导入、导出三态与兼容降级四种状态。已按它实现，留着作为设计基准（源文件：[design/kerf-editor-mockup.html](design/kerf-editor-mockup.html)）
 - [首页与项目管理设计稿](design/kerf-home-mockup.html) — 四种状态，已按它实现（决策见 PLAN.md 的 D37）
 - [CLAUDE.md](CLAUDE.md) — 给 AI 编码助手的项目规则与硬约束

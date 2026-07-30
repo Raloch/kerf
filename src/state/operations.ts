@@ -596,6 +596,78 @@ export interface BatchResult extends EditResult {
   readonly skippedReason?: string;
 }
 
+/** `perClip` 的战果。 */
+interface PerClipTally {
+  readonly timeline: Timeline;
+  /** 真的改了几个。 */
+  readonly done: number;
+  /** 带着原因失败了几个。 */
+  readonly skipped: number;
+  /** 第一个失败原因。只报第一个——一串重复的"轨道已锁定"没有更多信息。 */
+  readonly firstReason?: string;
+}
+
+/**
+ * 逐个做，失败的记下来。**批量删除和批量改属性共用这条循环**，因为它们的失败语义是
+ * 同一类（各自独立，见 `removeClips`）。
+ *
+ * 分三类而不是两类，第三类是这里唯一容易写错的地方：`changed:false` 且**不给 `reason`**
+ * 的那个结果是"值没变"（见 `EditResult.reason`），它既不是成功也不是失败。把它算进
+ * `skipped` 的话，"给 5 个片段设 50% 而其中 2 个本来就是 50%"会报成"5 个里有 2 个没改"
+ * ——那是句假话，而且它只在"部分片段的值本来就对"时出现，最容易漏测。
+ */
+function perClip(
+  timeline: Timeline,
+  ids: readonly ClipId[],
+  step: (working: Timeline, id: ClipId) => EditResult,
+): PerClipTally {
+  let working = timeline;
+  let done = 0;
+  let skipped = 0;
+  let firstReason: string | undefined;
+  for (const id of ids) {
+    const result = step(working, id);
+    if (result.changed) {
+      working = result.timeline;
+      done += 1;
+    } else if (result.reason !== undefined) {
+      skipped += 1;
+      firstReason ??= result.reason;
+    }
+  }
+  // exactOptionalPropertyTypes 下 `firstReason: undefined` 和"没有这个字段"是两种类型
+  return firstReason === undefined
+    ? { timeline: working, done, skipped }
+    : { timeline: working, done, skipped, firstReason };
+}
+
+/**
+ * 把战果折成 `BatchResult`。`verb`（"删" / "改"）进文案，所以措辞仍归调用方。
+ *
+ * 三种出口对应 `EditResult` 的三态，中间那个是"一个都没变而且没人失败" = 值没变：
+ * 那时**不能给 `reason`**，否则滑块拖到边界会一直闪红字（见 `EditResult.reason`）。
+ */
+function tallyResult(
+  timeline: Timeline,
+  tally: PerClipTally,
+  total: number,
+  verb: string,
+): BatchResult {
+  if (tally.done === 0 && tally.skipped === 0) return { ...unchanged(timeline), done: 0, total };
+  if (tally.done === 0) {
+    return { ...reject(timeline, tally.firstReason ?? `没有可${verb}的片段`), done: 0, total };
+  }
+  if (tally.skipped > 0) {
+    return {
+      ...ok(tally.timeline),
+      done: tally.done,
+      total,
+      skippedReason: `${total} 个片段里有 ${tally.skipped} 个没${verb}：${tally.firstReason ?? "原因不明"}`,
+    };
+  }
+  return { ...ok(tally.timeline), done: tally.done, total };
+}
+
 /**
  * 批量删除。**逐个做，做不成的报出来，不整批拒绝。**
  *
@@ -614,31 +686,10 @@ export function removeClips(
   const ids = uniqueIds(clipIds);
   if (ids.length === 0) return { ...reject(timeline, "没有选中片段"), done: 0, total: 0 };
 
-  let working = timeline;
-  let done = 0;
-  let firstReason: string | undefined;
-  for (const id of ids) {
-    const result = ripple ? rippleDeleteClip(working, id) : removeClip(working, id);
-    if (result.changed) {
-      working = result.timeline;
-      done += 1;
-    } else if (firstReason === undefined) {
-      firstReason = result.reason;
-    }
-  }
-
-  if (done === 0) {
-    return { ...reject(timeline, firstReason ?? "没有可删的片段"), done: 0, total: ids.length };
-  }
-  if (done < ids.length) {
-    return {
-      ...ok(working),
-      done,
-      total: ids.length,
-      skippedReason: `${ids.length} 个片段里有 ${ids.length - done} 个没删：${firstReason ?? "原因不明"}`,
-    };
-  }
-  return { ...ok(working), done, total: ids.length };
+  const tally = perClip(timeline, ids, (working, id) =>
+    ripple ? rippleDeleteClip(working, id) : removeClip(working, id),
+  );
+  return tallyResult(timeline, tally, ids.length, "删");
 }
 
 // ---------------------------------------------------------------------------
@@ -829,6 +880,71 @@ export function staticValueOf(clip: Clip, property: AnimatableProperty): number 
   if (isAudioProperty(property)) return clip.kind === "media" ? clip.volume : undefined;
   const group = isColorProperty(property) ? clip.color : clip.transform;
   return (group as Record<string, number | undefined> | undefined)?.[property];
+}
+
+/**
+ * 这个属性对这个片段有没有意义。**单选的界面门和批量操作共用这一处判据。**
+ *
+ * 两条规则都是既有的，原来写在检查器的 JSX 里：变换和调色只作用于画面，所以音频轨上的
+ * 片段没有；音量只在**音频轨的素材片段**上有意义（`planAudioJobs` 只混音频轨，视频轨上
+ * 的片段调了音量不会进任何一条增益链）。
+ *
+ * 收成一个函数是因为批量改属性给了它第二个消费者。两处各写一遍 `track.kind === "video"`，
+ * 漂了的表现是"单选看得见这一行、批量里没有"，或者更坏——批量把音量写进视频轨的片段，
+ * 字段存下来了而声音一点没变（D19 那类"存了但不生效"）。**`setClipVolume` 自己不判轨道
+ * 种类**，所以这个函数就是唯一的门，新的调用点都要先过它。
+ */
+export function propertyApplies(clip: Clip, track: Track, property: AnimatableProperty): boolean {
+  if (isAudioProperty(property)) return track.kind === "audio" && clip.kind === "media";
+  return track.kind === "video";
+}
+
+/** 一组片段在某个属性上的共同读数。见 `summarizeProperty`。 */
+export interface PropertySummary {
+  /** 这个属性对几个片段适用**且**没有动画——也就是这次批量真的会改到几个。 */
+  readonly editable: number;
+  /** 适用但打了关键帧的有几个。批量改不到它们，界面要说出来。 */
+  readonly animated: number;
+  /**
+   * `editable` 那几个的共同静态值（缺省值算在内）。**不一致时给 `undefined`**，
+   * 界面显示"多个值"；`editable === 0` 时同样是 `undefined`。
+   */
+  readonly value: number | undefined;
+}
+
+/**
+ * 一组片段在某个属性上是什么读数。
+ *
+ * **有动画的片段既不参与读数也不参与写入，两边必须是同一份名单。** 批量写的是静态值，
+ * 而有动画时静态值不是画面上生效的那个值——把它算进"共同值"里，用户会看到一个改不出来
+ * 的数字（改完那一行还是原样，而软件一个字都没说，硬规则 10 的形状）。
+ *
+ * 不适用的片段**不计入任何一个数**：它们不是这次操作的对象，算进去会让"5 个里有 2 个没改"
+ * 这句话把"文字片段没有音量"说成一次失败。
+ */
+export function summarizeProperty(
+  timeline: Timeline,
+  clipIds: readonly ClipId[],
+  property: AnimatableProperty,
+): PropertySummary {
+  const fallback = PROPERTY_RANGES[property].fallback;
+  let editable = 0;
+  let animated = 0;
+  let value: number | undefined;
+  let same = true;
+  for (const id of uniqueIds(clipIds)) {
+    const found = findClip(timeline, id);
+    if (!found || !propertyApplies(found.clip, found.track, property)) continue;
+    if ((found.clip.keyframes?.[property]?.length ?? 0) > 0) {
+      animated += 1;
+      continue;
+    }
+    const own = staticValueOf(found.clip, property) ?? fallback;
+    if (editable === 0) value = own;
+    else if (own !== value) same = false;
+    editable += 1;
+  }
+  return { editable, animated, value: same ? value : undefined };
 }
 
 /**
@@ -1092,6 +1208,141 @@ export function setClipVolume(timeline: Timeline, clipId: ClipId, volume: number
 
   const next = clamped === VOLUME_RANGE.fallback ? undefined : clamped;
   return ok(replaceClip(timeline, found.track.id, setOptional(found.clip, "volume", next)));
+}
+
+/**
+ * 把"若干属性 → 值"落到**一个**片段上。`undefined` = 回到缺省（字段整个删掉）。
+ *
+ * 静态值存在三个地方（`clip.transform` / `clip.color` 是对象、`clip.volume` 是标量），
+ * 这是**写**这一侧的唯一分岔点，`staticValueOf` 是读那一侧的。两边各写一遍
+ * `isAudioProperty ? … : isColorProperty ? … : …` 就会在加第四组时漏掉一处，而漏掉的
+ * 表现是"这个属性批量改不动"或者"改了但读回来还是老值"。都不报错。
+ *
+ * 三个组各调一次既有的编辑入口，于是夹紧、NaN 校验、归一化、锁定判断都不重写一遍；
+ * 中间态串在同一份 working timeline 上，对外仍然只是一个结果。**任何一步失败就整个
+ * 失败**（不返回半个补丁）——一次调用是一个属性组的一次编辑，部分落地的那种状态没人要。
+ */
+function setClipProperties(
+  timeline: Timeline,
+  clipId: ClipId,
+  values: ReadonlyMap<AnimatableProperty, number | undefined>,
+): EditResult {
+  const transform: Record<string, number | undefined> = {};
+  const color: Record<string, number | undefined> = {};
+  /** `null` = 这次不动音量。`undefined` 是个合法的值（回到缺省），不能拿它当哨兵。 */
+  let volume: number | undefined | null = null;
+  for (const [property, value] of values) {
+    if (isAudioProperty(property)) volume = value;
+    else if (isColorProperty(property)) color[property] = value;
+    else transform[property] = value;
+  }
+
+  let working = timeline;
+  let changed = false;
+  /** 成功就推进 working，失败（带原因）就把那个结果交出去；"值没变"两者都不做。 */
+  const advance = (result: EditResult): EditResult | null => {
+    if (result.changed) {
+      working = result.timeline;
+      changed = true;
+      return null;
+    }
+    return result.reason === undefined ? null : result;
+  };
+
+  if (Object.keys(transform).length > 0) {
+    const failed = advance(setClipTransform(working, clipId, transform as TransformPatch));
+    if (failed) return failed;
+  }
+  if (Object.keys(color).length > 0) {
+    const failed = advance(setClipColor(working, clipId, color as ColorPatch));
+    if (failed) return failed;
+  }
+  if (volume !== null) {
+    const failed = advance(setClipVolume(working, clipId, volume ?? VOLUME_RANGE.fallback));
+    if (failed) return failed;
+  }
+  return changed ? ok(working) : unchanged(timeline);
+}
+
+/**
+ * 批量改**一个**属性的静态值。**逐个做，做不成的报出来**（同 `removeClips`，与
+ * `moveClips` 的全体或拒绝刻意相反）。
+ *
+ * 判据还是那一条——"部分成功是不是一个用户没要的新状态"：几个片段的不透明度之间没有
+ * 任何关系，把 3 个改成 50% 就只是"这 3 个是 50%"，没有第三种含义；而整批拒绝会让"选中
+ * 的一堆里有一个在锁定轨道上"变成整组都调不了。（对比 `moveClips`：N 个片段的**相对
+ * 位置**就是内容本身，所以那边部分成功是个用户没要的新状态。）
+ *
+ * **有动画的片段跳过并报出来。** 那时静态值不是画面上生效的值，写进去看不出任何变化。
+ * 单选时这件事在界面上是可读的（钻石亮着、下面有关键帧条，而输入框改的就是当前帧那个
+ * 关键帧值），批量时既看不见谁有动画、也没有一个共同的"当前帧"——播放头只落在其中一部分
+ * 片段里。所以唯一诚实的做法是不改、并且说出来。
+ *
+ * **不适用的片段不计入 `total`**：它们不是这次操作的对象（见 `summarizeProperty`）。
+ */
+export function setClipsProperty(
+  timeline: Timeline,
+  clipIds: readonly ClipId[],
+  property: AnimatableProperty,
+  value: number,
+): BatchResult {
+  const ids = uniqueIds(clipIds).filter((id) => {
+    const found = findClip(timeline, id);
+    return found !== undefined && propertyApplies(found.clip, found.track, property);
+  });
+  if (ids.length === 0) {
+    return {
+      ...reject(timeline, `选中的片段都没有${PROPERTY_LABELS[property]}`),
+      done: 0,
+      total: 0,
+    };
+  }
+
+  const values = new Map<AnimatableProperty, number | undefined>([[property, value]]);
+  const tally = perClip(timeline, ids, (working, id) => {
+    const found = findClip(working, id);
+    if (found && (found.clip.keyframes?.[property]?.length ?? 0) > 0) {
+      return reject(working, `${PROPERTY_LABELS[property]}有动画，要单选才改得到动画值`);
+    }
+    return setClipProperties(working, id, values);
+  });
+  return tallyResult(timeline, tally, ids.length, "改");
+}
+
+/**
+ * 批量把若干属性恢复成缺省值（字段整个删掉）。检查器里每一组的「重置」按钮走这里。
+ *
+ * 和 `setClipsProperty` 差一条：**这里不跳过有动画的片段。** 重置的语义就是"把静态值
+ * 恢复成默认、不动关键帧"（单选那个按钮的提示原话），所以对一个有动画的属性写它的静态值
+ * 正是用户要的——那个值在关掉动画之后才生效（`clearKeyframes` 会往回烘，见它的注释）。
+ *
+ * 每个片段只重置**对它适用**的那几项，所以一次调用可以横跨画面轨和音频轨：视频轨上的
+ * 片段重置变换与调色、音频轨上的重置音量，各不相干。
+ */
+export function resetClipsProperties(
+  timeline: Timeline,
+  clipIds: readonly ClipId[],
+  properties: readonly AnimatableProperty[],
+): BatchResult {
+  const plans = new Map<ClipId, Map<AnimatableProperty, number | undefined>>();
+  for (const id of uniqueIds(clipIds)) {
+    const found = findClip(timeline, id);
+    if (!found) continue;
+    const values = new Map<AnimatableProperty, number | undefined>();
+    for (const property of properties) {
+      if (propertyApplies(found.clip, found.track, property)) values.set(property, undefined);
+    }
+    if (values.size > 0) plans.set(id, values);
+  }
+  if (plans.size === 0) {
+    return { ...reject(timeline, "选中的片段都没有这几项"), done: 0, total: 0 };
+  }
+
+  const targets = [...plans.keys()];
+  const tally = perClip(timeline, targets, (working, id) =>
+    setClipProperties(working, id, plans.get(id) ?? new Map()),
+  );
+  return tallyResult(timeline, tally, targets.length, "改");
 }
 
 /**

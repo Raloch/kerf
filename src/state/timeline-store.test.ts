@@ -790,3 +790,101 @@ describe("轨道开关", () => {
     expect(s().lastRejection).toMatch(/锁定/);
   });
 });
+
+describe("批量改属性", () => {
+  beforeEach(reset);
+
+  /** V1 上三个 100 帧片段（切两刀造出来），返回它们的 id。A1 也跟着变成三段。 */
+  function seeded(): string[] {
+    const s = () => useTimeline.getState();
+    s().addSource(source(300), 0);
+    s().select(null);
+    s().setPlayhead(100);
+    s().splitAtPlayhead();
+    s().setPlayhead(200);
+    s().splitAtPlayhead();
+    return (s().timeline().tracks.find((t) => t.id === "V1")?.clips ?? []).map((c) => c.id);
+  }
+
+  const opacityOf = (id: string): number | undefined =>
+    findClip(useTimeline.getState().timeline(), id)?.clip.transform?.opacity;
+
+  it("**一条撤销把三个片段一起退回去**", () => {
+    const ids = seeded();
+    const s = () => useTimeline.getState();
+    const before = s().history.past.length;
+    s().setClipsProperty(ids, "opacity", 0.5);
+    expect(s().history.past.length).toBe(before + 1);
+    expect(s().undoLabel()).toBe("批量改不透明度");
+    for (const id of ids) expect(opacityOf(id)).toBe(0.5);
+    s().undo();
+    for (const id of ids) expect(opacityOf(id)).toBeUndefined();
+  });
+
+  it("连续输入合并成一步，换属性断开", () => {
+    const ids = seeded();
+    const s = () => useTimeline.getState();
+    const before = s().history.past.length;
+    for (const v of [0.9, 0.8, 0.7]) s().setClipsProperty(ids, "opacity", v);
+    expect(s().history.past.length).toBe(before + 1);
+    s().setClipsProperty(ids, "scaleX", 2);
+    expect(s().history.past.length).toBe(before + 2);
+  });
+
+  it("**换一组片段必须断开合并**，否则 ⌘Z 一下退回去两组的改动", () => {
+    const ids = seeded();
+    const s = () => useTimeline.getState();
+    const before = s().history.past.length;
+    s().setClipsProperty([ids[0]!, ids[1]!], "opacity", 0.5);
+    s().setClipsProperty([ids[1]!, ids[2]!], "opacity", 0.25);
+    expect(s().history.past.length).toBe(before + 2);
+  });
+
+  it("**部分成功要在 apply 之后再报一次**（顺序反了就自己擦掉自己）", () => {
+    const ids = seeded();
+    const s = () => useTimeline.getState();
+    s().setTrackFlag("V1", "locked", true);
+    // 锁定那一下自己是成功的，会把 lastRejection 清空
+    expect(s().lastRejection).toBeNull();
+    s().setClipsProperty(ids, "opacity", 0.5);
+    // 整条轨都锁了 = 一个都没改成，走 reason
+    expect(s().lastRejection).toMatch(/锁定/);
+    for (const id of ids) expect(opacityOf(id)).toBeUndefined();
+  });
+
+  it("一部分改成了时，改动落地**并且**那句话说出来", () => {
+    const ids = seeded();
+    const s = () => useTimeline.getState();
+    // 把第三段挪到 V2 再锁 V2，于是同一次批量横跨锁定与未锁定
+    s().moveClip(ids[2]!, 0, { toTrack: "V2" });
+    s().setTrackFlag("V2", "locked", true);
+    s().setClipsProperty(ids, "opacity", 0.5);
+    expect(opacityOf(ids[0]!)).toBe(0.5);
+    expect(opacityOf(ids[2]!)).toBeUndefined();
+    expect(s().lastRejection).toMatch(/3 个片段里有 1 个没改/);
+  });
+
+  it("批量重置也是一条撤销", () => {
+    const ids = seeded();
+    const s = () => useTimeline.getState();
+    s().setClipsProperty(ids, "opacity", 0.5);
+    const before = s().history.past.length;
+    s().resetClipsProperties(ids, ["x", "y", "scaleX", "scaleY", "rotation", "opacity"]);
+    expect(s().history.past.length).toBe(before + 1);
+    expect(s().undoLabel()).toBe("批量重置");
+    for (const id of ids) expect(opacityOf(id)).toBeUndefined();
+    s().undo();
+    for (const id of ids) expect(opacityOf(id)).toBe(0.5);
+  });
+
+  it("值没变时不产生历史条目，也不弹提示", () => {
+    const ids = seeded();
+    const s = () => useTimeline.getState();
+    s().setClipsProperty(ids, "opacity", 0.5);
+    useTimeline.setState({ lastRejection: null });
+    const before = s().history.past.length;
+    s().setClipsProperty(ids, "opacity", 0.5);
+    expect(s().history.past.length).toBe(before);
+    expect(s().lastRejection).toBeNull();
+  });
+});

@@ -56,6 +56,9 @@ import {
   pasteClips,
   setClipPreservePitch,
   setClipSpeed,
+  setClipsProperty,
+  resetClipsProperties,
+  PROPERTY_LABELS,
   setTrackFlag,
   trackFlagLabel,
   setClipVolume,
@@ -193,6 +196,22 @@ export interface TimelineState {
   setClipColor: (clipId: ClipId, patch: ColorPatch) => void;
   /** 改片段音量。合并键带 clipId，理由同 `setClipTransform`。 */
   setClipVolume: (clipId: ClipId, volume: number) => void;
+  /**
+   * 批量改一个属性的静态值。**逐个做、做不成的报出来**，见 `setClipsProperty`。
+   *
+   * 合并键带上整组**和属性**：换一组片段、或者改另一个属性，都必须断开撤销合并
+   * （同 `moveClips` 和 `setClipTransform` 各自那半条理由）。
+   */
+  setClipsProperty: (
+    clipIds: readonly ClipId[],
+    property: AnimatableProperty,
+    value: number,
+  ) => void;
+  /** 批量把若干属性恢复成缺省。不合并——重置是一下按出来的，没有中间态。 */
+  resetClipsProperties: (
+    clipIds: readonly ClipId[],
+    properties: readonly AnimatableProperty[],
+  ) => void;
   /** 改片段速度。**片段长度会跟着变**（保内容），放不下会被拒。见 `setClipSpeed`。 */
   setClipSpeed: (clipId: ClipId, speed: Rational) => void;
   /** 开关变速保持音高。不改长度、不动速度，见 `setClipPreservePitch`。 */
@@ -302,8 +321,12 @@ export const useTimeline = create<TimelineState>((set, get) => {
    * `apply()` 在成功时会把 `lastRejection` 清空，所以"部分成功"那句话只能在它之后写
    * ——顺序反了就是自己把自己擦掉，而且不报错（见 `BatchResult.skippedReason`）。
    */
-  function applyBatch(result: BatchResult, label: string): void {
-    apply(result, label);
+  function applyBatch(
+    result: BatchResult,
+    label: string,
+    coalesceKey: string | null = null,
+  ): void {
+    apply(result, label, coalesceKey);
     if (result.changed && result.skippedReason !== undefined) {
       set({ lastRejection: result.skippedReason });
     }
@@ -512,6 +535,18 @@ export const useTimeline = create<TimelineState>((set, get) => {
 
     setClipVolume(clipId, volume) {
       apply(setClipVolume(get().timeline(), clipId, volume), "音量", `volume:${clipId}`);
+    },
+
+    setClipsProperty(clipIds, property, value) {
+      applyBatch(
+        setClipsProperty(get().timeline(), clipIds, property, value),
+        `批量改${PROPERTY_LABELS[property]}`,
+        `props:${[...clipIds].join(",")}:${property}`,
+      );
+    },
+
+    resetClipsProperties(clipIds, properties) {
+      applyBatch(resetClipsProperties(get().timeline(), clipIds, properties), "批量重置");
     },
 
     setClipSpeed(clipId, speed) {

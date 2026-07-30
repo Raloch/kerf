@@ -26,6 +26,12 @@
  * 它们在编辑侧完全同构（静态值 / 关键帧、单位换算、重置），所以共用
  * `PropertySection` + `PropertyRow`，只在"改哪个 action、读哪个静态字段"上分岔，
  * 而那两处收在 `GROUPS` 表里。见 PLAN.md 的 D17。
+ *
+ * ## 这个面板有两种模式
+ *
+ * 选中一个片段时是上面说的那套；选中多个时走 `BatchPanel`（同一张 `GROUPS` 表、同一套
+ * `PropertySpec`，但读的是一组片段的共同值、写的是批量入口）。两种模式的分岔只在
+ * `Inspector` 的第一个 if 里，属性名单和单位换算不复制第二份。见 PLAN.md 的 D45。
  */
 
 import { useRef, useState } from "react";
@@ -42,6 +48,7 @@ import {
   findLut,
   SPEED_RANGE,
   type Clip,
+  type ClipId,
   type ImageClip,
   type MediaClip,
   type TextClip,
@@ -57,7 +64,10 @@ import {
   PROPERTY_LABELS,
   PROPERTY_RANGES,
   isAudioProperty,
+  propertyApplies,
+  summarizeProperty,
   staticValueOf,
+  type PropertySummary,
   TRANSITION_LABELS,
   TRANSITION_ORDER,
   type ColorPatch,
@@ -180,31 +190,8 @@ export function Inspector() {
   const selectedClipIds = useTimeline((s) => s.selectedClipIds);
   const playhead = useTimeline((s) => s.playhead);
 
-  /**
-   * **多选时只报计数，不显示任何单片段属性。**
-   *
-   * 挑其中一个显示它的亮度 / 音量 / 速度，用户改一下会以为 N 个都变了——那是硬规则 10
-   * 的形状，而且改完看不出来（只有那一个变了）。所以这里指名说清楚：属性要单选才能改。
-   * "把这个变换应用到全部"是另一件事（它需要一个"哪些属性算共同的"的模型），不在这里。
-   */
   if (selectedClipIds.length > 1) {
-    return (
-      <>
-        <div className="insp-hd">
-          {/* 强调色留给选中，这里用中性灰：多选本身不是一个"更重要"的状态 */}
-          <span className="swatch" style={{ background: "var(--tx-faint)" }} />
-          <div style={{ minWidth: 0 }}>
-            <div className="n">已选中 {selectedClipIds.length} 个片段</div>
-            <div className="s">多选</div>
-          </div>
-        </div>
-        <p className="empty">
-          可以整组移动（拖其中任意一个）、删除 ⌫、复制 ⌘C、粘贴 ⌘V、做副本 ⌘D、
-          在播放头切分 ⌘K。单个片段的属性要<b>只选一个</b>才能改——显示其中一个的值，
-          改它却只作用到那一个，那和什么都没说一样。
-        </p>
-      </>
-    );
+    return <BatchPanel timeline={timeline} clipIds={selectedClipIds} />;
   }
 
   const sole = selectedClipIds.length === 1 ? selectedClipIds[0]! : null;
@@ -281,18 +268,15 @@ export function Inspector() {
           （见 `MediaClip.speed`），文字更没有，所以只给素材片段 */}
       {clip.kind === "media" && <SpeedSection clip={clip} timeline={timeline} />}
 
-      {/* 转场两种轨道都有（画面混像素、声音混增益）；变换和调色只有画面才有意义 */}
+      {/* 转场两种轨道都有（画面混像素、声音混增益） */}
       <TransitionSection clip={clip} track={track} timeline={timeline} />
-      {track.kind === "video" && (
-        <>
-          <PropertySection group="transform" clip={clip} playhead={playhead} />
-          <PropertySection group="color" clip={clip} playhead={playhead} />
-        </>
-      )}
-      {/* 音量只在**音频轨的素材片段**上出现：`planAudioJobs` 只混音频轨，
-          视频轨上的片段调了音量也不会有任何效果——那就是"能调但没用" */}
-      {track.kind === "audio" && clip.kind === "media" && (
-        <PropertySection group="audio" clip={clip} playhead={playhead} />
+      {/* 哪一组属性对这个片段有意义，判据在 `propertyApplies` 一处——多选面板问的是
+          同一个函数。两处各写一遍 `track.kind === "video"` 迟早漂，见那个函数的注释 */}
+      {(["transform", "color", "audio"] as const).map(
+        (group) =>
+          groupApplies(group, clip, track) && (
+            <PropertySection key={group} group={group} clip={clip} playhead={playhead} />
+          ),
       )}
     </>
   );
@@ -683,6 +667,182 @@ const GROUPS: Record<
     resetHint: "把音量恢复成 100%（不动关键帧）",
   },
 };
+
+/**
+ * 这一组属性对这个片段有没有意义。判据是 `propertyApplies`（同一个函数也在批量那边
+ * 用），这里只是"这一组里有任何一项适用"——同组的几项适用性一样，写成 `some` 是为了
+ * 不在界面上重述"哪些属性归哪一组"那份名单。
+ */
+function groupApplies(group: PropertyGroup, clip: Clip, track: Track): boolean {
+  return GROUPS[group].specs.some((spec) => propertyApplies(clip, track, spec.property));
+}
+
+// ---------------------------------------------------------------------------
+// 多选：批量改属性
+// ---------------------------------------------------------------------------
+
+/** 多选面板里一个片段连它所在的轨道。适用性判据要两个都看。 */
+interface FoundClip {
+  readonly clip: Clip;
+  readonly track: Track;
+}
+
+/**
+ * 多选时的属性面板。
+ *
+ * 三条纪律是"不许说假话"的三个形态：
+ *
+ * - **值不一致时显示"多个值"，不显示其中一个的值。** 挑一个显示，用户会以为 N 个都是
+ *   那个数——它连当前状态都说错了；而改一下之后 N 个真的一样了，于是这个谎**自己变成了
+ *   真的**，事后完全查不出来。
+ * - **有动画的片段要点名。** 批量写的是静态值，有动画时那个值不生效（理由见
+ *   `setClipsProperty`），所以改了看不出变化。说清楚"哪个属性、几个片段"，不是只灰一下。
+ * - **没有关键帧按钮。** 批量打点需要一个共同的"这一帧"，而播放头只落在其中一部分片段
+ *   里；给一个不知道打在哪儿的钻石比不给更坏。
+ *
+ * 不在这里的三样，理由各不相同：**速度**改的是长度、要判碰撞，属于"全体或拒绝"那一类
+ * （同 `moveClips`），得单独一刀；**LUT** 要选文件，"把这一张挂到全部"是另一个入口；
+ * **文字内容和转场**是逐片段的内容，不是"共同属性"。
+ */
+function BatchPanel({
+  timeline,
+  clipIds,
+}: {
+  readonly timeline: Timeline;
+  readonly clipIds: readonly ClipId[];
+}) {
+  const clips: readonly FoundClip[] = clipIds
+    .map((id) => findClip(timeline, id))
+    .filter((f): f is FoundClip => f !== undefined);
+
+  return (
+    <>
+      <div className="insp-hd">
+        {/* 强调色留给选中，这里用中性灰：多选本身不是一个"更重要"的状态 */}
+        <span className="swatch" style={{ background: "var(--tx-faint)" }} />
+        <div style={{ minWidth: 0 }}>
+          <div className="n">已选中 {clipIds.length} 个片段</div>
+          <div className="s">多选 · 填一个值会落到全部</div>
+        </div>
+      </div>
+      {(["transform", "color", "audio"] as const).map((group) => (
+        <BatchSection key={group} group={group} timeline={timeline} clipIds={clipIds} clips={clips} />
+      ))}
+      <p className="empty">
+        整组移动（拖其中任意一个）、删除 ⌫、复制 ⌘C、粘贴 ⌘V、做副本 ⌘D、在播放头切分 ⌘K。
+        速度、LUT、文字和转场要<b>只选一个</b>才能改。
+      </p>
+    </>
+  );
+}
+
+/**
+ * 批量的一节。**这一组对选中的片段都没意义时整节不出现**（同 D40 那条"摆一个不起作用的
+ * 控件同样是在说假话"）：全选了音频轨的片段就不该看见「变换」。
+ *
+ * 标题上带"N 个"是因为多选很容易横跨两种轨道——3 个画面 + 2 个配乐时，「变换 · 3 个」
+ * 和「音量 · 2 个」把"这一节作用到谁"直接说出来，否则用户只能猜。
+ */
+function BatchSection({
+  group,
+  timeline,
+  clipIds,
+  clips,
+}: {
+  readonly group: PropertyGroup;
+  readonly timeline: Timeline;
+  readonly clipIds: readonly ClipId[];
+  readonly clips: readonly FoundClip[];
+}) {
+  const resetClipsProperties = useTimeline((s) => s.resetClipsProperties);
+  const { title, specs, staticsOf, resetHint } = GROUPS[group];
+  const targets = clips.filter((f) => groupApplies(group, f.clip, f.track));
+  if (targets.length === 0) return null;
+
+  const rows = specs.map((spec) => ({
+    spec,
+    summary: summarizeProperty(timeline, clipIds, spec.property),
+  }));
+  // 有动画的那几项点名：属性名 + 个数。放成一行而不是每行一个角标，是因为第三列只有
+  // 20px（关键帧钻石的宽度），塞进去会把输入框挤成看不清数字的一条——那条注释在
+  // `.f.ctl` 上，实测踩过两次
+  const animated = rows.filter((r) => r.summary.animated > 0);
+
+  return (
+    <>
+      <div className="grp-title row">
+        <span>
+          {title} · {targets.length} 个
+        </span>
+        <button
+          type="button"
+          className="mini"
+          disabled={!targets.some((f) => staticsOf(f.clip) !== undefined)}
+          title={resetHint}
+          onClick={() => resetClipsProperties(clipIds, specs.map((spec) => spec.property))}
+        >
+          重置
+        </button>
+      </div>
+      <div className="fields">
+        {rows.map(({ spec, summary }) => (
+          <BatchRow key={spec.property} spec={spec} summary={summary} clipIds={clipIds} />
+        ))}
+      </div>
+      {animated.length > 0 && (
+        <p className="hint">
+          {animated.map((r) => `${r.spec.label} ${r.summary.animated} 个`).join("、")}
+          有动画，批量改不到——动画值要只选一个才改得动。
+        </p>
+      )}
+    </>
+  );
+}
+
+/**
+ * 批量的一行。值一致就显示那个值，不一致显示占位的"多个值"（`NumberField` 收 `null`）。
+ *
+ * 适用的片段**全都有动画**时这一行不可编辑：那时填什么都不会有任何效果，而一个能填、
+ * 填完没反应的框比灰掉的更坏。
+ */
+function BatchRow({
+  spec,
+  summary,
+  clipIds,
+}: {
+  readonly spec: PropertySpec;
+  readonly summary: PropertySummary;
+  readonly clipIds: readonly ClipId[];
+}) {
+  const setClipsProperty = useTimeline((s) => s.setClipsProperty);
+  const range = PROPERTY_RANGES[spec.property];
+  const mixed = summary.editable > 0 && summary.value === undefined;
+  const allAnimated = summary.editable === 0;
+
+  return (
+    <div className="f ctl">
+      <label>{spec.label}</label>
+      <NumberField
+        value={summary.value === undefined ? null : spec.toDisplay(summary.value)}
+        step={spec.step}
+        min={spec.toDisplay(range.min)}
+        max={spec.toDisplay(range.max)}
+        digits={spec.digits}
+        suffix={spec.suffix}
+        disabled={allAnimated}
+        placeholder={allAnimated ? "有动画" : mixed ? "多个值" : ""}
+        title={
+          allAnimated
+            ? `选中的片段都给${spec.label}打了关键帧，批量改不到动画值`
+            : mixed
+              ? `这 ${summary.editable} 个片段的${spec.label}不一样，填一个数会全部设成它`
+              : `${summary.editable} 个片段的${spec.label}`
+        }
+        onCommit={(display) => setClipsProperty(clipIds, spec.property, spec.fromDisplay(display))}
+      />
+    </div>
+  );
+}
 
 function PropertySection({
   group,
@@ -1313,6 +1473,13 @@ function TextSection({ clip }: { readonly clip: TextClip }) {
  * 显示上次输入的数字——动画值明明在变，输入框却纹丝不动，看起来像关键帧没生效。
  * 判据是"当前值还等不等于我们自己提交出去的那个"（`echo`）：相等说明这次
  * 重渲染是自己引起的，草稿留着；不等说明播放头动了或者被夹紧了，草稿作废。
+ *
+ * `value` 允许是 `null` = **没有一个可显示的值**（多选时几个片段的值不一致，见
+ * `BatchRow`）。那时框里空着、只有占位字。而 **`null` 不能让草稿作废**：它是一个
+ * 折叠过的读数（N 个片段折成一个数），"没有共同值"根本不是"我刚提交的那个值没生效"
+ * 的证据——有片段在锁定轨道上时它**永远**不会收敛。判据搞混的表现是多位数打不进去：
+ * 敲"7"提交 7%，几个片段仍然不一致于是草稿被判作废、框清空，接着敲的"0"就成了一个
+ * 全新的 0——用户想输 70，拿到的是 0，而且不报错。实测踩过（`v1: [0, 0]`）。
  */
 function NumberField({
   value,
@@ -1322,27 +1489,33 @@ function NumberField({
   digits,
   suffix,
   disabled,
+  placeholder,
   title,
   onCommit,
 }: {
-  readonly value: number;
+  readonly value: number | null;
   readonly step: number;
   readonly min: number;
   readonly max: number;
   readonly digits: number;
   readonly suffix: string;
   readonly disabled?: boolean | undefined;
+  readonly placeholder?: string | undefined;
   readonly title?: string | undefined;
   readonly onCommit: (value: number) => void;
 }) {
   const [draft, setDraft] = useState<string | null>(null);
   /** 上一次由这个框提交出去的显示值。渲染期比对，见上面的注释。 */
   const [echo, setEcho] = useState<number | null>(null);
-  if (draft !== null && echo !== null && round(value, digits) !== round(echo, digits)) {
+  // 两个 null 都是"没有可比的东西"，都必须让草稿留着：`echo === null` = 我们还没往外提交过
+  // 任何东西（输到一半的 `-` / 空串），`value === null` = 几个片段没有共同值。判据只在
+  // "提交过了，而外面那个数已经不是它"时才成立——那时是播放头动了或者被夹紧了
+  const stale = echo !== null && value !== null && round(value, digits) !== round(echo, digits);
+  if (draft !== null && stale) {
     setDraft(null);
     setEcho(null);
   }
-  const shown = draft ?? String(round(value, digits));
+  const shown = draft ?? (value === null ? "" : String(round(value, digits)));
 
   return (
     <span className="numw" title={title ?? ""}>
@@ -1353,6 +1526,7 @@ function NumberField({
         step={step}
         min={min}
         max={max}
+        placeholder={placeholder ?? ""}
         disabled={disabled ?? false}
         onChange={(e) => {
           const text = e.target.value;

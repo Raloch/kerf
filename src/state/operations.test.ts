@@ -46,6 +46,10 @@ import {
   setClipPreservePitch,
   setClipSpeed,
   setClipVolume,
+  setClipsProperty,
+  resetClipsProperties,
+  propertyApplies,
+  summarizeProperty,
   staticValueOf,
   setClipLut,
   setClipTransform,
@@ -2590,6 +2594,210 @@ describe("多选：批量复制 / 粘贴 / 副本", () => {
     for (const id of r.clipIds!) {
       expect("transitionIn" in findClip(r.timeline, id)!.clip).toBe(false);
     }
+  });
+});
+
+describe("多选：批量改属性", () => {
+  /** V1 上三个画面片段，A1 上一个配乐片段。 */
+  const base = () =>
+    timeline([
+      {
+        id: "V1",
+        kind: "video",
+        clips: [clip("a", 0, 100), clip("b", 100, 200), clip("c", 200, 300)],
+      },
+      { id: "A1", kind: "audio", clips: [clip("m", 0, 300)] },
+    ]);
+
+  const opacityOf = (t: Timeline, id: string): number | undefined =>
+    findClip(t, id)?.clip.transform?.opacity;
+
+  describe("适用性判据只有一处", () => {
+    it("变换和调色只作用于画面轨，音量只作用于音频轨的素材片段", () => {
+      const t = base();
+      const v = findClip(t, "a")!;
+      const a = findClip(t, "m")!;
+      expect(propertyApplies(v.clip, v.track, "opacity")).toBe(true);
+      expect(propertyApplies(v.clip, v.track, "brightness")).toBe(true);
+      // 视频轨上调音量不会进任何一条增益链（`planAudioJobs` 只混音频轨）
+      expect(propertyApplies(v.clip, v.track, "volume")).toBe(false);
+      expect(propertyApplies(a.clip, a.track, "volume")).toBe(true);
+      // 音频轨上的片段没有画面，变换和调色改了不生效
+      expect(propertyApplies(a.clip, a.track, "opacity")).toBe(false);
+    });
+
+    it("文字片段有变换、没有音量", () => {
+      const t = timeline([{ id: "T1", kind: "video", clips: [textClip("t", 0, 100)] }]);
+      const f = findClip(t, "t")!;
+      expect(propertyApplies(f.clip, f.track, "opacity")).toBe(true);
+      expect(propertyApplies(f.clip, f.track, "volume")).toBe(false);
+    });
+  });
+
+  describe("共同读数", () => {
+    it("都没设过时共同值是缺省值", () => {
+      const s = summarizeProperty(base(), ["a", "b", "c"], "opacity");
+      expect(s.editable).toBe(3);
+      expect(s.animated).toBe(0);
+      expect(s.value).toBe(1);
+    });
+
+    it("**值不一致时给 undefined，界面显示「多个值」**", () => {
+      const t = setClipTransform(base(), "a", { opacity: 0.5 }).timeline;
+      const s = summarizeProperty(t, ["a", "b"], "opacity");
+      expect(s.editable).toBe(2);
+      expect(s.value).toBeUndefined();
+    });
+
+    it("**有动画的片段既不参与读数也不参与计数**", () => {
+      // a 有动画且静态值和别人不同——算进共同值的话会读出 undefined（"多个值"），
+      // 而那个数字用户改不出来：批量写的是静态值，a 的画面仍由关键帧决定
+      let t = setClipTransform(base(), "a", { opacity: 0.25 }).timeline;
+      t = setKeyframe(t, "a", "opacity", 0, 0.9).timeline;
+      const s = summarizeProperty(t, ["a", "b", "c"], "opacity");
+      expect(s.animated).toBe(1);
+      expect(s.editable).toBe(2);
+      expect(s.value).toBe(1); // b 和 c 的共同值，a 的 0.25 没掺进来
+    });
+
+    it("不适用的片段一个数都不占", () => {
+      const s = summarizeProperty(base(), ["a", "b", "c", "m"], "volume");
+      expect(s.editable).toBe(1); // 只有 A1 上的 m
+      expect(s.animated).toBe(0);
+    });
+  });
+
+  describe("批量写入", () => {
+    it("一次改多个，逐个落地", () => {
+      const r = setClipsProperty(base(), ["a", "b", "c"], "opacity", 0.5);
+      expect(r.changed).toBe(true);
+      expect(r.done).toBe(3);
+      expect(r.total).toBe(3);
+      expect(r.skippedReason).toBeUndefined();
+      for (const id of ["a", "b", "c"]) expect(opacityOf(r.timeline, id)).toBe(0.5);
+    });
+
+    it("锁定轨道上的跳过并报出来，其余照改", () => {
+      const t = timeline([
+        { id: "V1", kind: "video", clips: [clip("a", 0, 100)] },
+        { id: "V2", kind: "video", locked: true, clips: [clip("c", 200, 300)] },
+      ]);
+      const r = setClipsProperty(t, ["a", "c"], "opacity", 0.5);
+      expect(r.changed).toBe(true);
+      expect(r.done).toBe(1);
+      expect(r.total).toBe(2);
+      expect(r.reason).toBeUndefined();
+      expect(r.skippedReason).toMatch(/2 个片段里有 1 个没改/);
+      expect(r.skippedReason).toMatch(/锁定/);
+      expect(opacityOf(r.timeline, "a")).toBe(0.5);
+      expect(opacityOf(r.timeline, "c")).toBeUndefined();
+    });
+
+    it("**有动画的片段跳过并报出来**，静态值一个字都不动", () => {
+      const t = setKeyframe(base(), "a", "opacity", 0, 0.9).timeline;
+      const r = setClipsProperty(t, ["a", "b"], "opacity", 0.5);
+      expect(r.changed).toBe(true);
+      expect(r.done).toBe(1);
+      expect(r.skippedReason).toMatch(/有动画/);
+      expect(opacityOf(r.timeline, "a")).toBeUndefined();
+      expect(opacityOf(r.timeline, "b")).toBe(0.5);
+    });
+
+    it("不适用的片段不计入 total", () => {
+      // 选中三个画面片段 + 一个配乐，改音量只作用到配乐那一个
+      const r = setClipsProperty(base(), ["a", "b", "c", "m"], "volume", 0.5);
+      expect(r.changed).toBe(true);
+      expect(r.done).toBe(1);
+      expect(r.total).toBe(1); // 不是 4——那三个不是这次操作的对象
+      expect(r.skippedReason).toBeUndefined();
+      expect(media(findClip(r.timeline, "m")?.clip).volume).toBe(0.5);
+    });
+
+    it("一个都不适用时整批拒绝", () => {
+      const r = setClipsProperty(base(), ["a", "b"], "volume", 0.5);
+      expect(r.changed).toBe(false);
+      expect(r.total).toBe(0);
+      expect(r.reason).toMatch(/都没有音量/);
+    });
+
+    it("**本来就是那个值的算「值没变」，不算「没改」**", () => {
+      // 算进 skipped 的话这句话会变成"3 个片段里有 2 个没改"，而那两个本来就是 0.5
+      let t = setClipTransform(base(), "a", { opacity: 0.5 }).timeline;
+      t = setClipTransform(t, "b", { opacity: 0.5 }).timeline;
+      const r = setClipsProperty(t, ["a", "b", "c"], "opacity", 0.5);
+      expect(r.changed).toBe(true);
+      expect(r.done).toBe(1);
+      expect(r.total).toBe(3);
+      expect(r.skippedReason).toBeUndefined();
+    });
+
+    it("全都已经是那个值 = 第三种结果：没变且不给 reason", () => {
+      const t = setClipsProperty(base(), ["a", "b"], "opacity", 0.5).timeline;
+      const again = setClipsProperty(t, ["a", "b"], "opacity", 0.5);
+      expect(again.changed).toBe(false);
+      // 给了 reason 的话滑块拖到边界会一直闪红字（见 EditResult.reason）
+      expect(again.reason).toBeUndefined();
+      expect(again.done).toBe(0);
+    });
+
+    it("NaN 一路拒绝（底层校验没被绕过）", () => {
+      const r = setClipsProperty(base(), ["a", "b"], "opacity", Number.NaN);
+      expect(r.changed).toBe(false);
+      expect(r.reason).toMatch(/有限数/);
+    });
+
+    it("改回缺省值要把字段整个删掉（归一化沿用底层）", () => {
+      const t = setClipsProperty(base(), ["a", "b"], "opacity", 0.5).timeline;
+      const back = setClipsProperty(t, ["a", "b"], "opacity", 1);
+      expect(back.changed).toBe(true);
+      expect(findClip(back.timeline, "a")?.clip.transform).toBeUndefined();
+    });
+
+    it("音量走的是标量那一支", () => {
+      const t = timeline([{ id: "A1", kind: "audio", clips: [clip("m", 0, 100), clip("n", 100, 200)] }]);
+      const r = setClipsProperty(t, ["m", "n"], "volume", 0.25);
+      expect(r.done).toBe(2);
+      expect(media(findClip(r.timeline, "m")?.clip).volume).toBe(0.25);
+      expect(media(findClip(r.timeline, "n")?.clip).volume).toBe(0.25);
+    });
+  });
+
+  describe("批量重置", () => {
+    it("把整组恢复成缺省，字段整个删掉", () => {
+      let t = setClipsProperty(base(), ["a", "b"], "opacity", 0.5).timeline;
+      t = setClipsProperty(t, ["a", "b"], "scaleX", 2).timeline;
+      const r = resetClipsProperties(t, ["a", "b"], ["x", "y", "scaleX", "scaleY", "rotation", "opacity"]);
+      expect(r.changed).toBe(true);
+      expect(r.done).toBe(2);
+      expect(findClip(r.timeline, "a")?.clip.transform).toBeUndefined();
+      expect(findClip(r.timeline, "b")?.clip.transform).toBeUndefined();
+    });
+
+    it("**不跳过有动画的片段**（与批量改值刻意相反）", () => {
+      // 重置的语义就是"把静态值恢复成默认、不动关键帧"，那个值在关掉动画之后才生效
+      let t = setClipTransform(base(), "a", { opacity: 0.25 }).timeline;
+      t = setKeyframe(t, "a", "opacity", 0, 0.9).timeline;
+      const r = resetClipsProperties(t, ["a"], ["opacity"]);
+      expect(r.changed).toBe(true);
+      expect(r.done).toBe(1);
+      expect(findClip(r.timeline, "a")?.clip.transform).toBeUndefined();
+      expect(findClip(r.timeline, "a")?.clip.keyframes?.opacity).toHaveLength(1);
+    });
+
+    it("一次调用可以横跨两种轨道，各自只重置适用的那几项", () => {
+      let t = setClipsProperty(base(), ["a"], "opacity", 0.5).timeline;
+      t = setClipsProperty(t, ["m"], "volume", 0.25).timeline;
+      const r = resetClipsProperties(t, ["a", "m"], ["opacity", "volume"]);
+      expect(r.done).toBe(2);
+      expect(findClip(r.timeline, "a")?.clip.transform).toBeUndefined();
+      expect(media(findClip(r.timeline, "m")?.clip).volume).toBeUndefined();
+    });
+
+    it("一个都不适用时拒绝", () => {
+      const t = timeline([{ id: "A1", kind: "audio", clips: [clip("m", 0, 100)] }]);
+      expect(resetClipsProperties(t, ["m"], ["opacity"]).changed).toBe(false);
+      expect(resetClipsProperties(t, [], ["volume"]).reason).toMatch(/都没有/);
+    });
   });
 });
 
