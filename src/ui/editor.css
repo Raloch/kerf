@@ -260,6 +260,15 @@
   padding: 4px 8px;
   white-space: nowrap;
 }
+/*
+  变速读数（J/K/L）。刻意比别的 chip 显眼：它是一个**此刻正在生效的状态**，
+  而旁边那些是静态读数。同 `.frz` 用同一族琥珀色——两者都在说"这里有个非常态"。
+*/
+.ed .chip.sh {
+  color: #f0c05a;
+  border-color: rgba(240, 192, 90, 0.4);
+  background: rgba(240, 192, 90, 0.1);
+}
 .ed .chip-btn {
   font: inherit;
   font-family: var(--mono);

@@ -11,16 +11,23 @@
  * 两者**共用** `compose()` 和 `clipAt()`：画面构成、图层顺序、缩放留边完全一致。
  * 预览这边允许 seek 不帧精确（差一帧肉眼无感），但导出绝不允许。
  *
- * 播放时不逐帧 seek——每帧 seek 会卡死。做法是让 video 自己以 1× 播放，
- * rAF 只负责采样它当前的画面，并在偏离时间轴超过阈值时纠正一次。
+ * 播放时不逐帧 seek——每帧 seek 会卡死。做法是让 video 自己走，rAF 只负责采样它
+ * 当前的画面，并在偏离时间轴超过阈值时纠正一次。**"自己走多快"由 `playbackRate` 说**
+ * （`shuttle.ts` 的 `elementPlaybackRate`：变速倍率 × 片段速度 × 定格与否）；那个值
+ * 为 0 的元素——倒放、定格——才回到逐帧 seek，而那时容差必须让路，见 `renderLive`。
  *
- * **音频**：M1 预览静音。V1 与 A1 虽然常来自同一文件，但用户可以把 A1 单独
- * 拖走或裁短，此时跟着 video 走的声音就是错的——宁可没有声音，也不要给
- * 用户一个"听起来对但实际不对"的预览。多轨音频预览要等独立的音频引擎。
+ * **音频不在这一层**：预览的声音由 `audio-engine.ts` 按 EDL 的音频轨独立排期（D26），
+ * 播的就是导出会写进成片的那份 PCM。所以这里的 video 元素**一律静音**，而理由不是
+ * "还没做"：它们自己的声音是一条**不受 EDL 控制的第二音源**（V1 与 A1 常来自同一
+ * 文件，但用户可以把 A1 单独拖走、裁短、调音量），放出来就是"听起来对但实际不对"，
+ * 而且会和音频引擎那份叠在一起。
  */
 
 import type { AvSource, ImageSource, Timeline } from "../edl/types";
+import { clipSpeed, isFrozen } from "../edl/types";
 import { layerLooks, microsToSeconds, visibleVideoClips, type VisibleClip } from "../edl/sampling";
+import { elementPlaybackRate } from "./shuttle";
+import { toNumber } from "../time/rational";
 import { createCompositor, type CompositorBackend } from "../compose/backend";
 import type { ComposeLayer, ComposeSourceLayer, Compositor } from "../compose/compositor";
 import { rasterizeText } from "../compose/text-raster";
@@ -46,6 +53,14 @@ interface ActiveSource {
   readonly source: AvSource;
   readonly clipId: string;
   readonly seekSeconds: number;
+  /**
+   * 这个片段的速度倍数（D39）与定格与否（D48）。
+   *
+   * 只带这两个**片段自己的事实**，不在这里乘变速倍率——倍率是每次 `renderLive` 传进来的，
+   * 而 `layersFor` 也服务于暂停态的 `renderFrame`。相乘收在 `elementPlaybackRate` 一处。
+   */
+  readonly sourceSpeed: number;
+  readonly frozen: boolean;
 }
 
 interface SourceHandle {
@@ -55,6 +70,17 @@ interface SourceHandle {
   ready: boolean;
   /** 原片 URL 是这里创建的，要负责 revoke；代理 URL 归 ProxyManager，不能碰。 */
   readonly ownsUrl: boolean;
+  /**
+   * 上一次**要求**它停在哪（秒）。判"这一帧要不要再 seek 一次"用的是这个，
+   * 不是 `video.currentTime`。
+   *
+   * 后者 seek 完会吸附到最近的关键帧/帧边界，和要求值差着一点，于是"要求没变"
+   * 永远判不出来——表现是定格片段每帧都发一次 seek（画面对，但白解一遍）。
+   * 反过来，这个字段**必须由每一处写 `currentTime` 的地方一起更新**（`seekElement`
+   * 是唯一入口）：漏更新会让它变成陈旧的第二真值来源，具体形态是"scrub 到别处再
+   * 按播放，画面停在 scrub 的位置不回来"（要求值恰好等于陈旧记录时那一次 seek 被跳过）。
+   */
+  wanted: number;
 }
 
 export interface PreviewEngine {
@@ -81,10 +107,16 @@ export interface PreviewEngine {
   useProxy(sourceId: string, proxyUrl: string): void;
   /** 渲染指定帧（暂停态用）。会等待 seek 完成，因此是异步的。 */
   renderFrame(timeline: Timeline, frame: number): Promise<void>;
-  /** 播放态每帧调用：只采样 video 当前画面，不等待 seek。 */
-  renderLive(timeline: Timeline, frame: number): void;
-  /** 进入播放：把相关 video 对齐到该帧并开始走。 */
-  startPlayback(timeline: Timeline, frame: number): Promise<void>;
+  /**
+   * 播放态每帧调用：只采样 video 当前画面，不等待 seek。
+   *
+   * `rate` 是变速倍率（有符号，0 是暂停，见 `shuttle.ts`）。**每帧传进来而不是
+   * 记在引擎上**：它的真值来源是 `Preview.tsx` 的那个状态，记一份在这里就是第二个
+   * 真值来源，而不同步的表现是"松开 L 之后画面还在 4× 跑"。
+   */
+  renderLive(timeline: Timeline, frame: number, rate: number): void;
+  /** 进入播放：把相关 video 对齐到该帧、按倍率开始走。 */
+  startPlayback(timeline: Timeline, frame: number, rate: number): Promise<void>;
   stopPlayback(): void;
   dispose(): void;
 }
@@ -165,7 +197,9 @@ export async function createPreviewEngine(
     const proxyUrl = proxies.get(source.id);
     const url = proxyUrl ?? URL.createObjectURL(source.file);
     video.src = url;
-    video.muted = true; // 见文件头注释：M1 预览刻意静音
+    // **一律静音**，而且这条不随"预览已经会出声了"而改变：声音归音频引擎按 EDL 排期，
+    // 元素自己的声音是一条不受 EDL 控制的第二音源，见文件头
+    video.muted = true;
     video.playsInline = true;
     video.preload = "auto";
     const handle: SourceHandle = {
@@ -174,6 +208,9 @@ export async function createPreviewEngine(
       url,
       ready: false,
       ownsUrl: proxyUrl === undefined,
+      // 新元素还没被要求停在任何地方。用 NaN 而不是 0：0 是一个**合法的**要求值
+      // （每个片段的第一帧），记成 0 会让"从头播"的第一次 seek 被判成"要求没变"而跳过
+      wanted: Number.NaN,
     };
     video.addEventListener("loadeddata", () => {
       handle.ready = true;
@@ -213,9 +250,20 @@ export async function createPreviewEngine(
     });
   }
 
+  /**
+   * **唯一一处写 `video.currentTime`。** 顺带记下要求值，见 `SourceHandle.wanted`。
+   */
+  function seekElement(handle: SourceHandle, seconds: number): void {
+    handle.wanted = seconds;
+    handle.video.currentTime = seconds;
+  }
+
   /** 精确 seek：等 seeked 事件，超时后也返回（宁可画旧帧也不要卡住 UI）。 */
-  function seekTo(video: HTMLVideoElement, seconds: number): Promise<void> {
+  function seekTo(handle: SourceHandle, seconds: number): Promise<void> {
+    const video = handle.video;
     if (Math.abs(video.currentTime - seconds) < 1e-4 && video.readyState >= 2) {
+      // 已经停在那儿了，但要求值仍要记上：不记的话下一次同样的要求会被判成"变了"
+      handle.wanted = seconds;
       return Promise.resolve();
     }
     return new Promise((resolve) => {
@@ -230,7 +278,7 @@ export async function createPreviewEngine(
       video.addEventListener("seeked", finish, { once: true });
       // 素材还在加载时 seek 可能不触发 seeked，兜个底
       const timer = setTimeout(finish, 400);
-      video.currentTime = seconds;
+      seekElement(handle, seconds);
     });
   }
 
@@ -310,6 +358,9 @@ export async function createPreviewEngine(
         seekSeconds: microsToSeconds(
           visible.sourceMicros + Math.round(frameDurationMicros(source.fps) / 2),
         ),
+        // 元素该走多快的两个片段侧因子，相乘在 `elementPlaybackRate`
+        sourceSpeed: toNumber(clipSpeed(clip)),
+        frozen: isFrozen(clip),
       });
 
       // 用 readyState 而不是缓存的标志位：事件可能在我们订阅之前就已触发过
@@ -382,7 +433,7 @@ export async function createPreviewEngine(
         ...active.map(async ({ source, clipId, seekSeconds }) => {
           const handle = handleFor(source, clipId);
           await ensureLoaded(handle.video);
-          await seekTo(handle.video, seekSeconds);
+          await seekTo(handle, seekSeconds);
         }),
       ]);
       // await 期间引擎可能已经随 Editor 卸载销毁（回首页/进自检），见 `disposed`
@@ -392,19 +443,42 @@ export async function createPreviewEngine(
       await draw(fresh.layers.length > 0 ? fresh.layers : layers);
     },
 
-    renderLive(timeline, frame) {
+    renderLive(timeline, frame, rate) {
       const { layers, active } = layersFor(timeline, frame);
 
-      // 漂移纠正：video 自己走，偏差超过阈值才拉回来，避免每帧 seek。
-      // 容差按**源片**帧长算：慢速素材放到高帧率时间轴上时，3 个时间轴帧
-      // 可能还不到源片的 1 帧，按时间轴帧算会导致每帧都判超差、每帧都 seek
-      for (const { source, clipId, seekSeconds } of active) {
+      for (const { source, clipId, seekSeconds, sourceSpeed, frozen } of active) {
         const handle = handleFor(source, clipId);
         if (handle.video.readyState < 2) continue;
+        const elementRate = elementPlaybackRate(rate, sourceSpeed, frozen);
+        // 别每帧写同一个值（`playbackRate` 的赋值会派发 ratechange）
+        if (handle.video.playbackRate !== elementRate) handle.video.playbackRate = elementRate;
+
+        if (elementRate === 0) {
+          /*
+            元素自己不走：倒放（没有负的 `playbackRate`）或定格（D48）。
+
+            **这时容差必须让路。** 容差挡的是"它正自己走过去，别打断它"，而一个停住的
+            元素永远走不到新位置——留着容差的表现是倒放时画面每 3 个源片帧才动一次
+            （十来 fps 的顿，而用户会以为是素材解不动）。判据用 `wanted` 而不是
+            `currentTime`，见那个字段的注释；于是**定格片段这里恰好一次 seek 都不发**
+            （要求值恒定），倒放则是逐帧一次，正是各自要的。
+          */
+          if (!handle.video.paused) handle.video.pause();
+          if (handle.wanted !== seekSeconds) seekElement(handle, seekSeconds);
+          continue;
+        }
+
+        // 该走却停着：从倒放/定格切回正放时会遇到（那时不重走 `startPlayback`）。
+        // 漏掉这一句不会报错，表现是画面靠漂移纠正一顿一顿地挪
+        if (handle.video.paused) void handle.video.play().catch(() => undefined);
+
+        // 漂移纠正：video 自己走，偏差超过阈值才拉回来，避免每帧 seek。
+        // 容差按**源片**帧长算：慢速素材放到高帧率时间轴上时，3 个时间轴帧
+        // 可能还不到源片的 1 帧，按时间轴帧算会导致每帧都判超差、每帧都 seek
         const tolerance =
           (DRIFT_TOLERANCE_FRAMES * frameDurationMicros(source.fps)) / MICROS_PER_SECOND;
         if (Math.abs(handle.video.currentTime - seekSeconds) > tolerance) {
-          handle.video.currentTime = seekSeconds;
+          seekElement(handle, seekSeconds);
         }
       }
       // 播放态不能 await（rAF 回调是同步的），丢了上下文就先画不出来，
@@ -412,15 +486,21 @@ export async function createPreviewEngine(
       if (!compositor.isContextLost()) compositor.composeFrame(layers);
     },
 
-    async startPlayback(timeline, frame) {
+    async startPlayback(timeline, frame, rate) {
       playing = true;
       const { active } = layersFor(timeline, frame);
       await Promise.all(
-        active.map(async ({ source, clipId, seekSeconds }) => {
+        active.map(async ({ source, clipId, seekSeconds, sourceSpeed, frozen }) => {
           const handle = handleFor(source, clipId);
           await ensureLoaded(handle.video);
-          await seekTo(handle.video, seekSeconds);
+          await seekTo(handle, seekSeconds);
           if (!playing) return;
+          const elementRate = elementPlaybackRate(rate, sourceSpeed, frozen);
+          handle.video.playbackRate = elementRate;
+          // 倒放和定格的元素不用 play()：它一帧都不该自己走，位置由 renderLive 逐帧给。
+          // 硬叫它 play() 也不算错（0 倍率等于停着），但那会在 Safari 上多一个
+          // "playing 但不动"的元素，而 `paused` 是 renderLive 那条自愈判据的输入
+          if (elementRate === 0) return;
           // play() 在某些情况下会 reject（例如元素已被移除），静音播放不受自动播放策略限制
           await handle.video.play().catch(() => undefined);
         }),
