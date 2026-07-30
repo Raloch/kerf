@@ -25,7 +25,7 @@ import { TRANSITION_LABELS } from "../state/operations";
 import { framesToTimecode, secondsToFrameCount } from "../time/timebase";
 import { toNumber } from "../time/rational";
 import { useTimeline } from "../state/timeline-store";
-import { ghostForTrack, useClipDrag, type ClipDragApi, type Ghost } from "./use-clip-drag";
+import { ghostsForTrack, useClipDrag, type ClipDragApi, type Ghost } from "./use-clip-drag";
 import { buildStrip, cachedStrip, drawStrip } from "../media/thumbnails";
 import { decodeImage, decodedImage } from "../compose/image-store";
 import {
@@ -76,7 +76,7 @@ const TEXT_CLIP_SECONDS = 3;
 export function TimelinePanel() {
   const timeline = useTimeline((s) => s.timeline());
   const playhead = useTimeline((s) => s.playhead);
-  const selectedClipId = useTimeline((s) => s.selectedClipId);
+  const selectedClipIds = useTimeline((s) => s.selectedClipIds);
   const snapEnabled = useTimeline((s) => s.snapEnabled);
   const setPlayhead = useTimeline((s) => s.setPlayhead);
   const select = useTimeline((s) => s.select);
@@ -159,8 +159,12 @@ export function TimelinePanel() {
         <button
           type="button"
           className="ib sm"
-          title="删除选中片段 ⌫"
-          disabled={!selectedClipId}
+          title={
+            selectedClipIds.length > 1
+              ? `删除选中的 ${selectedClipIds.length} 个片段 ⌫`
+              : "删除选中片段 ⌫"
+          }
+          disabled={selectedClipIds.length === 0}
           onClick={() => removeSelected(false)}
         >
           <IconTrash />
@@ -242,7 +246,7 @@ export function TimelinePanel() {
                 track={track}
                 timeline={timeline}
                 pxPerFrame={pxPerFrame}
-                selectedClipId={selectedClipId}
+                selectedClipIds={selectedClipIds}
                 onSelect={select}
                 drag={drag}
                 proxyUrls={proxyUrls}
@@ -309,7 +313,7 @@ function TrackRow({
   track,
   timeline,
   pxPerFrame,
-  selectedClipId,
+  selectedClipIds,
   onSelect,
   drag,
   proxyUrls,
@@ -317,16 +321,18 @@ function TrackRow({
   track: Track;
   timeline: Tl;
   pxPerFrame: number;
-  selectedClipId: string | null;
+  selectedClipIds: readonly string[];
   onSelect: (id: string) => void;
   drag: ClipDragApi;
   proxyUrls: Record<string, string>;
 }) {
   const isAudio = track.kind === "audio";
-  const ghost = ghostForTrack(drag.ghost, track.id);
-  // 关键帧轨只给**这条轨上被选中的那个片段**展开：全都展开的话，一条有动画的
-  // 字幕轨能顶出十几行，而用户此刻只在编辑一个片段
-  const selected = track.clips.find((c) => c.id === selectedClipId);
+  const ghosts = ghostsForTrack(drag.ghosts, track.id);
+  // 关键帧轨只给**这条轨上被选中的那个片段**展开，而且**只在恰好选中一个时**：全都展开
+  // 的话一条有动画的字幕轨能顶出十几行；多选时展开谁的更是没有答案（两个片段可以在
+  // 同一个偏移上各有一个点，叠在一行读不出来）。同 `soleSelectedClipId` 那条判据
+  const sole = selectedClipIds.length === 1 ? selectedClipIds[0] : null;
+  const selected = track.clips.find((c) => c.id === sole);
   const animatedProps = selected ? animatedPropertiesOf(selected) : [];
   const [lanesOpen, setLanesOpen] = useState(true);
 
@@ -384,7 +390,7 @@ function TrackRow({
             kind={track.kind}
             trackId={track.id}
             pxPerFrame={pxPerFrame}
-            selected={clip.id === selectedClipId}
+            selected={selectedClipIds.includes(clip.id)}
             onSelect={onSelect}
             drag={drag}
             proxyUrl={clip.kind === "media" ? proxyUrls[clip.sourceId] : undefined}
@@ -404,7 +410,9 @@ function TrackRow({
             }}
           />
         ))}
-        {ghost && <GhostView ghost={ghost} pxPerFrame={pxPerFrame} />}
+        {ghosts.map((g) => (
+          <GhostView key={g.clipId} ghost={g} pxPerFrame={pxPerFrame} />
+        ))}
       </div>
     </div>
     {selected && lanesOpen && (

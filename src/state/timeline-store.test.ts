@@ -66,7 +66,7 @@ describe("导入素材", () => {
     expect(t.tracks.find((x) => x.id === "V1")!.clips).toHaveLength(1);
     expect(t.tracks.find((x) => x.id === "A1")!.clips).toHaveLength(1);
     expect(t.tracks.find((x) => x.id === "V2")!.clips).toHaveLength(0);
-    expect(s.selectedClipId).toBe("src1-v");
+    expect(s.selectedClipIds).toEqual(["src1-v"]);
     expect(t.fps).toEqual(FPS.ndf2997);
   });
 
@@ -255,7 +255,7 @@ describe("删除", () => {
     s().addSource(source(300));
     s().select("src1-v");
     s().removeSelected();
-    expect(s().selectedClipId).toBeNull();
+    expect(s().selectedClipIds).toEqual([]);
     expect(s().timeline().tracks.find((t) => t.id === "V1")!.clips).toHaveLength(0);
   });
 
@@ -281,12 +281,12 @@ describe("撤销的连带处理", () => {
 
     const rightId = s().timeline().tracks.find((t) => t.id === "V1")!.clips[1]!.id;
     s().select(rightId);
-    expect(s().selectedClipId).toBe(rightId);
+    expect(s().selectedClipIds).toEqual([rightId]);
 
     // 撤销切分 → 右半段不再存在 → 选中必须被清掉，否则检查器会渲染空引用
     s().undo();
     expect(findClip(s().timeline(), rightId)).toBeUndefined();
-    expect(s().selectedClipId).toBeNull();
+    expect(s().selectedClipIds).toEqual([]);
   });
 
   it("撤销后播放头不超出新时长", () => {
@@ -414,7 +414,7 @@ describe("新建文字片段", () => {
   it("落在 T1 并自动选中，接着就能改内容", () => {
     useTimeline.getState().addTextClip({ timelineIn: 0, durationFrames: 60, text: "标题" });
     const s = useTimeline.getState();
-    const created = s.selectedClipId!;
+    const created = s.soleSelectedClipId()!;
     expect(findClip(s.timeline(), created)!.track.id).toBe("T1");
 
     useTimeline.getState().setTextContent(created, "改过的标题");
@@ -425,17 +425,17 @@ describe("新建文字片段", () => {
   it("失败时不改选中", () => {
     useTimeline.getState().select("src1-v");
     useTimeline.getState().addTextClip({ timelineIn: 0, durationFrames: 0, text: "x" });
-    expect(useTimeline.getState().selectedClipId).toBe("src1-v");
+    expect(useTimeline.getState().selectedClipIds).toEqual(["src1-v"]);
     expect(useTimeline.getState().lastRejection).toContain("1 帧");
   });
 
   it("撤销能把新建的文字片段收回去", () => {
     useTimeline.getState().addTextClip({ timelineIn: 0, durationFrames: 60, text: "标题" });
-    const created = useTimeline.getState().selectedClipId!;
+    const created = useTimeline.getState().soleSelectedClipId()!;
     useTimeline.getState().undo();
     expect(findClip(useTimeline.getState().timeline(), created)).toBeUndefined();
     // 撤销后选中不能指向已经不存在的片段
-    expect(useTimeline.getState().selectedClipId).toBeNull();
+    expect(useTimeline.getState().selectedClipIds).toEqual([]);
   });
 });
 
@@ -460,7 +460,7 @@ describe("剪贴板", () => {
     const before = s.undoLabel();
     s.select("src1-v");
     useTimeline.getState().copySelected();
-    expect(useTimeline.getState().clipboard?.clip.id).toBe("src1-v");
+    expect(useTimeline.getState().clipboard[0]?.clip.id).toBe("src1-v");
     // 进了撤销栈的话用户要按两次 ⌘Z 才回到上一次真编辑
     expect(useTimeline.getState().undoLabel()).toBe(before);
   });
@@ -471,7 +471,7 @@ describe("剪贴板", () => {
     useTimeline.getState().copySelected();
     useTimeline.getState().select(null);
     useTimeline.getState().copySelected();
-    expect(useTimeline.getState().clipboard?.clip.id).toBe("src1-v");
+    expect(useTimeline.getState().clipboard[0]?.clip.id).toBe("src1-v");
   });
 
   it("粘贴落在播放头处并选中新片段，进一条撤销", () => {
@@ -481,14 +481,14 @@ describe("剪贴板", () => {
     useTimeline.getState().paste();
     const after = useTimeline.getState();
     expect(after.undoLabel()).toBe("粘贴片段");
-    const id = after.selectedClipId;
+    const id = after.soleSelectedClipId();
     expect(id).not.toBe("src1-v");
     expect(after.playhead).toBe(299);
     expect(findClip(after.timeline(), id!)?.clip.timelineIn).toBe(after.playhead);
     // 撤销把它整个拿掉，而剪贴板不受影响（撤销栈里没有它）
     useTimeline.getState().undo();
     expect(findClip(useTimeline.getState().timeline(), id!)).toBeUndefined();
-    expect(useTimeline.getState().clipboard?.clip.id).toBe("src1-v");
+    expect(useTimeline.getState().clipboard[0]?.clip.id).toBe("src1-v");
   });
 
   it("剪贴板是空的时候粘贴什么都不做，也不报错", () => {
@@ -507,8 +507,8 @@ describe("剪贴板", () => {
     useTimeline.getState().duplicateSelected();
     const after = useTimeline.getState();
     // 副本紧接着原片段，不取播放头（那时播放头在 0，落点会和自己重叠）
-    expect(findClip(after.timeline(), after.selectedClipId!)?.clip.timelineIn).toBe(299);
-    expect(after.clipboard?.clip.id).toBe("src1-v");
+    expect(findClip(after.timeline(), after.soleSelectedClipId()!)?.clip.timelineIn).toBe(299);
+    expect(after.clipboard[0]?.clip.id).toBe("src1-v");
     expect(after.undoLabel()).toBe("片段副本");
   });
 
@@ -526,10 +526,209 @@ describe("剪贴板", () => {
     const s = seeded();
     s.select("src1-v");
     useTimeline.getState().copySelected();
-    expect(useTimeline.getState().clipboard).not.toBeNull();
+    expect(useTimeline.getState().clipboard).toHaveLength(1);
     useTimeline.getState().openProject("p2", EMPTY_TIMELINE, 0);
-    expect(useTimeline.getState().clipboard).toBeNull();
+    expect(useTimeline.getState().clipboard).toEqual([]);
     useTimeline.getState().closeProject();
-    expect(useTimeline.getState().clipboard).toBeNull();
+    expect(useTimeline.getState().clipboard).toEqual([]);
+  });
+});
+
+describe("多选", () => {
+  beforeEach(reset);
+
+  /**
+   * V1 和 A1 各三个 100 帧片段（0/100/200 起）。
+   *
+   * 用 `addSource` + 两次切分造出来，而不是手写 timeline：这样片段 id 和真实项目里
+   * 一样（`src1-v` 派生），也顺带证明多选在"刚切完"这种常见状态下能用。
+   *
+   * **没有选中时 ⌘K 切的是每一条轨**（`splitAtPlayhead` 的既有语义），所以音频那一条
+   * 也跟着变成三段——总共 6 个片段。下面几条断言的数字都从这里来。
+   */
+  function seeded(): string[] {
+    const s = () => useTimeline.getState();
+    s().addSource(source(300), 0);
+    s().select(null);
+    s().setPlayhead(100);
+    s().splitAtPlayhead();
+    s().setPlayhead(200);
+    s().splitAtPlayhead();
+    return (s().timeline().tracks.find((t) => t.id === "V1")?.clips ?? []).map((c) => c.id);
+  }
+
+  it("⌘ 点选加进集合，再点一次移出", () => {
+    const ids = seeded();
+    const s = () => useTimeline.getState();
+    s().select(ids[0]!);
+    s().toggleSelect(ids[1]!);
+    expect(s().selectedClipIds).toEqual([ids[0], ids[1]]);
+    s().toggleSelect(ids[0]!);
+    expect(s().selectedClipIds).toEqual([ids[1]]);
+  });
+
+  it("**`soleSelectedClipId` 在 0 个和多个时都是 null**", () => {
+    // 多选时给出其中一个的话，检查器会显示它的属性——改一下只作用到那一个，
+    // 而用户以为 N 个都变了（硬规则 10 的形状）
+    const ids = seeded();
+    const s = () => useTimeline.getState();
+    expect(s().soleSelectedClipId()).toBeNull();
+    s().select(ids[0]!);
+    expect(s().soleSelectedClipId()).toBe(ids[0]);
+    s().toggleSelect(ids[1]!);
+    expect(s().soleSelectedClipId()).toBeNull();
+  });
+
+  it("⌘A 选上所有轨道的所有片段", () => {
+    seeded();
+    const s = () => useTimeline.getState();
+    s().selectAll();
+    // V1 三段 + A1 三段（没选中时的 ⌘K 把两条轨都切了）
+    expect(s().selectedClipIds).toHaveLength(6);
+  });
+
+  it("**批量删除只进一条撤销**，一次 ⌘Z 全部回来", () => {
+    const ids = seeded();
+    const s = () => useTimeline.getState();
+    s().select(ids[0]!);
+    s().toggleSelect(ids[2]!);
+    s().removeSelected();
+    expect(s().timeline().tracks.find((t) => t.id === "V1")?.clips).toHaveLength(1);
+    expect(s().selectedClipIds).toEqual([]);
+    expect(s().undoLabel()).toBe("删除片段");
+    s().undo();
+    expect(s().timeline().tracks.find((t) => t.id === "V1")?.clips).toHaveLength(3);
+  });
+
+  it("**整组平移进一条撤销，相对位置不变**", () => {
+    const ids = seeded();
+    const s = () => useTimeline.getState();
+    s().select(ids[0]!);
+    s().toggleSelect(ids[1]!);
+    // A1 上那一段没选，所以 V1 头两段右移 500 之后不会撞上任何东西
+    s().moveClips(s().selectedClipIds, 500);
+    const clips = s().timeline().tracks.find((t) => t.id === "V1")!.clips;
+    expect(clips.map((c) => c.timelineIn)).toEqual([200, 500, 600]);
+    expect(s().undoLabel()).toBe("移动片段");
+    s().undo();
+    expect(
+      s().timeline().tracks.find((t) => t.id === "V1")!.clips.map((c) => c.timelineIn),
+    ).toEqual([0, 100, 200]);
+  });
+
+  it("**复制粘贴一整组：相对位置保留，粘出来的整组被选中**", () => {
+    const ids = seeded();
+    const s = () => useTimeline.getState();
+    s().select(ids[0]!);
+    s().toggleSelect(ids[2]!); // 0-100 和 200-300，中间隔一个
+    s().copySelected();
+    expect(s().clipboard).toHaveLength(2);
+    // 播放头被 `setPlayhead` 夹在 [0, durationFrames]，所以这里落在 300 而不是 500
+    s().setPlayhead(500);
+    const at = s().playhead;
+    expect(at).toBe(300);
+    s().paste();
+    expect(s().selectedClipIds).toHaveLength(2);
+    const pasted = s()
+      .selectedClipIds.map((id) => findClip(s().timeline(), id)!.clip.timelineIn)
+      .sort((a, b) => a - b);
+    expect(pasted).toEqual([at, at + 200]); // 200 帧的间隔原样保留
+    expect(s().undoLabel()).toBe("粘贴片段");
+  });
+
+  it("**⌘ 点选的顺序倒过来，粘贴落点一个帧都不差**", () => {
+    // 这条才是"复制要按 timelineIn 排序"的后果：不排序时锚点变成**先点的那个**，
+    // 于是先点右边再点左边，整组会往左偏一个间距（落点甚至可能变成负数而被拒），
+    // 而两次操作在用户眼里完全一样。按升序点选的用例对这个 bug 完全免疫
+    const ids = seeded();
+    const s = () => useTimeline.getState();
+    const at = 300;
+
+    s().select(ids[0]!);
+    s().toggleSelect(ids[2]!);
+    s().copySelected();
+    s().setPlayhead(at);
+    s().paste();
+    const forward = s()
+      .selectedClipIds.map((id) => findClip(s().timeline(), id)!.clip.timelineIn)
+      .sort((a, b) => a - b);
+
+    s().undo();
+    // 倒着点：先右边那个，再左边那个
+    s().select(ids[2]!);
+    s().toggleSelect(ids[0]!);
+    s().copySelected();
+    s().setPlayhead(at);
+    s().paste();
+    const backward = s()
+      .selectedClipIds.map((id) => findClip(s().timeline(), id)!.clip.timelineIn)
+      .sort((a, b) => a - b);
+
+    expect(backward).toEqual(forward);
+    expect(backward[0]).toBe(at); // 组的开头就落在播放头上
+  });
+
+  it("**整组副本落在组尾之后**，相邻的几个也放得下", () => {
+    const ids = seeded();
+    const s = () => useTimeline.getState();
+    s().select(ids[0]!);
+    s().toggleSelect(ids[1]!); // [0,100) 和 [100,200)，紧邻
+    s().duplicateSelected();
+    // 各自取自己出点的写法在这里必然失败（a 的副本会压在 b 上）；
+    // 按组跨度平移则落在 200 / 300——而 [200,300) 上原本有第三段，所以这一组会被拒。
+    // 于是先把第三段挪走，再验落点
+    expect(s().lastRejection).toMatch(/放不下/);
+    s().select(ids[2]!);
+    s().moveClips([ids[2]!], 500);
+    s().select(ids[0]!);
+    s().toggleSelect(ids[1]!);
+    s().duplicateSelected();
+    const copies = s().selectedClipIds.map((id) => findClip(s().timeline(), id)!.clip.timelineIn);
+    expect(copies.sort((a, b) => a - b)).toEqual([200, 300]);
+  });
+
+  it("**撤销后逐个过滤选中，不整体清空**", () => {
+    // 整体清空的话，撤销一次切分会把"另外两个还在的片段"也一起取消选中，
+    // 而用户接下来那一下操作就落到空处
+    const ids = seeded();
+    const s = () => useTimeline.getState();
+    s().selectAll();
+    const before = s().selectedClipIds;
+    s().undo(); // 撤销第二次切分 → 被切开的那两段合回去，它们的 id 不再存在
+    const after = s().selectedClipIds;
+    // 判据是这条性质本身，不是一个数字：**掉了一些、剩下的都还在、而且没剩成空**
+    expect(after.length).toBeGreaterThan(0);
+    expect(after.length).toBeLessThan(before.length);
+    for (const id of after) expect(findClip(s().timeline(), id)).toBeDefined();
+    expect(after).not.toContain(ids[2]);
+  });
+
+  it("多选时 ⌘K 只切选中的那些", () => {
+    const ids = seeded();
+    const s = () => useTimeline.getState();
+    s().select(ids[0]!);
+    s().setPlayhead(50);
+    s().splitAtPlayhead();
+    // 只有被选中的那一段被切开；A1 的第一段同样跨过 50，但它没被选中
+    expect(s().timeline().tracks.find((t) => t.id === "V1")?.clips).toHaveLength(4);
+    expect(s().timeline().tracks.find((t) => t.id === "A1")?.clips).toHaveLength(3);
+  });
+
+  it("部分成功要报出来（锁定轨道），而删掉的那些确实删了", () => {
+    const ids = seeded();
+    const s = () => useTimeline.getState();
+    // 手动锁一条轨：界面上还没有锁定开关，但纯函数层一直在判它
+    const locked = s().timeline().tracks.map((t) =>
+      t.id === "A1" ? { ...t, locked: true } : t,
+    );
+    useTimeline.getState().openProject("p", { ...s().timeline(), tracks: locked }, 0);
+    s().select(ids[0]!);
+    s().toggleSelect("src1-a");
+    s().removeSelected();
+    expect(findClip(s().timeline(), ids[0]!)).toBeUndefined();
+    expect(findClip(s().timeline(), "src1-a")).toBeDefined();
+    expect(s().lastRejection).toMatch(/2 个片段里有 1 个没删/);
+    // 没删掉的那个仍然选着
+    expect(s().selectedClipIds).toEqual(["src1-a"]);
   });
 });

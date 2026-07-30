@@ -293,6 +293,88 @@ export function moveClip(
   return ok(replaceTracks(timeline, tracks));
 }
 
+/**
+ * 去掉重复 id 并保持原顺序。
+ *
+ * 多选的选中集合是**数组**（不是 Set），所以"里面没有重复"是一条要维护的不变量而不是
+ * 类型保证。批量操作全部先过这里：重复一次的表现是"波纹删除同一个片段两次"——第二次
+ * 找不到它，于是被算进"没做成的那些"，报出一句用户看不懂的失败。
+ */
+function uniqueIds(ids: readonly ClipId[]): ClipId[] {
+  return [...new Set(ids)];
+}
+
+/**
+ * 把一组片段**整体**平移同一个位移。
+ *
+ * 三条和单个片段不同的取舍：
+ *
+ * - **全体或拒绝。** N 个片段的相对位置就是内容本身，移动成功 3 个、剩下 2 个留在原处，
+ *   得到的是一个用户没要的排列（同 `addSource` 那条"不允许画面放下了、声音挪到了别处"）。
+ *   判据是"部分成功是不是一个用户没要的新状态"——删除不是（删掉 3 个和删掉 5 个都是
+ *   "这些不在了"），移动是。
+ * - **不换轨。** 一组片段可以横跨多条轨道，而"目标轨道"是一个值不是一组——把 5 个片段
+ *   全塞进同一条轨等于毁掉排列。所以多选拖拽只走水平，要换轨得单选（`moveClip`）。
+ * - **夹紧是调整整组的位移，不是把每个片段各自夹到 0。** 后者会把越界的那几个压成一叠
+ *   （它们全落在 0），而那正好是"相对位置就是内容"这条被破坏的形态。
+ *
+ * 只需要检查每个片段与**不在移动集合里**的邻居是否重叠：整组共用一个位移，所以移动中的
+ * 片段之间的相对位置不变，原本不重叠的现在也不会重叠。
+ */
+export function moveClips(
+  timeline: Timeline,
+  clipIds: readonly ClipId[],
+  deltaFrames: number,
+  options: { readonly clampToBounds?: boolean } = {},
+): EditResult {
+  if (!Number.isInteger(deltaFrames)) return reject(timeline, "位移必须是整数帧");
+  const ids = uniqueIds(clipIds);
+  if (ids.length === 0) return reject(timeline, "没有选中片段");
+  // 单个片段走原路径：那条支持换轨，而且"多选"退化成一个时行为必须和从来没多选过一样
+  if (ids.length === 1) return moveClip(timeline, ids[0]!, deltaFrames, options);
+
+  const entries: { track: Track; clip: Clip }[] = [];
+  for (const id of ids) {
+    const found = findClip(timeline, id);
+    if (!found) return reject(timeline, `找不到片段 ${id}`);
+    if (found.track.locked) return reject(timeline, `${found.track.label ?? found.track.id} 已锁定`);
+    entries.push(found);
+  }
+
+  let delta = deltaFrames;
+  const minIn = Math.min(...entries.map((e) => e.clip.timelineIn));
+  if (minIn + delta < 0) {
+    if (options.clampToBounds === false) return reject(timeline, "片段不能移到时间轴起点之前");
+    delta = -minIn;
+  }
+  if (delta === 0) return unchanged(timeline);
+
+  const moving = new Set(ids);
+  const movedById = new Map<ClipId, Clip>();
+  for (const { track, clip } of entries) {
+    const length = clipDuration(clip);
+    const moved: Clip = {
+      ...clip,
+      timelineIn: clip.timelineIn + delta,
+      timelineOut: clip.timelineIn + delta + length,
+    };
+    const hit = track.clips.find((c) => !moving.has(c.id) && overlaps(c, moved));
+    if (hit) return reject(timeline, `与「${hit.name ?? hit.id}」重叠`);
+    movedById.set(clip.id, moved);
+  }
+
+  return ok(
+    replaceTracks(
+      timeline,
+      timeline.tracks.map((t) =>
+        t.clips.some((c) => moving.has(c.id))
+          ? withClips(t, t.clips.map((c) => movedById.get(c.id) ?? c))
+          : t,
+      ),
+    ),
+  );
+}
+
 // ---------------------------------------------------------------------------
 // 裁切
 // ---------------------------------------------------------------------------
@@ -496,6 +578,67 @@ export function rippleDeleteClip(timeline: Timeline, clipId: ClipId): EditResult
       ),
     ),
   );
+}
+
+/**
+ * 批量结果：**部分成功是合法结果**，而它不能走 `reason`。
+ *
+ * `apply()` 在 `changed:true` 时**根本不看 `reason`**（那条通道是给失败用的），所以把
+ * "5 个里有 1 个没删"写进 `reason` 等于静默丢掉——用户按了删除，看到 4 个消失、
+ * 一个还在，而软件一个字都没说。字段单独取名就是为了让调用方漏掉时显眼。
+ */
+export interface BatchResult extends EditResult {
+  /** 做成了几个。0 表示整批失败，那时 `changed` 是 false、原因走 `reason`。 */
+  readonly done: number;
+  /** 一共要做几个。 */
+  readonly total: number;
+  /** 没做成的那些是为什么。`done === total` 时不给。 */
+  readonly skippedReason?: string;
+}
+
+/**
+ * 批量删除。**逐个做，做不成的报出来，不整批拒绝。**
+ *
+ * 和 `moveClips` 的全体或拒绝刻意相反，判据是"部分成功是不是一个用户没要的新状态"：
+ * 删掉 3 个和删掉 5 个都是"这些片段不在了"，没有第三种含义；而整批拒绝会让"选中的一堆
+ * 里有一个在锁定轨道上"变成什么都删不掉，那不是用户的意图。
+ *
+ * 波纹删除逐个做同样是对的：每一步都从**当前**时间轴重读位置，而每次波纹左移的量都是
+ * 那个片段自己的长度，所以顺序不影响结果（几个删除彼此可交换）。
+ */
+export function removeClips(
+  timeline: Timeline,
+  clipIds: readonly ClipId[],
+  ripple = false,
+): BatchResult {
+  const ids = uniqueIds(clipIds);
+  if (ids.length === 0) return { ...reject(timeline, "没有选中片段"), done: 0, total: 0 };
+
+  let working = timeline;
+  let done = 0;
+  let firstReason: string | undefined;
+  for (const id of ids) {
+    const result = ripple ? rippleDeleteClip(working, id) : removeClip(working, id);
+    if (result.changed) {
+      working = result.timeline;
+      done += 1;
+    } else if (firstReason === undefined) {
+      firstReason = result.reason;
+    }
+  }
+
+  if (done === 0) {
+    return { ...reject(timeline, firstReason ?? "没有可删的片段"), done: 0, total: ids.length };
+  }
+  if (done < ids.length) {
+    return {
+      ...ok(working),
+      done,
+      total: ids.length,
+      skippedReason: `${ids.length} 个片段里有 ${ids.length - done} 个没删：${firstReason ?? "原因不明"}`,
+    };
+  }
+  return { ...ok(working), done, total: ids.length };
 }
 
 // ---------------------------------------------------------------------------
@@ -1399,6 +1542,25 @@ export function copyClip(timeline: Timeline, clipId: ClipId): ClipboardEntry | n
 }
 
 /**
+ * 把这一组片段放进剪贴板，**按 `timelineIn` 升序**。
+ *
+ * 排序买到的是**确定的报错**：`pasteClips` 逐个插、失败时报出挡路的那一个，按点选顺序
+ * 存的话同一组片段两次粘贴可能怪到不同的片段头上。**它不负责锚点的正确性**——那由
+ * `pasteClips` 里的 `Math.min` 结构性保证（试过把这里的排序去掉，行为一个字节都不变，
+ * 于是那次注入不算反向验证，只说明我原来写的理由是假的）。
+ *
+ * 找不到的悄悄跳过（选中集合可能刚被撤销掉一部分）。
+ */
+export function copyClips(timeline: Timeline, clipIds: readonly ClipId[]): ClipboardEntry[] {
+  const entries: ClipboardEntry[] = [];
+  for (const id of uniqueIds(clipIds)) {
+    const entry = copyClip(timeline, id);
+    if (entry) entries.push(entry);
+  }
+  return entries.sort((a, b) => a.clip.timelineIn - b.clip.timelineIn);
+}
+
+/**
  * 复制一份片段用来插入别处。
  *
  * 两件必须做的事：
@@ -1476,6 +1638,46 @@ export function pasteClip(timeline: Timeline, entry: ClipboardEntry, at: number)
   return insertClone(timeline, entry, at, "paste");
 }
 
+/** 一次放下多个片段的结果。id 按落点顺序给回去，UI 拿它整组选中。 */
+export interface AddClipsResult extends EditResult {
+  readonly clipIds?: readonly ClipId[];
+}
+
+/**
+ * 把剪贴板里那一组粘到 `at` 帧：**组的开头对齐播放头，组内相对位置原样保留**。
+ *
+ * 偏移按"离组内最早那个片段多远"算，而不是各自的绝对帧号——后者会让粘贴无视播放头
+ * （直接粘回原处），而**单个片段时完全正常**（那时锚点就是它自己），同 D35 那个被乘以零
+ * 的因子。每个片段各自回到自己那条轨（`insertClone` 认 `entry.trackId`），所以跨轨道的
+ * 一组粘过去仍然是原来的排列。
+ *
+ * **全体或拒绝**（同 `moveClips`）：放下 3 个、剩下 2 个被挡住，得到的是一个用户没要的
+ * 排列。做法是在一份工作副本上逐个插，任何一个失败就把整份丢掉、返回**原**时间轴。
+ * 逐个插还顺带把"新片段之间互相重叠"检查掉了——它们看得见前面已经插进去的那些。
+ */
+export function pasteClips(
+  timeline: Timeline,
+  entries: readonly ClipboardEntry[],
+  at: number,
+): AddClipsResult {
+  if (entries.length === 0) return reject(timeline, "剪贴板是空的");
+  if (!Number.isInteger(at) || at < 0) return reject(timeline, "落点必须是非负整数帧");
+
+  // **锚点必须是 `min`，不能写成 `entries[0]`。** 后者靠 `copyClips` 恰好排过序才对，
+  // 而那是另一个函数的实现细节；⌘ 点选的顺序是"先点右边再点左边"时，锚点会变成右边那个，
+  // 整组往左偏一个间距（落点为负时更是直接被拒），而两次操作在用户眼里完全一样
+  const anchor = Math.min(...entries.map((e) => e.clip.timelineIn));
+  let working = timeline;
+  const clipIds: ClipId[] = [];
+  for (const entry of entries) {
+    const result = insertClone(working, entry, at + (entry.clip.timelineIn - anchor), "paste");
+    if (!result.changed) return reject(timeline, result.reason ?? "粘不过来");
+    working = result.timeline;
+    if (result.clipId) clipIds.push(result.clipId);
+  }
+  return { ...ok(working), clipIds };
+}
+
 /**
  * 就地做一个副本，放在**原片段的出点**上（紧接着它）。
  *
@@ -1487,6 +1689,37 @@ export function duplicateClip(timeline: Timeline, clipId: ClipId): AddClipResult
   const entry = copyClip(timeline, clipId);
   if (!entry) return reject(timeline, `找不到片段 ${clipId}`);
   return insertClone(timeline, entry, entry.clip.timelineOut, "copy");
+}
+
+/**
+ * 一组片段各做一个副本，**整组往后平移"组的跨度"**（最晚的出点 − 最早的入点）。
+ *
+ * 落点不能各自取自己的出点：两个前后相邻的片段那样做，A 的副本正好落在 B 头上，于是
+ * **选中相邻几个片段按 ⌘D 永远失败**。按整组跨度平移则一定落在整组之后，而单个片段时
+ * 跨度就是它自己的长度，落点退化成"紧接着它"——和 `duplicateClip` 落在同一处。
+ *
+ * 组里有空档、或者横跨多条轨道时，空档和轨道关系原样保留（平移量对整组是同一个）。
+ * 同样**全体或拒绝**，理由见 `pasteClips`。
+ */
+export function duplicateClips(timeline: Timeline, clipIds: readonly ClipId[]): AddClipsResult {
+  const ids = uniqueIds(clipIds);
+  if (ids.length === 0) return reject(timeline, "没有选中片段");
+  const entries = copyClips(timeline, ids);
+  if (entries.length !== ids.length) return reject(timeline, "有片段已经不在了");
+
+  const start = Math.min(...entries.map((e) => e.clip.timelineIn));
+  const end = Math.max(...entries.map((e) => e.clip.timelineOut));
+  const shift = end - start;
+
+  let working = timeline;
+  const clipIdsOut: ClipId[] = [];
+  for (const entry of entries) {
+    const result = insertClone(working, entry, entry.clip.timelineIn + shift, "copy");
+    if (!result.changed) return reject(timeline, result.reason ?? "放不下");
+    working = result.timeline;
+    if (result.clipId) clipIdsOut.push(result.clipId);
+  }
+  return { ...ok(working), clipIds: clipIdsOut };
 }
 
 // ---------------------------------------------------------------------------
@@ -1672,16 +1905,21 @@ export interface SnapCandidates {
  * 收集所有可吸附的帧位置：其他片段的两端、播放头、入出点、时间轴起点。
  *
  * 刻意排除被拖动片段自身的两端——否则它会吸附到自己原来的位置，永远拖不动。
+ *
+ * 排除的是**一组** id 而不是一个：多选整组拖拽时，组内其他片段的两端同样要排掉，
+ * 否则被拖的那个会吸到同伴的**原**位置上（它们也在移动），表现是整组拖起来一顿一顿的。
+ * 参数收成数组而不是"一个 id 或一组"的联合，是为了让漏改的调用点在编译期就红。
  */
 export function snapTargets(
   timeline: Timeline,
-  excludeClipId: ClipId | null,
+  excludeClipIds: readonly ClipId[],
   extra: SnapCandidates = {},
 ): number[] {
+  const excluded = new Set(excludeClipIds);
   const targets = new Set<number>([0]);
   for (const track of timeline.tracks) {
     for (const clip of track.clips) {
-      if (clip.id === excludeClipId) continue;
+      if (excluded.has(clip.id)) continue;
       targets.add(clip.timelineIn);
       targets.add(clip.timelineOut);
     }

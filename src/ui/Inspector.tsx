@@ -177,10 +177,38 @@ function round(value: number, digits: number): number {
 
 export function Inspector() {
   const timeline = useTimeline((s) => s.timeline());
-  const selectedClipId = useTimeline((s) => s.selectedClipId);
+  const selectedClipIds = useTimeline((s) => s.selectedClipIds);
   const playhead = useTimeline((s) => s.playhead);
 
-  const found = selectedClipId ? findClip(timeline, selectedClipId) : undefined;
+  /**
+   * **多选时只报计数，不显示任何单片段属性。**
+   *
+   * 挑其中一个显示它的亮度 / 音量 / 速度，用户改一下会以为 N 个都变了——那是硬规则 10
+   * 的形状，而且改完看不出来（只有那一个变了）。所以这里指名说清楚：属性要单选才能改。
+   * "把这个变换应用到全部"是另一件事（它需要一个"哪些属性算共同的"的模型），不在这里。
+   */
+  if (selectedClipIds.length > 1) {
+    return (
+      <>
+        <div className="insp-hd">
+          {/* 强调色留给选中，这里用中性灰：多选本身不是一个"更重要"的状态 */}
+          <span className="swatch" style={{ background: "var(--tx-faint)" }} />
+          <div style={{ minWidth: 0 }}>
+            <div className="n">已选中 {selectedClipIds.length} 个片段</div>
+            <div className="s">多选</div>
+          </div>
+        </div>
+        <p className="empty">
+          可以整组移动（拖其中任意一个）、删除 ⌫、复制 ⌘C、粘贴 ⌘V、做副本 ⌘D、
+          在播放头切分 ⌘K。单个片段的属性要<b>只选一个</b>才能改——显示其中一个的值，
+          改它却只作用到那一个，那和什么都没说一样。
+        </p>
+      </>
+    );
+  }
+
+  const sole = selectedClipIds.length === 1 ? selectedClipIds[0]! : null;
+  const found = sole ? findClip(timeline, sole) : undefined;
   if (!found) {
     return <p className="empty">未选中片段。点时间轴上的片段查看属性，或用时间轴工具条的「T」新建文字。</p>;
   }

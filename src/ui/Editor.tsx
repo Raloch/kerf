@@ -5,7 +5,7 @@
  * 沿用 Premiere / Resolve / 剪映共有的骨架，用户不需要重新学（PLAN.md §6）。
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ExportCapabilities } from "../media/capability";
 import { proxyManager } from "../media/proxy-client";
 import type { ProxyInfo } from "../media/proxy";
@@ -78,7 +78,7 @@ export function Editor({
   const timeline = useTimeline((s) => s.timeline());
   const projectId = useTimeline((s) => s.projectId);
   const playhead = useTimeline((s) => s.playhead);
-  const selectedClipId = useTimeline((s) => s.selectedClipId);
+  const selectedClipIds = useTimeline((s) => s.selectedClipIds);
   const lastRejection = useTimeline((s) => s.lastRejection);
   const dragHint = useTimeline((s) => s.dragHint);
   const addSource = useTimeline((s) => s.addSource);
@@ -95,6 +95,8 @@ export function Editor({
   const paste = useTimeline((s) => s.paste);
   const duplicateSelected = useTimeline((s) => s.duplicateSelected);
   const removeSelected = useTimeline((s) => s.removeSelected);
+  const selectAll = useTimeline((s) => s.selectAll);
+  const select = useTimeline((s) => s.select);
 
   const [caps, setCaps] = useState<ExportCapabilities | null>(null);
   const [proxies, setProxies] = useState<Record<string, ProxyInfo>>({});
@@ -354,6 +356,19 @@ export function Editor({
         duplicateSelected();
         return;
       }
+      // ⌘A 全选片段。**要 preventDefault**：否则浏览器会把整个页面的文字选上，
+      // 于是界面被蓝底盖住一片，而选中的片段也确实变了——看起来像"选中把界面搞坏了"
+      if (meta && e.key.toLowerCase() === "a") {
+        e.preventDefault();
+        selectAll();
+        return;
+      }
+      // Esc 取消选中。多选之后特别需要它：⌘ 点选反选一个个取消太慢，
+      // 而"点空白处清空"这条路还不存在（时间轴空白区目前不接指针事件）
+      if (e.key === "Escape") {
+        select(null);
+        return;
+      }
       if (e.key === "Backspace" || e.key === "Delete") {
         e.preventDefault();
         removeSelected(e.shiftKey);
@@ -377,6 +392,8 @@ export function Editor({
     paste,
     playhead,
     redo,
+    select,
+    selectAll,
     removeSelected,
     setPlayhead,
     splitAtPlayhead,
@@ -384,7 +401,24 @@ export function Editor({
   ]);
 
   // 检查器自己从 store 读选中片段；这里留一份是给状态栏和导出范围用的
-  const selected = selectedClipId ? findClip(timeline, selectedClipId) : undefined;
+  const selected = selectedClipIds.length === 1 ? findClip(timeline, selectedClipIds[0]!) : undefined;
+  /**
+   * 选中区间：多选时是**整组的跨度**（最早的入点到最晚的出点）。
+   *
+   * 中间的空档也算进来，而这是对的——导出的是一段连续时间，不是几个片段的并集。
+   * 报的是"这些片段占了哪一段"，而导出面板上那一行同时印着帧数，所以跨度里含空档
+   * 这件事看得见。
+   */
+  const selectedRange = useMemo(() => {
+    const clips = selectedClipIds
+      .map((id) => findClip(timeline, id)?.clip)
+      .filter((c): c is NonNullable<typeof c> => c !== undefined);
+    if (clips.length === 0) return null;
+    return {
+      inFrame: Math.min(...clips.map((c) => c.timelineIn)),
+      outFrame: Math.max(...clips.map((c) => c.timelineOut)),
+    };
+  }, [selectedClipIds, timeline]);
   const hasContent = timeline.durationFrames > 0;
 
   return (
@@ -674,6 +708,8 @@ export function Editor({
             busy
           ) : selected ? (
             `${selected.clip.name ?? selected.clip.id} · ${selected.track.id} · ${clipDuration(selected.clip)}f`
+          ) : selectedClipIds.length > 1 ? (
+            `已选中 ${selectedClipIds.length} 个片段${selectedRange ? ` · 跨 ${selectedRange.outFrame - selectedRange.inFrame}f` : ""}`
           ) : (
             "未选中片段"
           )}
@@ -705,11 +741,7 @@ export function Editor({
         <ExportDialog
           timeline={timeline}
           caps={caps}
-          selectedRange={
-            selected
-              ? { inFrame: selected.clip.timelineIn, outFrame: selected.clip.timelineOut }
-              : null
-          }
+          selectedRange={selectedRange}
           onClose={() => setExportOpen(false)}
         />
       )}

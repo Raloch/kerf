@@ -42,18 +42,18 @@ import {
   clearKeyframes,
   findClip,
   moveClip,
-  removeClip,
+  moveClips,
+  removeClips,
   removeKeyframe,
   moveKeyframe,
   addLut,
   addFont,
   renameProject,
-  rippleDeleteClip,
   setClipColor,
   setClipLut,
-  copyClip,
-  duplicateClip,
-  pasteClip,
+  copyClips,
+  duplicateClips,
+  pasteClips,
   setClipPreservePitch,
   setClipSpeed,
   setClipVolume,
@@ -67,6 +67,7 @@ import {
   splitClipAt,
   trimClip,
   type AddTextOptions,
+  type BatchResult,
   type ColorPatch,
   type EditResult,
   type MoveOptions,
@@ -110,7 +111,15 @@ export interface TimelineState {
   projectId: string | null;
   /** 当前播放头（帧）。不进撤销栈。 */
   playhead: number;
-  selectedClipId: ClipId | null;
+  /**
+   * 选中的片段。**数组不是 Set**：React 里 `includes` 够用，而 Set 在 devtools 里读不出来，
+   * 也让"选中集合"看起来比它实际承担的更重。顺序是**加入顺序**且**不承载语义**——凡是
+   * 需要确定顺序的地方（粘贴的锚点）自己按 `timelineIn` 排（见 `copyClips`）。
+   *
+   * 不变量：**没有重复**、**不指向已不存在的片段**（撤销 / 重做后要过滤，见 `undo`）。
+   * 空数组 = 没选中，不用 null——`length` 一个判据管三种情形（0 / 1 / 多个）。
+   */
+  selectedClipIds: readonly ClipId[];
   snapEnabled: boolean;
   /** 时间轴缩放：每帧像素数 × 100。UI 状态，不进撤销栈。 */
   zoom: number;
@@ -119,11 +128,11 @@ export interface TimelineState {
   /** 拖拽过程中的即时提示（落点非法的原因）。拖拽结束清空，不进撤销栈。 */
   dragHint: string | null;
   /**
-   * 剪贴板里的那一份片段。**不进撤销栈**（复制没有改动任何东西），**不进快照**
-   * （它引用的素材下次打开时可能已经不在，见 `ClipboardEntry`），
+   * 剪贴板里的那一组片段（空数组 = 没有可粘的）。**不进撤销栈**（复制没有改动任何
+   * 东西），**不进快照**（它引用的素材下次打开时可能已经不在，见 `ClipboardEntry`），
    * 而且**切项目要清掉**（见 `openProject`）。
    */
-  clipboard: ClipboardEntry | null;
+  clipboard: readonly ClipboardEntry[];
 
   // ---- 读 ----
   timeline: () => Timeline;
@@ -131,6 +140,14 @@ export interface TimelineState {
   canRedo: () => boolean;
   undoLabel: () => string | null;
   redoLabel: () => string | null;
+  /**
+   * 恰好选中一个时返回它，**0 个和多个都返回 null**。
+   *
+   * 检查器、关键帧轨、状态栏都只在"就一个"时才有意义：选中 5 个却显示其中一个的亮度，
+   * 用户改它会以为 5 个都变了，那正是硬规则 10 的形状。所以这个判据收在一处，
+   * 不让各个组件自己写 `length === 1 ? ids[0] : null`——写漏一处就是上面那句假话。
+   */
+  soleSelectedClipId: () => ClipId | null;
 
   // ---- 编辑（都会进撤销栈）----
   /**
@@ -155,6 +172,13 @@ export interface TimelineState {
   /** 重命名当前项目。进撤销栈（它改的是 Timeline），`namedByUser` 由纯函数置位。 */
   renameProject: (name: string) => void;
   moveClip: (clipId: ClipId, deltaFrames: number, options?: MoveOptions) => void;
+  /**
+   * 整组平移。**不换轨**，理由见 `moveClips`；合并键带上整组，换一组片段必须断开。
+   *
+   * 磁吸不在这里：拖拽的落点由 `use-clip-drag` 算完（它要尊重 ⌥ 临时关掉磁吸），
+   * 同 `moveClip` 那条。
+   */
+  moveClips: (clipIds: readonly ClipId[], deltaFrames: number, clampToBounds?: boolean) => void;
   /** 拖拽落点：先算磁吸再移动，中间态按 clipId 合并成一步撤销。 */
   dragClipTo: (clipId: ClipId, desiredIn: number, toTrack?: TrackId) => void;
   trimClip: (clipId: ClipId, edge: TrimEdge, deltaFrames: number) => void;
@@ -170,11 +194,11 @@ export interface TimelineState {
   setClipSpeed: (clipId: ClipId, speed: Rational) => void;
   /** 开关变速保持音高。不改长度、不动速度，见 `setClipPreservePitch`。 */
   setClipPreservePitch: (clipId: ClipId, on: boolean) => void;
-  /** 把选中片段放进剪贴板。**不进撤销栈**——它什么都没改。 */
+  /** 把选中的（可能多个）片段放进剪贴板。**不进撤销栈**——它什么都没改。 */
   copySelected: () => void;
-  /** 把剪贴板那份粘到播放头，落回原轨。放不下就拒绝。 */
+  /** 把剪贴板那一组粘到播放头，各自落回原轨。放不下就整组拒绝。 */
   paste: () => void;
-  /** 就地做一个副本，紧接着原片段。不动剪贴板。 */
+  /** 给选中的每个片段做一个副本，整组落在它们之后。不动剪贴板。 */
   duplicateSelected: () => void;
   /** 把一张解析好的 LUT 加进项目库。 */
   addLut: (lut: LutSource) => void;
@@ -221,7 +245,17 @@ export interface TimelineState {
 
   // ---- 不进撤销栈 ----
   setPlayhead: (frame: number) => void;
+  /** 换成只选这一个；传 null 清空。 */
   select: (clipId: ClipId | null) => void;
+  /**
+   * 加进 / 移出选中集合（⌘ 点选）。
+   *
+   * 已经选中的再点一次就移出——那是"加减选择"的常规语义，而且它是唯一不用先清空
+   * 就能取消误选的手势。
+   */
+  toggleSelect: (clipId: ClipId) => void;
+  /** 全选所有轨道上的所有片段（⌘A）。锁定轨道上的也选，批量操作会自己报出没做成的。 */
+  selectAll: () => void;
   toggleSnap: () => void;
   setZoom: (zoom: number) => void;
   setDragHint: (hint: string | null) => void;
@@ -247,18 +281,41 @@ export const useTimeline = create<TimelineState>((set, get) => {
     }));
   }
 
+  /**
+   * 批量结果的第二次上报。
+   *
+   * `apply()` 在成功时会把 `lastRejection` 清空，所以"部分成功"那句话只能在它之后写
+   * ——顺序反了就是自己把自己擦掉，而且不报错（见 `BatchResult.skippedReason`）。
+   */
+  function applyBatch(result: BatchResult, label: string): void {
+    apply(result, label);
+    if (result.changed && result.skippedReason !== undefined) {
+      set({ lastRejection: result.skippedReason });
+    }
+  }
+
+  /** 撤销 / 重做之后，选中集合里可能有片段已经不在了。**逐个过滤，不整体清空。** */
+  function liveSelection(timeline: Timeline, ids: readonly ClipId[]): readonly ClipId[] {
+    const live = ids.filter((id) => findClip(timeline, id));
+    return live.length === ids.length ? ids : live;
+  }
+
   return {
     history: initHistory(EMPTY_TIMELINE, "新建项目"),
     projectId: null,
-    clipboard: null,
+    clipboard: [],
     playhead: 0,
-    selectedClipId: null,
+    selectedClipIds: [],
     snapEnabled: true, // 默认开，见 PLAN.md 决策 D2
     zoom: 42,
     lastRejection: null,
     dragHint: null,
 
     timeline: () => current(get().history),
+    soleSelectedClipId: () => {
+      const ids = get().selectedClipIds;
+      return ids.length === 1 ? ids[0]! : null;
+    },
     canUndo: () => histCanUndo(get().history),
     canRedo: () => histCanRedo(get().history),
     undoLabel: () => histUndoLabel(get().history),
@@ -278,9 +335,11 @@ export const useTimeline = create<TimelineState>((set, get) => {
           coalesceKey: null,
           at: now(),
         }),
-        // 选中新片段（画面在前）。**不动播放头**：导入配乐时用户正停在某一处，
+        // 选中新片段（画面在前）。**只选第一个，不把音画两个都选上**：多选态下检查器
+        // 只报计数（那是刻意的，见 `soleSelectedClipId`），两个都选中就等于导入之后
+        // 看不到这个片段的属性。**不动播放头**：导入配乐时用户正停在某一处，
         // 把它拨回 0 等于让"在播放头处插入"这件事自己失效
-        selectedClipId: result.clipIds?.[0] ?? null,
+        selectedClipIds: result.clipIds?.[0] ? [result.clipIds[0]] : [],
         lastRejection: null,
       }));
     },
@@ -290,13 +349,13 @@ export const useTimeline = create<TimelineState>((set, get) => {
         projectId,
         history: initHistory(timeline, "打开项目"),
         playhead,
-        selectedClipId: null,
+        selectedClipIds: [],
         lastRejection: null,
         dragHint: null,
         // 跨项目粘贴够得到（剪贴板本来活过切项目），而粘过去的片段会引用一个不在这个
         // 项目里的素材——那时快照恢复会抛（D23）。`pasteClip` 自己也拦着，但那是契约；
         // 这里清掉是体验：与其让用户按了粘贴看到一句拒绝，不如根本没有可粘的东西
-        clipboard: null,
+        clipboard: [],
       });
     },
 
@@ -305,10 +364,10 @@ export const useTimeline = create<TimelineState>((set, get) => {
         projectId: null,
         history: initHistory(EMPTY_TIMELINE, "新建项目"),
         playhead: 0,
-        selectedClipId: null,
+        selectedClipIds: [],
         lastRejection: null,
         dragHint: null,
-        clipboard: null,
+        clipboard: [],
       });
     },
 
@@ -324,6 +383,19 @@ export const useTimeline = create<TimelineState>((set, get) => {
       );
     },
 
+    moveClips(clipIds, deltaFrames, clampToBounds) {
+      apply(
+        moveClips(
+          get().timeline(),
+          clipIds,
+          deltaFrames,
+          clampToBounds === undefined ? {} : { clampToBounds },
+        ),
+        "移动片段",
+        `move:${[...clipIds].join(",")}`,
+      );
+    },
+
     dragClipTo(clipId, desiredIn, toTrack) {
       const state = get();
       const timeline = state.timeline();
@@ -336,7 +408,7 @@ export const useTimeline = create<TimelineState>((set, get) => {
       let target = Math.round(desiredIn);
       if (state.snapEnabled) {
         const length = found.clip.timelineOut - found.clip.timelineIn;
-        const targets = snapTargets(timeline, clipId, { playhead: state.playhead });
+        const targets = snapTargets(timeline, [clipId], { playhead: state.playhead });
         target = snapDrag(target, length, targets).frame;
       }
 
@@ -366,8 +438,8 @@ export const useTimeline = create<TimelineState>((set, get) => {
       const timeline = state.timeline();
       const frame = state.playhead;
       // 没选中片段时，切播放头下所有未锁定轨道里的片段
-      const targets = state.selectedClipId
-        ? [state.selectedClipId]
+      const targets = state.selectedClipIds.length
+        ? state.selectedClipIds
         : timeline.tracks
             .filter((t) => !t.locked)
             .flatMap((t) => t.clips.filter((c) => frame > c.timelineIn && frame < c.timelineOut))
@@ -394,17 +466,17 @@ export const useTimeline = create<TimelineState>((set, get) => {
     },
 
     removeSelected(ripple = false) {
-      const { selectedClipId } = get();
-      if (!selectedClipId) {
+      const { selectedClipIds } = get();
+      if (selectedClipIds.length === 0) {
         set({ lastRejection: "没有选中片段" });
         return;
       }
-      const timeline = get().timeline();
-      const result = ripple
-        ? rippleDeleteClip(timeline, selectedClipId)
-        : removeClip(timeline, selectedClipId);
-      if (result.changed) set({ selectedClipId: null });
-      apply(result, ripple ? "波纹删除" : "删除片段");
+      const result = removeClips(get().timeline(), selectedClipIds, ripple);
+      // 删掉的那些当然不能还选着；部分成功时留下没删掉的那几个仍然选中
+      if (result.changed) {
+        set({ selectedClipIds: liveSelection(result.timeline, selectedClipIds) });
+      }
+      applyBatch(result, ripple ? "波纹删除" : "删除片段");
     },
 
     setClipTransform(clipId, patch) {
@@ -438,28 +510,30 @@ export const useTimeline = create<TimelineState>((set, get) => {
 
     copySelected() {
       const state = get();
-      if (!state.selectedClipId) return;
-      const entry = copyClip(state.timeline(), state.selectedClipId);
-      // **不走 `apply`**：复制什么都没改，进撤销栈的话用户要按两次 ⌘Z 才回到上一次真编辑
-      if (entry) set({ clipboard: entry, lastRejection: null });
+      if (state.selectedClipIds.length === 0) return;
+      const entries = copyClips(state.timeline(), state.selectedClipIds);
+      // **不走 `apply`**：复制什么都没改，进撤销栈的话用户要按两次 ⌘Z 才回到上一次真编辑。
+      // 一个都没抓到时不动剪贴板——上一次复制的东西还能粘，比清空更有用
+      if (entries.length > 0) set({ clipboard: entries, lastRejection: null });
     },
 
     paste() {
       const state = get();
-      const entry = state.clipboard;
-      if (!entry) return;
-      const result = pasteClip(state.timeline(), entry, state.playhead);
+      const entries = state.clipboard;
+      if (entries.length === 0) return;
+      const result = pasteClips(state.timeline(), entries, state.playhead);
       apply(result, "粘贴片段");
-      if (result.changed && result.clipId) set({ selectedClipId: result.clipId });
+      // 整组选中粘出来的那些：接着按 ⌘V 之外的任何编辑，作用对象都是刚粘的这一组
+      if (result.changed && result.clipIds) set({ selectedClipIds: result.clipIds });
     },
 
     duplicateSelected() {
       const state = get();
-      if (!state.selectedClipId) return;
-      const result = duplicateClip(state.timeline(), state.selectedClipId);
+      if (state.selectedClipIds.length === 0) return;
+      const result = duplicateClips(state.timeline(), state.selectedClipIds);
       apply(result, "片段副本");
       // 选中副本而不是原片段：接着按 ⌘D 就能连着复制一串
-      if (result.changed && result.clipId) set({ selectedClipId: result.clipId });
+      if (result.changed && result.clipIds) set({ selectedClipIds: result.clipIds });
     },
 
     addLut(lut) {
@@ -545,7 +619,7 @@ export const useTimeline = create<TimelineState>((set, get) => {
       const result = addTextClip(get().timeline(), options);
       apply(result, "新建文字");
       // 选中新片段，用户接着就能改内容；失败时 clipId 为空，不动选中
-      if (result.changed && result.clipId) set({ selectedClipId: result.clipId });
+      if (result.changed && result.clipId) set({ selectedClipIds: [result.clipId] });
     },
 
     setPlayhead(frame) {
@@ -556,7 +630,24 @@ export const useTimeline = create<TimelineState>((set, get) => {
     },
 
     select(clipId) {
-      set({ selectedClipId: clipId, lastRejection: null });
+      set({ selectedClipIds: clipId === null ? [] : [clipId], lastRejection: null });
+    },
+
+    toggleSelect(clipId) {
+      set((state) => ({
+        selectedClipIds: state.selectedClipIds.includes(clipId)
+          ? state.selectedClipIds.filter((id) => id !== clipId)
+          : [...state.selectedClipIds, clipId],
+        lastRejection: null,
+      }));
+    },
+
+    selectAll() {
+      const timeline = get().timeline();
+      set({
+        selectedClipIds: timeline.tracks.flatMap((t) => t.clips.map((c) => c.id)),
+        lastRejection: null,
+      });
     },
 
     toggleSnap() {
@@ -579,11 +670,8 @@ export const useTimeline = create<TimelineState>((set, get) => {
         return {
           history,
           lastRejection: null,
-          // 撤销后选中的片段可能已不存在，清掉悬空引用
-          selectedClipId:
-            state.selectedClipId && findClip(timeline, state.selectedClipId)
-              ? state.selectedClipId
-              : null,
+          // 撤销后选中的片段可能已不存在，清掉悬空引用（逐个过滤，不整体清空）
+          selectedClipIds: liveSelection(timeline, state.selectedClipIds),
           playhead: Math.min(state.playhead, timeline.durationFrames),
         };
       });
@@ -596,10 +684,7 @@ export const useTimeline = create<TimelineState>((set, get) => {
         return {
           history,
           lastRejection: null,
-          selectedClipId:
-            state.selectedClipId && findClip(timeline, state.selectedClipId)
-              ? state.selectedClipId
-              : null,
+          selectedClipIds: liveSelection(timeline, state.selectedClipIds),
           playhead: Math.min(state.playhead, timeline.durationFrames),
         };
       });

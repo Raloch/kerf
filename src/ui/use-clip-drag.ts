@@ -15,6 +15,7 @@ import type { Clip, Timeline, TrackId } from "../edl/types";
 import { clipDuration } from "../edl/types";
 import {
   moveClip,
+  moveClips,
   snapDrag,
   snapFrame,
   snapTargets,
@@ -32,12 +33,22 @@ import { useTimeline } from "../state/timeline-store";
 const DRAG_THRESHOLD_PX = 3;
 
 export interface Ghost {
+  /** 这个幽灵是哪个片段的落点。整组拖拽时一次画好几个，React 拿它当 key。 */
+  readonly clipId: string;
   readonly trackId: TrackId;
   readonly inFrame: number;
   readonly lengthFrames: number;
   readonly valid: boolean;
   readonly reason?: string | undefined;
   readonly kind: "move" | "trim";
+}
+
+/** 整组拖拽里跟着一起动的一个片段：原位置 + 长度，够画幽灵也够算落点。 */
+interface Follower {
+  readonly clipId: string;
+  readonly trackId: TrackId;
+  readonly originIn: number;
+  readonly lengthFrames: number;
 }
 
 interface MoveSession {
@@ -48,6 +59,13 @@ interface MoveSession {
   readonly lengthFrames: number;
   readonly startX: number;
   readonly startY: number;
+  /**
+   * 跟着一起动的其他片段（多选整组拖拽）。空数组 = 单个片段那条原路径。
+   *
+   * 存**快照**而不是每次 pointermove 去 store 查选中集合：拖拽期间选中不会变，而拖到
+   * 一半重新读一次的话，任何让选中变化的东西都会让这次拖拽中途换掉被移动的对象。
+   */
+  readonly followers: readonly Follower[];
 }
 
 interface TrimSession {
@@ -64,7 +82,8 @@ interface TrimSession {
 type Session = MoveSession | TrimSession;
 
 export interface ClipDragApi {
-  readonly ghost: Ghost | null;
+  /** 拖拽中的落点，**一个或多个**（整组拖拽时每个片段一个）。空数组 = 没在拖。 */
+  readonly ghosts: readonly Ghost[];
   /** 吸附辅助线的帧号，null 表示当前没有吸附。 */
   readonly snapLine: number | null;
   readonly dragging: boolean;
@@ -86,14 +105,17 @@ export function useClipDrag(pxPerFrame: number): ClipDragApi {
   const playhead = useTimeline((s) => s.playhead);
   const snapEnabled = useTimeline((s) => s.snapEnabled);
   const select = useTimeline((s) => s.select);
+  const toggleSelect = useTimeline((s) => s.toggleSelect);
+  const selectedClipIds = useTimeline((s) => s.selectedClipIds);
   // 用 moveClip 而不是 dragClipTo 提交：磁吸已经在这里算完了（且要尊重 ⌥ 临时关闭），
   // dragClipTo 会按 store 的 snapEnabled 再吸一次，把 ⌥ 的效果覆盖掉。
   const move = useTimeline((s) => s.moveClip);
+  const moveGroup = useTimeline((s) => s.moveClips);
   const trim = useTimeline((s) => s.trimClip);
 
   const setDragHint = useTimeline((s) => s.setDragHint);
 
-  const [ghost, setGhost] = useState<Ghost | null>(null);
+  const [ghosts, setGhosts] = useState<readonly Ghost[]>([]);
   const [snapLine, setSnapLine] = useState<number | null>(null);
   const session = useRef<Session | null>(null);
   const movedEnough = useRef(false);
@@ -112,7 +134,7 @@ export function useClipDrag(pxPerFrame: number): ClipDragApi {
   const reset = useCallback(() => {
     session.current = null;
     movedEnough.current = false;
-    setGhost(null);
+    setGhosts([]);
     setSnapLine(null);
     publishHint(null);
   }, [publishHint]);
@@ -125,14 +147,18 @@ export function useClipDrag(pxPerFrame: number): ClipDragApi {
   }, []);
 
   const computeMove = useCallback(
-    (s: MoveSession, event: PointerEvent): { ghost: Ghost; snap: number | null } => {
+    (s: MoveSession, event: PointerEvent): { ghosts: readonly Ghost[]; snap: number | null } => {
+      const group = s.followers.length > 0;
       const rawDelta = (event.clientX - s.startX) / pxPerFrame;
       let desiredIn = Math.max(0, Math.round(s.originIn + rawDelta));
       let snap: number | null = null;
 
       // 按住 ⌥ 临时关闭磁吸（PLAN.md 决策 D2 承诺的行为）
       if (snapEnabled && !event.altKey) {
-        const targets = snapTargets(timeline, s.clipId, { playhead });
+        // 整组拖拽时候选位置要排掉**整组**：同伴也在移动，吸到它们的原位置是错的。
+        // 磁吸只按被按住的那个片段算——一组有 2N 个端点，全都参与会让落点来回跳
+        const exclude = group ? [s.clipId, ...s.followers.map((f) => f.clipId)] : [s.clipId];
+        const targets = snapTargets(timeline, exclude, { playhead });
         const snapped = snapDrag(desiredIn, s.lengthFrames, targets);
         if (snapped.snapped) {
           // 吸附线画在真正贴住的那一端
@@ -142,22 +168,47 @@ export function useClipDrag(pxPerFrame: number): ClipDragApi {
         desiredIn = snapped.frame;
       }
 
-      const targetTrack = trackAt(event.clientX, event.clientY) ?? s.fromTrack;
       const delta = desiredIn - s.originIn;
+
+      // 整组：不换轨（见 `moveClips`），落点合法性对整组是**一个**布尔——分别判会画出
+      // "这几个绿那几个红"，而提交是全体或拒绝，那就是界面说了一件不会发生的事
+      if (group) {
+        const ids = [s.clipId, ...s.followers.map((f) => f.clipId)];
+        const probe = moveClips(timeline, ids, delta, { clampToBounds: false });
+        const shared = { kind: "move" as const, valid: probe.changed, reason: probe.reason };
+        return {
+          ghosts: [
+            { ...shared, clipId: s.clipId, trackId: s.fromTrack, inFrame: desiredIn, lengthFrames: s.lengthFrames },
+            ...s.followers.map((f) => ({
+              ...shared,
+              clipId: f.clipId,
+              trackId: f.trackId,
+              inFrame: f.originIn + delta,
+              lengthFrames: f.lengthFrames,
+            })),
+          ],
+          snap,
+        };
+      }
+
+      const targetTrack = trackAt(event.clientX, event.clientY) ?? s.fromTrack;
       const probe = moveClip(timeline, s.clipId, delta, {
         toTrack: targetTrack,
         clampToBounds: false,
       });
 
       return {
-        ghost: {
-          kind: "move",
-          trackId: targetTrack,
-          inFrame: desiredIn,
-          lengthFrames: s.lengthFrames,
-          valid: probe.changed,
-          reason: probe.reason,
-        },
+        ghosts: [
+          {
+            kind: "move",
+            clipId: s.clipId,
+            trackId: targetTrack,
+            inFrame: desiredIn,
+            lengthFrames: s.lengthFrames,
+            valid: probe.changed,
+            reason: probe.reason,
+          },
+        ],
         snap,
       };
     },
@@ -165,13 +216,13 @@ export function useClipDrag(pxPerFrame: number): ClipDragApi {
   );
 
   const computeTrim = useCallback(
-    (s: TrimSession, event: PointerEvent): { ghost: Ghost; snap: number | null } => {
+    (s: TrimSession, event: PointerEvent): { ghosts: readonly Ghost[]; snap: number | null } => {
       const rawDelta = (event.clientX - s.startX) / pxPerFrame;
       let delta = Math.round(rawDelta);
       let snap: number | null = null;
 
       if (snapEnabled && !event.altKey) {
-        const targets = snapTargets(timeline, s.clipId, { playhead });
+        const targets = snapTargets(timeline, [s.clipId], { playhead });
         const edgeFrame = (s.edge === "in" ? s.originIn : s.originOut) + delta;
         const snapped = snapFrame(edgeFrame, targets);
         if (snapped.snapped && snapped.target !== undefined) {
@@ -186,14 +237,17 @@ export function useClipDrag(pxPerFrame: number): ClipDragApi {
       const outFrame = s.edge === "in" ? s.originOut : s.originOut + delta;
 
       return {
-        ghost: {
-          kind: "trim",
-          trackId: s.trackId,
-          inFrame,
-          lengthFrames: Math.max(1, outFrame - inFrame),
-          valid: probe.changed && delta !== 0,
-          reason: probe.reason,
-        },
+        ghosts: [
+          {
+            kind: "trim",
+            clipId: s.clipId,
+            trackId: s.trackId,
+            inFrame,
+            lengthFrames: Math.max(1, outFrame - inFrame),
+            valid: probe.changed && delta !== 0,
+            reason: probe.reason,
+          },
+        ],
         snap,
       };
     },
@@ -221,9 +275,12 @@ export function useClipDrag(pxPerFrame: number): ClipDragApi {
           movedEnough.current = true;
         }
         const result = s.kind === "move" ? computeMove(s, e) : computeTrim(s, e);
-        setGhost(result.ghost);
+        setGhosts(result.ghosts);
         setSnapLine(result.snap);
-        publishHint(result.ghost.valid ? null : result.ghost.reason ?? "这里放不下");
+        // 整组共用一个合法性，所以看第一个就够；写成"有没有任何一个非法"是一样的结果，
+        // 但那种写法会让人以为这里允许部分合法
+        const first = result.ghosts[0];
+        publishHint(!first || first.valid ? null : first.reason ?? "这里放不下");
       };
 
       const onUp = (e: PointerEvent) => {
@@ -232,19 +289,32 @@ export function useClipDrag(pxPerFrame: number): ClipDragApi {
         target.removeEventListener("pointercancel", onCancel);
 
         const s = session.current;
+        // **低于阈值 = 点击，那时要把选中收缩成这一个。**
+        //
+        // 按下时刻刻意不收缩（否则一按就丢掉整组，而用户接下来正是要拖这一组），代价是
+        // "点一下组里的某个片段"必须在这里补上语义——不补的话从"选了三个"回到"只要这一个"
+        // 就只剩 Esc 再点一次这条路，而用户明明点了一个片段却看到三个还亮着。
+        // 判据用的是拖拽阈值本身（同关键帧那条"低于阈值算点击"），所以真的拖过就不会误触
+        if (s && !movedEnough.current && s.kind === "move" && s.followers.length > 0) {
+          select(s.clipId);
+        }
         if (s && movedEnough.current) {
           const result = s.kind === "move" ? computeMove(s, e) : computeTrim(s, e);
-          if (result.ghost.valid) {
+          const ghost = result.ghosts[0];
+          if (ghost && ghost.valid) {
             if (s.kind === "move") {
-              move(s.clipId, result.ghost.inFrame - s.originIn, {
-                toTrack: result.ghost.trackId,
-                clampToBounds: false,
-              });
+              const delta = ghost.inFrame - s.originIn;
+              if (s.followers.length > 0) {
+                // 整组一次提交（一条撤销），而且**不带目标轨道**——多选拖拽不换轨
+                moveGroup([s.clipId, ...s.followers.map((f) => f.clipId)], delta, false);
+              } else {
+                move(s.clipId, delta, { toTrack: ghost.trackId, clampToBounds: false });
+              }
             } else {
               const delta =
                 s.edge === "in"
-                  ? result.ghost.inFrame - s.originIn
-                  : result.ghost.inFrame + result.ghost.lengthFrames - s.originOut;
+                  ? ghost.inFrame - s.originIn
+                  : ghost.inFrame + ghost.lengthFrames - s.originOut;
               trim(s.clipId, s.edge, delta);
             }
           }
@@ -263,13 +333,35 @@ export function useClipDrag(pxPerFrame: number): ClipDragApi {
       target.addEventListener("pointerup", onUp);
       target.addEventListener("pointercancel", onCancel);
     },
-    [computeMove, computeTrim, move, publishHint, reset, trim],
+    [computeMove, computeTrim, move, moveGroup, publishHint, reset, select, trim],
   );
 
   const onClipPointerDown = useCallback(
     (event: ReactPointerEvent<HTMLElement>, clip: Clip, trackId: TrackId) => {
-      // 按下即选中，和真实 NLE 一致；不等到 click，否则拖拽后选中态会滞后
-      select(clip.id);
+      // ⌘/Ctrl 按下 = 加减选择，**不启动拖拽**。加选的那一下顺手把片段拖走是"选了 A
+      // 拿到 B"：用户的手势是"再选一个"，位移只是手抖
+      if (event.metaKey || event.ctrlKey) {
+        event.stopPropagation();
+        toggleSelect(clip.id);
+        return;
+      }
+
+      // 按下即选中，和真实 NLE 一致；不等到 click，否则拖拽后选中态会滞后。
+      // **已经在多选里的片段不要把选中收缩成它自己**：那样一按就丢掉整组，
+      // 而用户接下来正是要拖这一组
+      const inGroup = selectedClipIds.includes(clip.id);
+      if (!inGroup) select(clip.id);
+
+      const followers =
+        inGroup && selectedClipIds.length > 1
+          ? selectedClipIds
+              .filter((id) => id !== clip.id)
+              .flatMap((id) => {
+                const found = findFollower(timeline, id);
+                return found ? [found] : [];
+              })
+          : [];
+
       begin(event, {
         kind: "move",
         clipId: clip.id,
@@ -278,13 +370,16 @@ export function useClipDrag(pxPerFrame: number): ClipDragApi {
         lengthFrames: clipDuration(clip),
         startX: event.clientX,
         startY: event.clientY,
+        followers,
       });
     },
-    [begin, select],
+    [begin, select, selectedClipIds, timeline, toggleSelect],
   );
 
   const onHandlePointerDown = useCallback(
     (event: ReactPointerEvent<HTMLElement>, clip: Clip, trackId: TrackId, edge: TrimEdge) => {
+      // 裁切永远只作用于一个片段（多选裁切要么按各自长度按比例缩、要么全裁同一个量，
+      // 两种都不是明显正确的），所以按住边缘就把选中收缩成它自己——那是看得见的降级
       select(clip.id);
       begin(event, {
         kind: "trim",
@@ -301,17 +396,33 @@ export function useClipDrag(pxPerFrame: number): ClipDragApi {
   );
 
   return {
-    ghost,
+    ghosts,
     snapLine,
-    dragging: ghost !== null,
+    dragging: ghosts.length > 0,
     onClipPointerDown,
     onHandlePointerDown,
   };
 }
 
-/** 供 Timeline 复用：某轨道上要不要画幽灵。 */
-export function ghostForTrack(ghost: Ghost | null, trackId: TrackId): Ghost | null {
-  return ghost && ghost.trackId === trackId ? ghost : null;
+/** 整组拖拽要记住每个同伴的原位置和长度。找不到就跳过（选中集合可能刚被撤销掉一部分）。 */
+function findFollower(timeline: Timeline, clipId: string): Follower | null {
+  for (const track of timeline.tracks) {
+    const clip = track.clips.find((c) => c.id === clipId);
+    if (clip) {
+      return {
+        clipId,
+        trackId: track.id,
+        originIn: clip.timelineIn,
+        lengthFrames: clipDuration(clip),
+      };
+    }
+  }
+  return null;
+}
+
+/** 供 Timeline 复用：某轨道上要画哪些幽灵。 */
+export function ghostsForTrack(ghosts: readonly Ghost[], trackId: TrackId): readonly Ghost[] {
+  return ghosts.filter((g) => g.trackId === trackId);
 }
 
 /** 幽灵的合法性也决定了鼠标样式与提示文案。 */

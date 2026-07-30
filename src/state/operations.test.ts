@@ -28,6 +28,11 @@ import {
   moveClip,
   moveKeyframe,
   removeClip,
+  removeClips,
+  moveClips,
+  copyClips,
+  pasteClips,
+  duplicateClips,
   removeKeyframe,
   rippleDeleteClip,
   setClipColor,
@@ -377,7 +382,7 @@ describe("文字片段", () => {
 
 describe("磁吸", () => {
   it("收集其他片段两端、播放头和起点", () => {
-    const targets = snapTargets(twoClipTimeline(), "a", { playhead: 150 });
+    const targets = snapTargets(twoClipTimeline(), ["a"], { playhead: 150 });
     expect(targets).toContain(0);
     expect(targets).toContain(100); // b 的入点
     expect(targets).toContain(200); // b 的出点
@@ -386,8 +391,22 @@ describe("磁吸", () => {
 
   it("排除被拖动片段自身，否则永远吸回原位", () => {
     const t = timeline([{ id: "V1", kind: "video", clips: [clip("a", 37, 137)] }]);
-    expect(snapTargets(t, "a")).not.toContain(37);
-    expect(snapTargets(t, null)).toContain(37);
+    expect(snapTargets(t, ["a"])).not.toContain(37);
+    expect(snapTargets(t, [])).toContain(37);
+  });
+
+  // 整组拖拽时同伴也在移动，吸到它们的**原**位置是错的（表现是整组拖起来一顿一顿的）
+  it("排除的是一组 id，整组拖拽时同伴的两端也不参与吸附", () => {
+    const t = timeline([
+      { id: "V1", kind: "video", clips: [clip("a", 0, 50), clip("b", 60, 90)] },
+      { id: "V2", kind: "video", clips: [clip("c", 200, 240)] },
+    ]);
+    const targets = snapTargets(t, ["a", "b"]);
+    expect(targets).not.toContain(60);
+    expect(targets).not.toContain(90);
+    // 不在组里的照常参与
+    expect(targets).toContain(200);
+    expect(targets).toContain(240);
   });
 
   it("阈值内吸附，阈值外不动", () => {
@@ -2150,6 +2169,300 @@ describe("复制 / 粘贴 / 副本", () => {
     ]);
     expect(duplicateClip(t, "a").reason).toMatch(/放不下/);
     expect(duplicateClip(t, "缺").reason).toMatch(/找不到片段/);
+  });
+});
+
+describe("多选：整组平移", () => {
+  /** V1 上 a[0,100) b[200,300)，V2 上 c[400,500)。 */
+  const base = () =>
+    timeline([
+      { id: "V1", kind: "video", clips: [clip("a", 0, 100), clip("b", 200, 300)] },
+      { id: "V2", kind: "video", clips: [clip("c", 400, 500)] },
+    ]);
+
+  it("整组同一个位移，跨轨道也一起动", () => {
+    const r = moveClips(base(), ["a", "b", "c"], 50);
+    expect(r.changed).toBe(true);
+    expect(findClip(r.timeline, "a")?.clip.timelineIn).toBe(50);
+    expect(findClip(r.timeline, "b")?.clip.timelineIn).toBe(250);
+    expect(findClip(r.timeline, "c")?.clip.timelineIn).toBe(450);
+    // 轨道没变
+    expect(findClip(r.timeline, "c")?.track.id).toBe("V2");
+  });
+
+  it("**移动中的片段之间不算重叠**——否则整组右移一格就撞上自己的同伴", () => {
+    // a[0,100) b[100,200) 紧邻。右移 10 帧时 a 的新位置 [10,110) 压在 b 的**原**位置上，
+    // 而 b 也在移动。把移动集合排掉是这条的全部内容，漏掉的表现是"多选之后拖不动"
+    const t = timeline([
+      { id: "V1", kind: "video", clips: [clip("a", 0, 100), clip("b", 100, 200)] },
+    ]);
+    const r = moveClips(t, ["a", "b"], 10);
+    expect(r.reason).toBeUndefined();
+    expect(findClip(r.timeline, "a")?.clip.timelineIn).toBe(10);
+    expect(findClip(r.timeline, "b")?.clip.timelineIn).toBe(110);
+  });
+
+  it("**任何一个放不下就整组拒绝**，一个字段都不改", () => {
+    const t = timeline([
+      { id: "V1", kind: "video", clips: [clip("a", 0, 100), clip("b", 200, 300)] },
+      { id: "V2", kind: "video", clips: [clip("c", 400, 500), { ...clip("blocker", 500, 600), name: "拦路的" }] },
+    ]);
+    const r = moveClips(t, ["a", "b", "c"], 100);
+    expect(r.changed).toBe(false);
+    expect(r.reason).toMatch(/拦路的/);
+    // 原时间轴原样返回
+    expect(findClip(r.timeline, "a")?.clip.timelineIn).toBe(0);
+    expect(findClip(r.timeline, "b")?.clip.timelineIn).toBe(200);
+  });
+
+  it("**夹紧是整组一起挪，不是把越界的各自压到 0**", () => {
+    // 各自压到 0 会让 a 和 b 都落在 0、叠成一堆——正是"相对位置就是内容"被破坏的形态。
+    // a[30,130) b[200,300) 左移 50：只能挪 30，于是 a 落 0 而 b 落 170（间距 170 不变）
+    const t = timeline([
+      { id: "V1", kind: "video", clips: [clip("a", 30, 130), clip("b", 200, 300)] },
+    ]);
+    const r = moveClips(t, ["a", "b"], -50);
+    expect(r.changed).toBe(true);
+    expect(findClip(r.timeline, "a")?.clip.timelineIn).toBe(0);
+    expect(findClip(r.timeline, "b")?.clip.timelineIn).toBe(170);
+  });
+
+  it("已经贴着 0 还往左拖：夹紧之后位移是 0，算「值没变」不算失败", () => {
+    // 不写这条的话上面那句"夹紧"很容易被实现成"夹到 0 再照常提交"，于是每一次
+    // 拖不动的拖拽都进一条空历史
+    const r = moveClips(base(), ["a", "b"], -50);
+    expect(r.changed).toBe(false);
+    expect(r.reason).toBeUndefined();
+  });
+
+  it("clampToBounds:false 时越界直接拒", () => {
+    const r = moveClips(base(), ["a", "b"], -50, { clampToBounds: false });
+    expect(r.changed).toBe(false);
+    expect(r.reason).toMatch(/起点之前/);
+  });
+
+  it("锁定轨道上的片段让整组被拒", () => {
+    const t = timeline([
+      { id: "V1", kind: "video", clips: [clip("a", 0, 100)] },
+      { id: "V2", kind: "video", locked: true, label: "叠加", clips: [clip("c", 400, 500)] },
+    ]);
+    const r = moveClips(t, ["a", "c"], 10);
+    expect(r.changed).toBe(false);
+    expect(r.reason).toMatch(/锁定/);
+  });
+
+  it("**只有一个 id 时逐字段等于 `moveClip`**——多选退化成一个必须和没多选过一样", () => {
+    const one = moveClips(base(), ["a"], 40);
+    const plain = moveClip(base(), "a", 40);
+    expect(one.changed).toBe(plain.changed);
+    expect(one.timeline).toEqual(plain.timeline);
+    // 被拒时也一样（40+100 会压到 b[200,300)？不会——所以这里用一个真撞上的位移）
+    expect(moveClips(base(), ["a"], 150).reason).toBe(moveClip(base(), "a", 150).reason);
+  });
+
+  it("位移为 0 时不算失败也不进历史（第三种结果）", () => {
+    const r = moveClips(base(), ["a", "b"], 0);
+    expect(r.changed).toBe(false);
+    expect(r.reason).toBeUndefined();
+  });
+
+  it("重复 id 只算一次", () => {
+    const r = moveClips(base(), ["a", "a", "b"], 10);
+    expect(r.changed).toBe(true);
+    expect(findClip(r.timeline, "a")?.clip.timelineIn).toBe(10);
+  });
+
+  it("找不到片段时整组拒绝", () => {
+    expect(moveClips(base(), ["a", "缺"], 10).reason).toMatch(/找不到片段/);
+    expect(moveClips(base(), [], 10).reason).toMatch(/没有选中/);
+    expect(moveClips(base(), ["a", "b"], 1.5).reason).toMatch(/整数帧/);
+  });
+});
+
+describe("多选：批量删除", () => {
+  const base = () =>
+    timeline([
+      { id: "V1", kind: "video", clips: [clip("a", 0, 100), clip("b", 100, 200), clip("c", 200, 300)] },
+    ]);
+
+  it("一次删掉多个", () => {
+    const r = removeClips(base(), ["a", "c"]);
+    expect(r.changed).toBe(true);
+    expect(r.done).toBe(2);
+    expect(r.total).toBe(2);
+    expect(r.skippedReason).toBeUndefined();
+    expect(findClip(r.timeline, "a")).toBeUndefined();
+    expect(findClip(r.timeline, "b")?.clip.timelineIn).toBe(100);
+  });
+
+  it("**波纹删除多个：每一步从当前时间轴重读位置**", () => {
+    const r = removeClips(base(), ["a", "b"], true);
+    expect(r.changed).toBe(true);
+    expect(r.done).toBe(2);
+    // 各自左移自己的长度，c 最终回到 0
+    expect(findClip(r.timeline, "c")?.clip.timelineIn).toBe(0);
+  });
+
+  it("波纹删除的顺序不影响结果（几个删除彼此可交换）", () => {
+    const forward = removeClips(base(), ["a", "b"], true).timeline;
+    const backward = removeClips(base(), ["b", "a"], true).timeline;
+    expect(findClip(forward, "c")?.clip.timelineIn).toBe(findClip(backward, "c")?.clip.timelineIn);
+  });
+
+  it("**部分成功是合法结果，而它走 `skippedReason` 不走 `reason`**", () => {
+    // 走 reason 的话 `apply()` 在 changed:true 时根本不看它，用户会看到 1 个消失、
+    // 1 个还在，而软件一个字都没说
+    const t = timeline([
+      { id: "V1", kind: "video", clips: [clip("a", 0, 100)] },
+      { id: "V2", kind: "video", locked: true, clips: [clip("c", 400, 500)] },
+    ]);
+    const r = removeClips(t, ["a", "c"]);
+    expect(r.changed).toBe(true);
+    expect(r.done).toBe(1);
+    expect(r.total).toBe(2);
+    expect(r.reason).toBeUndefined();
+    expect(r.skippedReason).toMatch(/2 个片段里有 1 个没删/);
+    expect(r.skippedReason).toMatch(/锁定/);
+    expect(findClip(r.timeline, "a")).toBeUndefined();
+    expect(findClip(r.timeline, "c")).toBeDefined();
+  });
+
+  it("一个都没删成才算失败，原因走 reason", () => {
+    const t = timeline([{ id: "V1", kind: "video", locked: true, clips: [clip("a", 0, 100)] }]);
+    const r = removeClips(t, ["a"]);
+    expect(r.changed).toBe(false);
+    expect(r.done).toBe(0);
+    expect(r.reason).toMatch(/锁定/);
+    expect(removeClips(base(), []).reason).toMatch(/没有选中/);
+  });
+});
+
+describe("多选：批量复制 / 粘贴 / 副本", () => {
+  /** V1 上 a[0,100) b[200,300)，A1 上 m[0,50)。 */
+  const base = () =>
+    timeline([
+      { id: "V1", kind: "video", clips: [clip("a", 0, 100), clip("b", 200, 300)] },
+      { id: "A1", kind: "audio", clips: [clip("m", 0, 50)] },
+    ]);
+
+  it("**复制按 `timelineIn` 升序，不按选择顺序**", () => {
+    // 按点选顺序存的话，先点右边再点左边就会得到另一个锚点，同一组片段粘出来落在
+    // 不同位置——而两次操作看起来完全一样
+    const entries = copyClips(base(), ["b", "a"]);
+    expect(entries.map((e) => e.clip.id)).toEqual(["a", "b"]);
+  });
+
+  it("找不到的悄悄跳过，重复 id 只算一次", () => {
+    expect(copyClips(base(), ["a", "缺", "a"]).map((e) => e.clip.id)).toEqual(["a"]);
+  });
+
+  it("**粘贴：组的开头对齐播放头，组内相对位置保留**", () => {
+    const t = base();
+    const r = pasteClips(t, copyClips(t, ["a", "b"]), 500);
+    expect(r.changed).toBe(true);
+    expect(r.clipIds).toHaveLength(2);
+    const [first, second] = r.clipIds!.map((id) => findClip(r.timeline, id)!.clip);
+    expect(first!.timelineIn).toBe(500); // 最早那个落在播放头
+    expect(second!.timelineIn).toBe(700); // 200 帧的间隔原样保留
+    expect(second!.timelineOut).toBe(800);
+  });
+
+  it("**偏移按'离组内最早那个多远'算，不是各自的绝对帧号**", () => {
+    // 用绝对帧号的话粘贴会无视播放头、直接粘回原处（而单个片段时完全正常，
+    // 因为那时锚点就是它自己）——同 D35 那个被乘以零的因子
+    const t = base();
+    const r = pasteClips(t, copyClips(t, ["b"]), 400);
+    expect(findClip(r.timeline, r.clipIds![0]!)?.clip.timelineIn).toBe(400);
+  });
+
+  it("跨轨道的一组各自回到自己那条轨", () => {
+    const t = base();
+    const r = pasteClips(t, copyClips(t, ["a", "m"]), 600);
+    const tracks = r.clipIds!.map((id) => findClip(r.timeline, id)!.track.id);
+    expect(new Set(tracks)).toEqual(new Set(["V1", "A1"]));
+  });
+
+  it("**任何一个放不下就整组拒绝，原时间轴原样返回**", () => {
+    const t = base();
+    // 粘到 150：a 的副本落 [150,250)，b 的副本落 [350,450)——前者压在 b[200,300) 上
+    const r = pasteClips(t, copyClips(t, ["a", "b"]), 150);
+    expect(r.changed).toBe(false);
+    expect(r.reason).toMatch(/放不下/);
+    expect(t.tracks[0]!.clips).toHaveLength(2);
+    expect(r.timeline.tracks[0]!.clips).toHaveLength(2);
+  });
+
+  it("**新片段之间互相重叠也会被拦**（逐个插，后面的看得见前面的）", () => {
+    // 造一个"两份同一个片段"的剪贴板：绝对帧号相同 ⇒ 偏移都是 0 ⇒ 两个副本落在同一处
+    const t = base();
+    const one = copyClips(t, ["a"]);
+    const r = pasteClips(t, [...one, ...one], 500);
+    expect(r.changed).toBe(false);
+    expect(r.reason).toMatch(/放不下/);
+  });
+
+  it("空剪贴板 / 非法落点被拒", () => {
+    const t = base();
+    expect(pasteClips(t, [], 100).reason).toMatch(/剪贴板是空的/);
+    expect(pasteClips(t, copyClips(t, ["a"]), -1).reason).toMatch(/非负整数/);
+    expect(pasteClips(t, copyClips(t, ["a"]), 1.5).reason).toMatch(/非负整数/);
+  });
+
+  it("**副本：整组往后平移'组的跨度'**，相邻的几个也放得下", () => {
+    // 各自取自己的出点会让 A 的副本正好落在 B 头上，于是"选中相邻几个按 ⌘D"永远失败
+    const t = timeline([
+      { id: "V1", kind: "video", clips: [clip("a", 0, 100), clip("b", 100, 200)] },
+    ]);
+    const r = duplicateClips(t, ["a", "b"]);
+    expect(r.changed).toBe(true);
+    const copies = r.clipIds!.map((id) => findClip(r.timeline, id)!.clip);
+    expect(copies.map((c) => c.timelineIn)).toEqual([200, 300]);
+  });
+
+  it("**单个片段时和 `duplicateClip` 落在同一处**（跨度退化成它自己的长度）", () => {
+    const one = duplicateClip(base(), "a");
+    const many = duplicateClips(base(), ["a"]);
+    const a = findClip(one.timeline, one.clipId!)!.clip;
+    const b = findClip(many.timeline, many.clipIds![0]!)!.clip;
+    expect([b.timelineIn, b.timelineOut]).toEqual([a.timelineIn, a.timelineOut]);
+    expect(b.timelineIn).toBe(100);
+  });
+
+  it("组里有空档时空档跟着走", () => {
+    // a[0,100) b[200,300)：跨度 300，所以副本落 300 / 500，中间那 100 帧空档还在
+    const r = duplicateClips(base(), ["a", "b"]);
+    const copies = r.clipIds!.map((id) => findClip(r.timeline, id)!.clip);
+    expect(copies.map((c) => c.timelineIn)).toEqual([300, 500]);
+  });
+
+  it("放不下就整组拒绝；空选中和已不在的片段也拒绝", () => {
+    const t = timeline([
+      { id: "V1", kind: "video", clips: [clip("a", 0, 100), { ...clip("b", 100, 200), name: "拦路的" }] },
+    ]);
+    // a 的副本要落 [200,300)（跨度 200），而 b 的副本落 [300,400)——都空着，所以这一组能过
+    expect(duplicateClips(t, ["a", "b"]).changed).toBe(true);
+    // 只选 a：跨度是它自己的 100，副本落 [100,200) 正好撞上 b
+    expect(duplicateClips(t, ["a"]).reason).toMatch(/放不下/);
+    expect(duplicateClips(t, []).reason).toMatch(/没有选中/);
+    expect(duplicateClips(t, ["a", "缺"]).reason).toMatch(/已经不在了/);
+  });
+
+  it("**副本也要把 `transitionIn` 删掉**，而整组的落点永远紧接着组尾", () => {
+    const t = timeline([
+      {
+        id: "V1",
+        kind: "video",
+        clips: [
+          clip("a", 0, 100),
+          { ...clip("b", 100, 200), transitionIn: { kind: "dissolve", frames: 20 } },
+        ],
+      },
+    ]);
+    const r = duplicateClips(t, ["a", "b"]);
+    expect(r.changed).toBe(true);
+    for (const id of r.clipIds!) {
+      expect("transitionIn" in findClip(r.timeline, id)!.clip).toBe(false);
+    }
   });
 });
 
