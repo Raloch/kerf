@@ -91,6 +91,9 @@ export function Editor({
   const undoLabel = useTimeline((s) => s.undoLabel());
   const redoLabel = useTimeline((s) => s.redoLabel());
   const splitAtPlayhead = useTimeline((s) => s.splitAtPlayhead);
+  const copySelected = useTimeline((s) => s.copySelected);
+  const paste = useTimeline((s) => s.paste);
+  const duplicateSelected = useTimeline((s) => s.duplicateSelected);
   const removeSelected = useTimeline((s) => s.removeSelected);
 
   const [caps, setCaps] = useState<ExportCapabilities | null>(null);
@@ -334,6 +337,23 @@ export function Editor({
         splitAtPlayhead();
         return;
       }
+      // ⌘C / ⌘V / ⌘D。**要 preventDefault**：⌘C 会把编辑器里的选区（这里没有）交给
+      // 系统剪贴板、⌘D 在浏览器里是"加书签"，两者都会让快捷键看起来"有时候不灵"
+      if (meta && e.key.toLowerCase() === "c") {
+        e.preventDefault();
+        copySelected();
+        return;
+      }
+      if (meta && e.key.toLowerCase() === "v") {
+        e.preventDefault();
+        paste();
+        return;
+      }
+      if (meta && e.key.toLowerCase() === "d") {
+        e.preventDefault();
+        duplicateSelected();
+        return;
+      }
       if (e.key === "Backspace" || e.key === "Delete") {
         e.preventDefault();
         removeSelected(e.shiftKey);
@@ -350,7 +370,18 @@ export function Editor({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [exportOpen, playhead, redo, removeSelected, setPlayhead, splitAtPlayhead, undo]);
+  }, [
+    copySelected,
+    duplicateSelected,
+    exportOpen,
+    paste,
+    playhead,
+    redo,
+    removeSelected,
+    setPlayhead,
+    splitAtPlayhead,
+    undo,
+  ]);
 
   // 检查器自己从 store 读选中片段；这里留一份是给状态栏和导出范围用的
   const selected = selectedClipId ? findClip(timeline, selectedClipId) : undefined;

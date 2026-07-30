@@ -438,3 +438,98 @@ describe("新建文字片段", () => {
     expect(useTimeline.getState().selectedClipId).toBeNull();
   });
 });
+
+describe("剪贴板", () => {
+  beforeEach(reset);
+
+  /**
+   * V1 有一个 [0,299) 的画面片段，播放头推到末尾。
+   *
+   * 给 400 会被 `setPlayhead` 夹到 299（它夹在 `[0, durationFrames]`，允许停在末尾以便
+   * 追加）——所以下面那条断言比的是**播放头的实际值**，不是我传进去的 400。
+   */
+  function seeded() {
+    const s = useTimeline.getState();
+    s.addSource(source(299), 0);
+    s.setPlayhead(400);
+    return useTimeline.getState();
+  }
+
+  it("复制**不进撤销栈**——它什么都没改", () => {
+    const s = seeded();
+    const before = s.undoLabel();
+    s.select("src1-v");
+    useTimeline.getState().copySelected();
+    expect(useTimeline.getState().clipboard?.clip.id).toBe("src1-v");
+    // 进了撤销栈的话用户要按两次 ⌘Z 才回到上一次真编辑
+    expect(useTimeline.getState().undoLabel()).toBe(before);
+  });
+
+  it("没有选中时复制是空操作，剪贴板不被清空", () => {
+    const s = seeded();
+    s.select("src1-v");
+    useTimeline.getState().copySelected();
+    useTimeline.getState().select(null);
+    useTimeline.getState().copySelected();
+    expect(useTimeline.getState().clipboard?.clip.id).toBe("src1-v");
+  });
+
+  it("粘贴落在播放头处并选中新片段，进一条撤销", () => {
+    const s = seeded();
+    s.select("src1-v");
+    useTimeline.getState().copySelected();
+    useTimeline.getState().paste();
+    const after = useTimeline.getState();
+    expect(after.undoLabel()).toBe("粘贴片段");
+    const id = after.selectedClipId;
+    expect(id).not.toBe("src1-v");
+    expect(after.playhead).toBe(299);
+    expect(findClip(after.timeline(), id!)?.clip.timelineIn).toBe(after.playhead);
+    // 撤销把它整个拿掉，而剪贴板不受影响（撤销栈里没有它）
+    useTimeline.getState().undo();
+    expect(findClip(useTimeline.getState().timeline(), id!)).toBeUndefined();
+    expect(useTimeline.getState().clipboard?.clip.id).toBe("src1-v");
+  });
+
+  it("剪贴板是空的时候粘贴什么都不做，也不报错", () => {
+    const s = seeded();
+    const before = s.undoLabel();
+    useTimeline.getState().paste();
+    expect(useTimeline.getState().undoLabel()).toBe(before);
+    expect(useTimeline.getState().lastRejection).toBeNull();
+  });
+
+  it("**⌘D 不冲掉剪贴板**", () => {
+    const s = seeded();
+    s.select("src1-v");
+    useTimeline.getState().copySelected();
+    useTimeline.getState().setPlayhead(0);
+    useTimeline.getState().duplicateSelected();
+    const after = useTimeline.getState();
+    // 副本紧接着原片段，不取播放头（那时播放头在 0，落点会和自己重叠）
+    expect(findClip(after.timeline(), after.selectedClipId!)?.clip.timelineIn).toBe(299);
+    expect(after.clipboard?.clip.id).toBe("src1-v");
+    expect(after.undoLabel()).toBe("片段副本");
+  });
+
+  it("副本被选中，于是连按 ⌘D 能复制出一串", () => {
+    const s = seeded();
+    s.select("src1-v");
+    for (let i = 0; i < 3; i++) useTimeline.getState().duplicateSelected();
+    const clips = useTimeline.getState().timeline().tracks.find((t) => t.id === "V1")?.clips ?? [];
+    expect(clips).toHaveLength(4);
+    expect(clips.map((c) => c.timelineIn)).toEqual([0, 299, 598, 897]);
+    expect(new Set(clips.map((c) => c.id)).size).toBe(4);
+  });
+
+  it("**切项目要清空剪贴板**——粘过去的片段会引用一个不在新项目里的素材", () => {
+    const s = seeded();
+    s.select("src1-v");
+    useTimeline.getState().copySelected();
+    expect(useTimeline.getState().clipboard).not.toBeNull();
+    useTimeline.getState().openProject("p2", EMPTY_TIMELINE, 0);
+    expect(useTimeline.getState().clipboard).toBeNull();
+    useTimeline.getState().closeProject();
+    expect(useTimeline.getState().clipboard).toBeNull();
+  });
+});

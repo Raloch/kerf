@@ -31,6 +31,9 @@ import {
   removeKeyframe,
   rippleDeleteClip,
   setClipColor,
+  copyClip,
+  duplicateClip,
+  pasteClip,
   setClipPreservePitch,
   setClipSpeed,
   setClipVolume,
@@ -1982,5 +1985,183 @@ describe("setClipPreservePitch：只换算法，不动长度", () => {
   it("锁定轨道上拒绝", () => {
     const locked = timeline([{ id: "V1", kind: "video", locked: true, clips: [clip("a", 0, 100)] }]);
     expect(setClipPreservePitch(locked, "a", true).reason).toMatch(/锁定/);
+  });
+});
+
+describe("复制 / 粘贴 / 副本", () => {
+  /** V1 上一个片段 [0,100)，A1 上一个 [0,200)。 */
+  const base = () =>
+    timeline([
+      { id: "V1", kind: "video", clips: [clip("a", 0, 100)] },
+      { id: "A1", kind: "audio", clips: [clip("m", 0, 200)] },
+    ]);
+  const entryOf = (t: Timeline, id: string) => {
+    const e = copyClip(t, id);
+    if (!e) throw new Error(`复制不到 ${id}`);
+    return e;
+  };
+
+  it("复制带上原轨道——粘贴要落回同一条轨，而片段自己看不出轨道种类", () => {
+    expect(copyClip(base(), "缺")).toBeNull();
+    const e = entryOf(base(), "m");
+    expect(e.trackId).toBe("A1");
+    expect(e.trackKind).toBe("audio");
+    expect(e.clip.id).toBe("m");
+  });
+
+  it("粘到播放头处，换一个新 id", () => {
+    const t = base();
+    const r = pasteClip(t, entryOf(t, "a"), 300);
+    expect(r.changed).toBe(true);
+    expect(r.clipId).toBeDefined();
+    expect(r.clipId).not.toBe("a");
+    const pasted = findClip(r.timeline, r.clipId!)?.clip;
+    expect(pasted?.timelineIn).toBe(300);
+    expect(pasted?.timelineOut).toBe(400);
+    // 原片段一个字段都没动
+    expect(findClip(r.timeline, "a")?.clip.timelineIn).toBe(0);
+  });
+
+  it("**连粘三次得到三个不同的片段**", () => {
+    // 模块级计数器在页面刷新之后才出错，这里是当场就错——所以这条断言比
+    // `newClipId` 那条更近：同一次会话里就必须唯一
+    let t = base();
+    const entry = entryOf(t, "a");
+    const ids: string[] = [];
+    for (const at of [300, 500, 700]) {
+      const r = pasteClip(t, entry, at);
+      expect(r.changed).toBe(true);
+      ids.push(r.clipId!);
+      t = r.timeline;
+    }
+    expect(new Set(ids).size).toBe(3);
+    expect(t.tracks.find((x) => x.id === "V1")?.clips).toHaveLength(4);
+  });
+
+  it("**`transitionIn` 必须整个删掉**，而判据是粘在某个片段**紧后面**", () => {
+    // 落点放远了这条断言就没有牙齿：`withClips` 的 `dropOrphanTransitions` 会把断了
+    // 交界的转场清掉，于是"忘了删"和"删了"输出相同（实测注入之后全绿）。真正的失效
+    // 形态是**新片段紧接着另一个片段**——那时交界成立、归一化不会动它，用户就凭空
+    // 多一个自己没加过的溶解，还刚好在新落点上（同 `splitClipAt` 右半段那条）。
+    // ⌘D 的落点恰恰永远是"紧后面"，所以这里两条都测。
+    const t = timeline([
+      {
+        id: "V1",
+        kind: "video",
+        clips: [
+          clip("a", 0, 100),
+          { ...clip("b", 100, 200), transitionIn: { kind: "dissolve", frames: 20 } },
+        ],
+      },
+    ]);
+    const e = entryOf(t, "b");
+    expect(e.clip.transitionIn).toBeDefined();
+
+    // 粘在 b 的紧后面：交界成立
+    const pastedNext = pasteClip(t, e, 200);
+    expect(pastedNext.changed).toBe(true);
+    expect("transitionIn" in findClip(pastedNext.timeline, pastedNext.clipId!)!.clip).toBe(false);
+
+    // 副本同理，而它的落点**只可能**是紧后面
+    const dup = duplicateClip(t, "b");
+    expect(dup.changed).toBe(true);
+    expect("transitionIn" in findClip(dup.timeline, dup.clipId!)!.clip).toBe(false);
+
+    // 粘到空地上也不许有（这一条弱，归一化本来也会清掉，留着当第二道）
+    const far = pasteClip(t, e, 400);
+    expect("transitionIn" in findClip(far.timeline, far.clipId!)!.clip).toBe(false);
+  });
+
+  it("关键帧、变换、调色、速度、音量全部照抄，关键帧偏移不动", () => {
+    let t = base();
+    t = setKeyframe(t, "a", "scaleX", 10, 1.5).timeline;
+    t = setKeyframe(t, "a", "scaleX", 60, 2).timeline;
+    t = setClipTransform(t, "a", { rotation: 0.5 }).timeline;
+    t = setClipColor(t, "a", { brightness: 1.2 }).timeline;
+    t = setClipVolume(t, "a", 0.4).timeline;
+    t = setClipSpeed(t, "a", SPEED_2X).timeline;
+
+    const r = pasteClip(t, entryOf(t, "a"), 300);
+    const pasted = media(findClip(r.timeline, r.clipId!)?.clip);
+    expect(pasted.keyframes?.scaleX?.map((k: { frame: number }) => k.frame)).toEqual([10, 60]);
+    expect(pasted.transform?.rotation).toBe(0.5);
+    expect(pasted.color?.brightness).toBe(1.2);
+    expect(pasted.volume).toBe(0.4);
+    expect(pasted.speed).toEqual(SPEED_2X);
+    expect(pasted.sourceIn).toBe(0);
+  });
+
+  it("放不下就拒绝，并报出挡路的是谁——不隐式挪走别人也不换轨道", () => {
+    const t = base();
+    const r = pasteClip(t, entryOf(t, "a"), 50);
+    expect(r.changed).toBe(false);
+    expect(r.reason).toMatch(/放不下/);
+    // 一个字节都没写进去
+    expect(r.timeline).toBe(t);
+  });
+
+  it("锁定轨道、原轨道消失、落点非法都拒绝", () => {
+    const locked = timeline([
+      { id: "V1", kind: "video", locked: true, clips: [clip("a", 0, 100)] },
+    ]);
+    expect(pasteClip(locked, entryOf(locked, "a"), 300).reason).toMatch(/锁定/);
+
+    const t = base();
+    const e = entryOf(t, "a");
+    expect(pasteClip(t, { ...e, trackId: "没有这条轨" }, 300).reason).toMatch(/已经不在了/);
+    expect(pasteClip(t, { ...e, trackKind: "audio" }, 300).reason).toMatch(/种类变了/);
+    expect(pasteClip(t, e, -1).reason).toMatch(/非负整数/);
+    expect(pasteClip(t, e, 1.5).reason).toMatch(/非负整数/);
+  });
+
+  it("**素材不在当前项目里要拒绝**——粘过去下次打开就崩", () => {
+    const t = base();
+    const e = entryOf(t, "a");
+    // 模拟跨项目：目标项目里没有这个素材（剪贴板活过 openProject）
+    const other: Timeline = { ...t, sources: [] };
+    const r = pasteClip(other, e, 300);
+    expect(r.changed).toBe(false);
+    expect(r.reason).toMatch(/不在当前项目里/);
+  });
+
+  it("文字片段也能粘，样式跟着走（它没有 sourceId，那条素材检查要放它过去）", () => {
+    const added = addTextClip(base(), { timelineIn: 300, durationFrames: 60, text: "标题" });
+    const t = setTextStyle(added.timeline, added.clipId!, { color: "#ff0000" }).timeline;
+    const r = pasteClip(t, entryOf(t, added.clipId!), 500);
+    expect(r.reason).toBeUndefined();
+    const pasted = findClip(r.timeline, r.clipId!)?.clip;
+    expect(pasted?.kind).toBe("text");
+    if (pasted?.kind !== "text") throw new Error("粘出来的不是文字片段");
+    expect(pasted.text).toBe("标题");
+    expect(pasted.style?.color).toBe("#ff0000");
+  });
+
+  it("副本落在原片段的出点上（紧接着它），不取播放头", () => {
+    const r = duplicateClip(base(), "a");
+    expect(r.changed).toBe(true);
+    const copy = findClip(r.timeline, r.clipId!)?.clip;
+    expect(copy?.timelineIn).toBe(100);
+    expect(copy?.timelineOut).toBe(200);
+  });
+
+  it("紧接着的位置被占住时副本被拒", () => {
+    const t = timeline([
+      { id: "V1", kind: "video", clips: [clip("a", 0, 100), clip("b", 100, 200)] },
+    ]);
+    expect(duplicateClip(t, "a").reason).toMatch(/放不下/);
+    expect(duplicateClip(t, "缺").reason).toMatch(/找不到片段/);
+  });
+});
+
+describe("新片段 id 不是模块级计数器", () => {
+  it("文字片段的 id 不长成 `text-<小整数>`", () => {
+    // 判据刻意是**形状**而不是"两次不同"：计数器同样满足"两次不同"，而它真正的
+    // 毛病是跨会话——打开一个存过的项目（快照里带着上一次会话的 `text-1`）再新建
+    // 一个，新的也叫 `text-1`，而 `replaceClip` 按 id 映射会把两个一起改（D36 那条
+    // 长在片段上的版本）。单测造不出"上一次会话"，所以直接钉住 id 的形状
+    const first = addTextClip(twoClipTimeline(), { timelineIn: 300, durationFrames: 60, text: "甲" });
+    expect(first.clipId).not.toMatch(/^text-\d+$/);
+    const second = addTextClip(first.timeline, { timelineIn: 400, durationFrames: 60, text: "乙" });
+    expect(second.clipId).not.toBe(first.clipId);
   });
 });

@@ -35,6 +35,7 @@ import type { TextStyle } from "../compose/text-raster";
 import {
   clipDuration,
   clipSourceFrames,
+  clipSourceId,
   clipSpeed,
   findFont,
   scaleBySpeed,
@@ -62,6 +63,7 @@ import {
   frozenFrames,
   transitionWindow,
 } from "../edl/transition";
+import { newClipId } from "../media/source-id";
 import { rational, toNumber, type Rational } from "../time/rational";
 
 /** 操作失败时返回原对象，并给出原因，便于 UI 提示而不是静默无反应。 */
@@ -1301,8 +1303,6 @@ export function setTextStyle(
   return ok(replaceClip(timeline, found.track.id, setOptional(found.clip, "style", style)));
 }
 
-let textSeq = 0;
-
 export interface AddTextOptions {
   readonly timelineIn: number;
   readonly durationFrames: number;
@@ -1331,7 +1331,8 @@ export function addTextClip(timeline: Timeline, options: AddTextOptions): AddCli
     return reject(timeline, "文字片段至少要有 1 帧");
   }
 
-  const clipId = `text-${++textSeq}`;
+  // 不能用模块级计数器，理由见 `newClipId`（同 D36 那条，只是长在片段 id 上）
+  const clipId = newClipId("text");
   const clip: TextClip = {
     id: clipId,
     kind: "text",
@@ -1368,6 +1369,124 @@ export function addTextClip(timeline: Timeline, options: AddTextOptions): AddCli
     };
   }
   return reject(timeline, options.trackId ? lastReason : `所有画面轨在这个位置都放不下：${lastReason}`);
+}
+
+// ---------------------------------------------------------------------------
+// 复制 / 粘贴 / 副本
+// ---------------------------------------------------------------------------
+
+/**
+ * 剪贴板里的一份片段。
+ *
+ * **带上原轨道**，而不是只存片段：粘贴要落回同一条轨（音频片段粘到画面轨没有意义，
+ * 而 `TrackKind` 是轨道的属性、片段自己看不出来——字幕轨 T1 的 `kind` 就是 `"video"`）。
+ *
+ * **不进撤销栈、不进快照。** 前者同播放头和选中（复制没有改动任何东西）；后者是因为它
+ * 引用的 `sourceId` 可能在下次打开时已经不在了，而快照里一个引用不到素材的片段会让
+ * `resolveSource()` 抛错（D23）。
+ */
+export interface ClipboardEntry {
+  readonly clip: Clip;
+  readonly trackId: TrackId;
+  readonly trackKind: TrackKind;
+}
+
+/** 把这个片段放进剪贴板。找不到就返回 null（不算失败，UI 不提示）。 */
+export function copyClip(timeline: Timeline, clipId: ClipId): ClipboardEntry | null {
+  const found = findClip(timeline, clipId);
+  if (!found) return null;
+  return { clip: found.clip, trackId: found.track.id, trackKind: found.track.kind };
+}
+
+/**
+ * 复制一份片段用来插入别处。
+ *
+ * 两件必须做的事：
+ *
+ * - **换一个新 id**。用 `newClipId` 而不是任何计数器，理由见那个函数；而且这里的要求
+ *   更紧——连按三次粘贴必须得到三个不同的片段，模块计数器在页面刷新之后才出错，
+ *   这里是当场就错。
+ * - **`transitionIn` 整个删掉**。转场描述的是"这个片段和它前驱的交界"（D19），粘到别处
+ *   之后那个前驱不存在了；留着的话粘贴会凭空多一个用户自己没加过的溶解，还刚好在
+ *   新落点上——同 `splitClipAt` 右半段那条，这是第二次踩。
+ *
+ * **关键帧原样保留、偏移不动**：偏移相对片段起点，而这里换的只是片段落在时间轴的哪儿
+ * （同"在时间轴上平移片段不要动关键帧"）。变换 / 调色 / LUT / 音量 / 速度 / 保音高 /
+ * 文字样式全部照抄——用户复制一个片段要的就是"再来一个一样的"。
+ */
+function cloneAt(clip: Clip, timelineIn: number, prefix: string): Clip {
+  const frames = clip.timelineOut - clip.timelineIn;
+  const moved = {
+    ...clip,
+    id: newClipId(prefix),
+    timelineIn,
+    timelineOut: timelineIn + frames,
+  };
+  return setOptional(moved, "transitionIn", undefined);
+}
+
+/** 粘贴 / 副本共用的落点校验与插入。 */
+function insertClone(
+  timeline: Timeline,
+  entry: ClipboardEntry,
+  at: number,
+  prefix: string,
+): AddClipResult {
+  if (!Number.isInteger(at) || at < 0) return reject(timeline, "落点必须是非负整数帧");
+
+  const track = findTrack(timeline, entry.trackId);
+  if (!track) return reject(timeline, `原轨道 ${entry.trackId} 已经不在了`);
+  // 轨道种类变了（现在造不出来，留着是不信任将来新的轨道操作）
+  if (track.kind !== entry.trackKind) return reject(timeline, "原轨道的种类变了");
+  if (track.locked) return reject(timeline, `${track.label ?? track.id} 已锁定`);
+
+  // **素材必须还在当前项目里。** 剪贴板活过 `openProject`，所以跨项目粘贴是够得到的
+  // 姿势；而一个引用不到素材的片段会让快照恢复时 `resolveSource()` 抛错（D23），
+  // 也就是"粘完这一下，下次打开项目就崩"。store 那边同时会在切项目时清空剪贴板，
+  // 但那是体验；这一条才是契约——这个函数单独拿出来用也必须是安全的
+  // **`clipSourceId` 对文字片段返回的是 `null` 不是 `undefined`。** 判 `!== undefined`
+  // 会让 `null` 通过这道门、再去找一个 id 为 null 的素材，于是**文字片段永远粘不了**
+  // ——单测当场抓到（"这个素材不在当前项目里"）。返回类型写成 `SourceId | null` 正是
+  // 为了让这里必须显式判 null
+  const sourceId = clipSourceId(entry.clip);
+  if (sourceId !== null && !timeline.sources.some((s) => s.id === sourceId)) {
+    return reject(timeline, "这个素材不在当前项目里，粘不过来");
+  }
+
+  const clip = cloneAt(entry.clip, at, prefix);
+  const hits = collisionsIn(track, clip);
+  if (hits.length > 0) {
+    // 不隐式挪走别人、也不找别的轨道：静默换个位置就是"选了 A 拿到 B"（同 setClipSpeed）
+    return reject(timeline, `放不下：会和「${hits[0]!.name ?? hits[0]!.id}」重叠`);
+  }
+
+  return {
+    ...ok(mapTrack(timeline, track.id, (t) => withClips(t, [...t.clips, clip]))),
+    clipId: clip.id,
+  };
+}
+
+/**
+ * 把剪贴板里那份粘到 `at` 帧，落回**原来那条轨**。
+ *
+ * 不去别的轨道上找位置：paste 的落点是用户用播放头指定的，静默换一条轨等于替他改了
+ * 目标（同 `setClipSpeed` 放不下就拒绝，不隐式波纹）。放不下时报出挡路的是谁。
+ */
+export function pasteClip(timeline: Timeline, entry: ClipboardEntry, at: number): AddClipResult {
+  return insertClone(timeline, entry, at, "paste");
+}
+
+/**
+ * 就地做一个副本，放在**原片段的出点**上（紧接着它）。
+ *
+ * 落点不取播放头：⌘D 的语义是"再来一个"，而用户按它的时候播放头很可能就在这个片段
+ * 中间——那时按播放头放必然和自己重叠、直接被拒。紧接着放是唯一不需要用户先移动
+ * 播放头的落点。**刻意不动剪贴板**：⌘D 不该把 ⌘C 复制好的东西冲掉。
+ */
+export function duplicateClip(timeline: Timeline, clipId: ClipId): AddClipResult {
+  const entry = copyClip(timeline, clipId);
+  if (!entry) return reject(timeline, `找不到片段 ${clipId}`);
+  return insertClone(timeline, entry, entry.clip.timelineOut, "copy");
 }
 
 // ---------------------------------------------------------------------------

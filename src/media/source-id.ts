@@ -1,5 +1,8 @@
 /**
- * 生成素材 id。
+ * 生成**跨会话唯一**的 id——素材和片段都在这里，不要另开一处。
+ *
+ * 集中在一个模块不是为了整齐：下面那条 `randomUUID` 不可用时的退路必须**只有一份
+ * 实现**，两份的话其中一份迟早会变成"看起来唯一其实不唯一"，而撞 id 全程不报错。
  *
  * ## 为什么不能用模块级递增计数器
  *
@@ -25,6 +28,22 @@ export function newSourceId(): string {
 /** 图片素材。前缀不同只为可读，两者共用同一个命名空间。 */
 export function newImageSourceId(): string {
   return `src-img-${uuid()}`;
+}
+
+/**
+ * 新片段 id（文字片段、粘贴 / 副本）。
+ *
+ * **同一条纪律长在片段上，而它到 M6 末尾才被收拾**：`addTextClip` 原来用的是
+ * `text-${++textSeq}` 这个模块级计数器。表现和素材那次一模一样，只是更坏——打开一个
+ * 存过的项目（快照里带着上一次会话的 `text-1`）再新建一个文字片段，新的也叫 `text-1`，
+ * 而 `replaceClip` 是**按 id 映射**的：改一个片段的样式会把两个一起改，`findClip`
+ * 只返回先遇到的那个。全程不报错。
+ *
+ * 素材片段的 id 不走这里（`addSource` 用 `${source.id}-v` / `-a` 派生），因为素材 id
+ * 本身已经是 UUID，派生出来的天然唯一。
+ */
+export function newClipId(prefix: string): string {
+  return `${prefix}-${uuid()}`;
 }
 
 function uuid(): string {
