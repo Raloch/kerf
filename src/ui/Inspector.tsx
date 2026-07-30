@@ -38,7 +38,9 @@ import { decodeSizeFor } from "../compose/image-store";
 import {
   clipDuration,
   clipSourceId,
+  clipSpeed,
   findLut,
+  SPEED_RANGE,
   type Clip,
   type ImageClip,
   type MediaClip,
@@ -66,6 +68,7 @@ import { isShaderTransition } from "../compose/transition-shader";
 import { observedCapabilities } from "../compose/backend";
 import { useTimeline } from "../state/timeline-store";
 import { framesToTimecode, formatDuration } from "../time/timebase";
+import { rational, toNumber, type Rational } from "../time/rational";
 import { IconX } from "./icons";
 
 // ---------------------------------------------------------------------------
@@ -246,6 +249,10 @@ export function Inspector() {
         <SourceSection clip={clip} timeline={timeline} />
       )}
 
+      {/* 变速两种轨道都有：画面片段和配乐都可能要放快放慢。图片没有"源片的哪一刻"
+          （见 `MediaClip.speed`），文字更没有，所以只给素材片段 */}
+      {clip.kind === "media" && <SpeedSection clip={clip} timeline={timeline} />}
+
       {/* 转场两种轨道都有（画面混像素、声音混增益）；变换和调色只有画面才有意义 */}
       <TransitionSection clip={clip} track={track} timeline={timeline} />
       {track.kind === "video" && (
@@ -258,6 +265,97 @@ export function Inspector() {
           视频轨上的片段调了音量也不会有任何效果——那就是"能调但没用" */}
       {track.kind === "audio" && clip.kind === "media" && (
         <PropertySection group="audio" clip={clip} playhead={playhead} />
+      )}
+    </>
+  );
+}
+
+/** 速度预设。覆盖常用档位，任意值走旁边那个输入框。 */
+const SPEED_PRESETS: readonly Rational[] = [
+  { num: 1, den: 4 },
+  { num: 1, den: 2 },
+  { num: 1, den: 1 },
+  { num: 3, den: 2 },
+  { num: 2, den: 1 },
+  { num: 4, den: 1 },
+];
+
+/** 把倍数显示成百分比整数（2× → 200）。 */
+function speedPercent(speed: Rational): number {
+  return Math.round(toNumber(speed) * 100);
+}
+
+/**
+ * 速度那一节（D39）。
+ *
+ * **改速度会改片段长度**（保内容），所以这里同时报出新长度——用户点一下 2× 之后
+ * 片段在时间轴上缩短一半，不说明的话那看起来像"我的片段被吃掉了一半"。放不下时
+ * `setClipSpeed` 拒绝，原因走 `lastRejection` 到状态栏（同别的编辑操作）。
+ *
+ * **变调提示只在真的会变调时出现**：速度不是 1× **且**这个素材有音轨。给一个无声
+ * 的画面片段挂"声音会变调"是句假话，而产品里的假话要删不是补充说明（同 D37）。
+ * 这条提示本身是必须的——变调是一次**看得见（听得见）的取舍**，静默变调就是硬规则 10
+ * 那种"选了 A 拿到 B"；同余量不足时把定格帧数报到界面上（D19）。
+ *
+ * 范围从 `SPEED_RANGE` 取，**不在这里写第二份**：两处不一致时用户看到的是
+ * "输入框允许、松手弹回"（同 `PROPERTY_RANGES` 那条）。
+ */
+function SpeedSection({
+  clip,
+  timeline,
+}: {
+  readonly clip: MediaClip;
+  readonly timeline: Timeline;
+}) {
+  const setClipSpeed = useTimeline((s) => s.setClipSpeed);
+  const speed = clipSpeed(clip);
+  const percent = speedPercent(speed);
+  const source = timeline.sources.find((x) => x.id === clip.sourceId);
+  const frames = clip.timelineOut - clip.timelineIn;
+
+  return (
+    <>
+      <div className="grp-title">速度</div>
+      <div className="speed-presets">
+        {SPEED_PRESETS.map((preset) => {
+          const active = preset.num * speed.den === speed.num * preset.den;
+          return (
+            <button
+              key={`${preset.num}/${preset.den}`}
+              type="button"
+              className={active ? "on" : undefined}
+              onClick={() => setClipSpeed(clip.id, preset)}
+            >
+              {toNumber(preset)}×
+            </button>
+          );
+        })}
+      </div>
+      <div className="fields">
+        <div className="f">
+          <label>倍数</label>
+          {/* 复用 `NumberField`：那条"外部值变化时要丢掉草稿"的纪律只该有一处实现，
+              手搓一个的话点了预设之后输入框还显示上次输入的数字（踩过一次） */}
+          <NumberField
+            value={percent}
+            step={5}
+            min={Math.round(SPEED_RANGE.min * 100)}
+            max={Math.round(SPEED_RANGE.max * 100)}
+            digits={0}
+            suffix="%"
+            title="百分比。100% = 原速"
+            onCommit={(next) => setClipSpeed(clip.id, rational(Math.round(next), 100))}
+          />
+        </div>
+        <div className="f">
+          <label>片段长度</label>
+          <span className="val">
+            {frames} 帧 · {framesToTimecode(frames, timeline.fps)}
+          </span>
+        </div>
+      </div>
+      {percent !== 100 && source?.hasAudio === true && (
+        <p className="hint">声音会跟着变调（变速用的是重采样）。画面不受影响。</p>
       )}
     </>
   );

@@ -11,7 +11,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import {
   clipDuration,
+  clipSourceFrames,
   clipSourceId,
+  clipSpeed,
   sourceGridFps,
   type Clip,
   type Timeline as Tl,
@@ -629,6 +631,16 @@ function ClipView({
   const sourceId = clipSourceId(clip);
   const source = sourceId ? timeline.sources.find((s) => s.id === sourceId) : undefined;
   const sourceInFrame = clip.kind === "media" ? clip.sourceIn : 0;
+  /**
+   * 这个片段覆盖多少**源片**帧 / 秒——缩略图和波形横向铺开靠它。
+   *
+   * 变速下它不等于占位帧数（`clipSourceFrames`，原速下逐值相同）。漏乘的表现是
+   * **波形和缩略图与听到/看到的对不上**：2× 的片段只画出前一半的内容然后停住，
+   * 而两者各自看都"像是对的"。这里有三个量刻意分开：源片入点用**源片栅格**、
+   * 片段长度用**时间轴帧率**、覆盖多少源片再乘**速度**。
+   */
+  const sourceFrames = clip.kind === "media" ? clipSourceFrames(clip) : clipDuration(clip);
+  const speedFactor = clip.kind === "media" ? toNumber(clipSpeed(clip)) : 1;
   const label = clip.name ?? (clip.kind === "text" ? clip.text : source?.name) ?? clip.id;
   const length = clipDuration(clip);
   const widthPx = length * pxPerFrame;
@@ -663,7 +675,8 @@ function ClipView({
         widthPx,
         heightPx: h,
         sourceInFrame,
-        lengthFrames: length,
+        // 源片帧数，不是占位帧数（变速下两者不同，见 `sourceFrames`）
+        lengthFrames: sourceFrames,
       });
     };
 
@@ -686,7 +699,9 @@ function ClipView({
     return () => {
       cancelled = true;
     };
-  }, [sourceInFrame, kind, length, proxyUrl, pxPerFrame, source, widthPx]);
+  // `sourceFrames` 要进依赖：改了速度之后覆盖的源片区间变了，不重画的表现是
+  // 缩略图还铺着旧的那一段（画面看起来和时间轴对不上）
+  }, [sourceFrames, sourceInFrame, kind, length, proxyUrl, pxPerFrame, source, widthPx]);
 
   /**
    * 图片片段把**图本身**平铺成缩略条。
@@ -747,7 +762,8 @@ function ClipView({
           // 纯音频素材没有自己的帧率，栅格就是项目帧率（见 `sourceGridFps`），
           // 两者混用不报错，只表现成波形整体拉伸
           sourceInSeconds: sourceInFrame / toNumber(sourceGridFps(source, timeline.fps)),
-          lengthSeconds: length / toNumber(timeline.fps),
+          // 这一段铺开的是**源片**秒数：占位秒数 × 速度（见 `sourceFrames` 那段注释）
+          lengthSeconds: (length / toNumber(timeline.fps)) * speedFactor,
           color: WAVE_COLOR,
         });
       }
@@ -783,6 +799,8 @@ function ClipView({
     length,
     source,
     sourceInFrame,
+    // 同缩略图那条：改了速度波形横向铺开的范围就变了
+    speedFactor,
     timeline.fps,
     volumeBase,
     widthPx,

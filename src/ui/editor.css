@@ -1975,3 +1975,36 @@
 .ed .ed-savebar .chip-btn {
   flex: 0 0 auto;
 }
+
+/* 速度预设。作用域化到 `.ed`，见 UI 约定「新增样式文件先作用域化」 */
+/* 三列两行，不用 flex-wrap：6 个按钮在 210px 宽的面板里排不成一行，
+   自动换行会得到 5+1 的参差版式（实测过） */
+.ed .speed-presets {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+  padding: 8px 11px 0;
+}
+
+.ed .speed-presets button {
+  padding: 4px 0;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--tx-dim);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.ed .speed-presets button:hover {
+  color: var(--tx);
+  border-color: var(--line-2);
+}
+
+/* 当前档位要一眼看出来——不然点了 2× 之后没有任何反馈说"现在是 2×" */
+.ed .speed-presets button.on {
+  color: var(--tx);
+  background: color-mix(in oklab, var(--kerf) 14%, var(--panel));
+  border-color: var(--kerf-soft);
+}
