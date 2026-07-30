@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { FPS } from "../time/rational";
-import { clipSourceFrames, clipsUsingEffects } from "../edl/types";
-import { layerLooks, videoTracksInDrawOrder, visibleVideoClips, type VisibleClip } from "../edl/sampling";
+import { clipDuration, clipSourceFrames, clipsUsingEffects } from "../edl/types";
+import {
+  layerLooks,
+  sourceMicrosAt,
+  videoTracksInDrawOrder,
+  visibleVideoClips,
+  type VisibleClip,
+} from "../edl/sampling";
 import type { LutSource } from "../edl/types";
 import type {
   AudioOnlySource,
@@ -20,6 +26,9 @@ import {
   addLut,
   addSource,
   addTrack,
+  freezeClipAt,
+  unfreezeClip,
+  withNormalizedTracks,
   removeSource,
   removeTrack,
   renameProject,
@@ -2895,6 +2904,258 @@ describe("layerLooks：两条渲染路径的同一份字段", () => {
     expect(looks.transform).toEqual({ x: 20 });
     expect("color" in looks).toBe(false);
     expect("lut" in looks).toBe(false);
+  });
+});
+
+describe("定格帧（D48）", () => {
+  /** V1 上一个 [100,200) 的片段，`sourceIn` 是 50；A1 上它的声音兄弟。 */
+  const withClip = (): Timeline =>
+    timeline([
+      { id: "V1", kind: "video", clips: [clip("v", 100, 200, 50)] },
+      { id: "A1", kind: "audio", clips: [clip("a", 100, 200, 50)] },
+    ]);
+
+  const frozenTimeline = (): Timeline => {
+    const result = freezeClipAt(withClip(), "v", 130);
+    expect(result.changed).toBe(true);
+    return result.timeline;
+  };
+
+  describe("入口", () => {
+    it("定格把 sourceIn 挪到播放头那一帧并置上 freeze", () => {
+      const frozen = media(findClip(frozenTimeline(), "v")?.clip);
+      // 播放头 130，片段从 100 起、sourceIn 50 → 定在源片第 80 帧
+      expect(frozen.sourceIn).toBe(80);
+      expect(frozen.freeze).toBe(true);
+      // 占位一个字都不动：定格改的是"画哪一帧"，不是"占多久"
+      expect(frozen.timelineIn).toBe(100);
+      expect(frozen.timelineOut).toBe(200);
+    });
+
+    it("变速片段按 scaleBySpeed 换算，和裁入点同一套", () => {
+      const fast = setClipSpeed(withClip(), "v", { num: 2, den: 1 });
+      expect(fast.changed).toBe(true);
+      // 2× 之后片段是 [100,150)，播放头 120 → 走了 20 个时间轴帧 = 40 源片帧
+      const frozen = media(findClip(freezeClipAt(fast.timeline, "v", 120).timeline, "v")?.clip);
+      expect(frozen.sourceIn).toBe(90);
+    });
+
+    it("播放头不在片段里时拒绝，不夹到最近的一端", () => {
+      const before = withClip();
+      for (const frame of [99, 200, 300]) {
+        const result = freezeClipAt(before, "v", frame);
+        expect(result.changed).toBe(false);
+        expect(result.reason).toContain("播放头不在");
+        expect(result.timeline).toBe(before);
+      }
+      // 左闭右开：入点那一帧算在里面，出点那一帧不算
+      expect(freezeClipAt(before, "v", 100).changed).toBe(true);
+    });
+
+    it("已经定格了算“值没变”，不给 reason", () => {
+      const result = freezeClipAt(frozenTimeline(), "v", 150);
+      expect(result.changed).toBe(false);
+      expect(result.reason).toBeUndefined();
+    });
+
+    it("音频轨上的片段拒绝——真存下去的后果是那一段静音", () => {
+      const result = freezeClipAt(withClip(), "a", 130);
+      expect(result.changed).toBe(false);
+      expect(result.reason).toContain("画面轨");
+    });
+
+    it("文字片段和图片片段各有自己的说法", () => {
+      const withText = timeline([
+        { id: "V1", kind: "video", clips: [textClip("t", 0, 100)] },
+        {
+          id: "V2",
+          kind: "video",
+          clips: [{ id: "p", kind: "image", sourceId: "src", timelineIn: 0, timelineOut: 100 }],
+        },
+      ]);
+      expect(freezeClipAt(withText, "t", 50).reason).toContain("素材片段");
+      expect(freezeClipAt(withText, "p", 50).reason).toContain("本来就是静止");
+    });
+
+    it("锁定轨道上拒绝", () => {
+      const locked = timeline([
+        { id: "V1", kind: "video", locked: true, clips: [clip("v", 0, 100)] },
+      ]);
+      expect(freezeClipAt(locked, "v", 50).reason).toContain("已锁定");
+    });
+  });
+
+  describe("取帧恒定", () => {
+    it("整段每一帧都映射到同一个源片时刻", () => {
+      const frozen = media(findClip(frozenTimeline(), "v")?.clip);
+      const at = (frame: number) =>
+        sourceMicrosAt(frozen, frame, FPS.ndf2997, FPS.ndf2997);
+      const expected = at(100);
+      for (const frame of [100, 101, 130, 150, 199]) {
+        expect(at(frame)).toBe(expected);
+      }
+      // 而对照：不定格的同一个片段每一帧都在往前走
+      const moving = media(findClip(withClip(), "v")?.clip);
+      expect(sourceMicrosAt(moving, 150, FPS.ndf2997, FPS.ndf2997)).not.toBe(
+        sourceMicrosAt(moving, 100, FPS.ndf2997, FPS.ndf2997),
+      );
+    });
+
+    it("定格片段身上留着 speed 也不影响取帧（判在速度之前）", () => {
+      // 手工造一个"定格 + 2×"的片段：调速度会被拒，但字段可能是定格之前设的
+      const both: MediaClip = {
+        ...clip("v", 100, 200, 80),
+        freeze: true,
+        speed: { num: 2, den: 1 },
+      };
+      const at = (frame: number) => sourceMicrosAt(both, frame, FPS.ndf2997, FPS.ndf2997);
+      expect(at(199)).toBe(at(100));
+    });
+
+    it("消耗的源片帧数是 1，与占位多长、速度多少无关", () => {
+      const frozen = media(findClip(frozenTimeline(), "v")?.clip);
+      expect(clipSourceFrames(frozen)).toBe(1);
+      expect(clipSourceFrames({ ...frozen, timelineOut: 100_000 })).toBe(1);
+      expect(clipSourceFrames({ ...frozen, speed: { num: 4, den: 1 } })).toBe(1);
+    });
+  });
+
+  describe("裁切与切分不动定住的那一帧", () => {
+    it("裁入点不推 sourceIn", () => {
+      const trimmed = trimClip(frozenTimeline(), "v", "in", 20);
+      expect(trimmed.changed).toBe(true);
+      const clip = media(findClip(trimmed.timeline, "v")?.clip);
+      expect(clip.timelineIn).toBe(120);
+      expect(clip.sourceIn).toBe(80); // 一个字都没动
+    });
+
+    it("出点拉到远超源片长度也放行（一帧素材铺任意长）", () => {
+      // 源片只有 1000 帧，定住的是第 80 帧；不定格的话这里必然被"到源片末尾"挡住
+      const stretched = trimClip(frozenTimeline(), "v", "out", 5000);
+      expect(stretched.changed).toBe(true);
+      expect(clipDuration(media(findClip(stretched.timeline, "v")?.clip))).toBe(5100);
+      // 对照：同一个片段不定格时被挡下来
+      const moving = trimClip(withClip(), "v", "out", 5000);
+      expect(moving.changed).toBe(false);
+      expect(moving.reason).toContain("源片末尾");
+    });
+
+    it("切分之后两半段定的是同一帧", () => {
+      const split = splitClipAt(frozenTimeline(), "v", 150);
+      expect(split.changed).toBe(true);
+      const clips = split.timeline.tracks.find((t) => t.id === "V1")!.clips.map(media);
+      expect(clips).toHaveLength(2);
+      expect(clips[0]!.sourceIn).toBe(80);
+      expect(clips[1]!.sourceIn).toBe(80);
+      expect(clips[1]!.freeze).toBe(true);
+    });
+  });
+
+  describe("转场余量是无穷", () => {
+    it("定在源片第 0 帧的片段做入场侧也不报定格帧数", () => {
+      // 入场侧的余量平时就是 sourceIn，定在第 0 帧时它是 0——不给无穷分支的话
+      // 这里会报出一个不存在的定格帧数
+      const base = timeline([
+        {
+          id: "V1",
+          kind: "video",
+          clips: [
+            clip("a", 0, 100, 500),
+            { ...clip("b", 100, 200, 0), transitionIn: { kind: "dissolve", frames: 12 } },
+          ],
+        },
+      ]);
+      const before = junctionInfo(base, "b");
+      expect(before?.shortfall.to).toBeGreaterThan(0);
+
+      const frozen = freezeClipAt(base, "b", 100);
+      expect(frozen.changed).toBe(true);
+      const after = junctionInfo(frozen.timeline, "b");
+      expect(after?.effectiveFrames).toBe(before?.effectiveFrames);
+      expect(after?.shortfall.to).toBe(0);
+    });
+
+    it("定格片段做出场侧同样不定格", () => {
+      const base = timeline(
+        [
+          {
+            id: "V1",
+            kind: "video",
+            clips: [
+              clip("a", 0, 100, 0),
+              { ...clip("b", 100, 200, 0), transitionIn: { kind: "dissolve", frames: 12 } },
+            ],
+          },
+        ],
+        100, // 源片只有 100 帧：a 用光了它，出场侧一帧余量都没有
+      );
+      expect(junctionInfo(base, "b")?.shortfall.from).toBeGreaterThan(0);
+      const frozen = freezeClipAt(base, "a", 50);
+      expect(junctionInfo(frozen.timeline, "b")?.shortfall.from).toBe(0);
+    });
+  });
+
+  describe("解除定格", () => {
+    it("素材够长时从定住那一帧继续播", () => {
+      const thawed = unfreezeClip(frozenTimeline(), "v");
+      expect(thawed.changed).toBe(true);
+      const clip = media(findClip(thawed.timeline, "v")?.clip);
+      expect(clip.freeze).toBeUndefined();
+      expect("freeze" in clip).toBe(false); // 真 delete，不留 false
+      expect(clip.sourceIn).toBe(80);
+    });
+
+    it("**素材不够长时拒绝**，并报出要多少、还剩多少", () => {
+      // 定格之后把片段拉到 5000 帧，而定住那一帧之后只剩 920 帧
+      const stretched = trimClip(frozenTimeline(), "v", "out", 5000).timeline;
+      const result = unfreezeClip(stretched, "v");
+      expect(result.changed).toBe(false);
+      expect(result.reason).toContain("5100");
+      expect(result.reason).toContain("920");
+      expect(result.timeline).toBe(stretched);
+    });
+
+    it("没定格过算“值没变”，不给 reason", () => {
+      const result = unfreezeClip(withClip(), "v");
+      expect(result.changed).toBe(false);
+      expect(result.reason).toBeUndefined();
+    });
+  });
+
+  describe("与速度互斥", () => {
+    it("定格期间改速度被拒（不是静默无效）", () => {
+      const frozen = frozenTimeline();
+      const result = setClipSpeed(frozen, "v", { num: 2, den: 1 });
+      expect(result.changed).toBe(false);
+      expect(result.reason).toContain("定格");
+      expect(result.timeline).toBe(frozen);
+    });
+
+    it("定格之前设过的速度字段留着，解除之后还在", () => {
+      const fast = setClipSpeed(withClip(), "v", { num: 2, den: 1 }).timeline;
+      const frozen = freezeClipAt(fast, "v", 120).timeline;
+      expect(media(findClip(frozen, "v")?.clip).speed).toEqual({ num: 2, den: 1 });
+      const thawed = unfreezeClip(frozen, "v");
+      expect(media(findClip(thawed.timeline, "v")?.clip).speed).toEqual({ num: 2, den: 1 });
+    });
+  });
+
+  it("归一化兜底：音频轨上的 freeze 被清掉（手工快照才造得出来）", () => {
+    // 直接构造一条带 freeze 的音频片段，再走任何一次编辑触发归一化
+    const dirty: Timeline = timeline([
+      { id: "A1", kind: "audio", clips: [{ ...clip("a", 0, 100, 0), freeze: true }] },
+    ]);
+    const normalized = withNormalizedTracks(dirty, dirty.tracks);
+    const cleaned = media(findClip(normalized, "a")?.clip);
+    expect(cleaned.freeze).toBeUndefined();
+    expect("freeze" in cleaned).toBe(false);
+    // 画面轨上的同一个字段不动
+    const videoDirty: Timeline = timeline([
+      { id: "V1", kind: "video", clips: [{ ...clip("v", 0, 100, 0), freeze: true }] },
+    ]);
+    expect(media(findClip(withNormalizedTracks(videoDirty, videoDirty.tracks), "v")?.clip).freeze).toBe(
+      true,
+    );
   });
 });
 

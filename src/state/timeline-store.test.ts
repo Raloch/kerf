@@ -980,3 +980,45 @@ describe("轨道增删与删除素材的 store 连带处理", () => {
     expect(s().history.past.length).toBe(before);
   });
 });
+
+describe("定格的 store 接线（D48）", () => {
+  beforeEach(reset);
+
+  it("freezeAtPlayhead 用的是**当前播放头**，不是片段起点", () => {
+    const s = () => useTimeline.getState();
+    s().addSource(source(300)); // src1-v 落 V1，[0,300)
+    s().setPlayhead(120);
+    s().freezeAtPlayhead("src1-v");
+    const clip = findClip(s().timeline(), "src1-v")!.clip;
+    expect(clip.kind === "media" && clip.sourceIn).toBe(120);
+    expect(clip.kind === "media" && clip.freeze).toBe(true);
+    expect(s().undoLabel()).toBe("定格");
+    // 撤销一步回到未定格
+    s().undo();
+    const back = findClip(s().timeline(), "src1-v")!.clip;
+    expect(back.kind === "media" && back.freeze).toBeUndefined();
+  });
+
+  it("播放头不在片段里时，拒绝原因报到 lastRejection 且不进撤销栈", () => {
+    const s = () => useTimeline.getState();
+    s().addSource(source(300));
+    // 把片段挪到 [100,400)，播放头停在 50
+    s().moveClip("src1-v", 100);
+    s().setPlayhead(50);
+    const before = s().history.past.length;
+    s().freezeAtPlayhead("src1-v");
+    expect(s().lastRejection).toContain("播放头不在");
+    expect(s().history.past.length).toBe(before);
+  });
+
+  it("解除定格被素材长度挡住时同样报到 lastRejection", () => {
+    const s = () => useTimeline.getState();
+    s().addSource(source(300));
+    s().setPlayhead(280);
+    s().freezeAtPlayhead("src1-v"); // 定在源片第 280 帧，片段仍有 300 帧
+    s().unfreezeClip("src1-v");
+    expect(s().lastRejection).toMatch(/解除定格要 300 帧素材/);
+    const clip = findClip(s().timeline(), "src1-v")!.clip;
+    expect(clip.kind === "media" && clip.freeze).toBe(true);
+  });
+});

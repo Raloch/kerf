@@ -90,7 +90,36 @@ const WIPE_PROBE = WIPE_WIN_IN + 5;
 const WIPE_LEFT = { x: 0, y: 90, width: 60, height: 140 };
 const WIPE_RIGHT = { x: 160, y: 90, width: 160, height: 140 };
 
-const TIMELINE_FRAMES = E_OUT;
+/**
+ * 定格段：F[340,400) 紧跟 E，**整段定在源片第 150 帧**（**D48**）。
+ *
+ * 色相编码源片帧号，所以定格在这套自检里有一个**一眼可判**的判据：F 里任意两帧的
+ * 色相必须**相同**（都等于第 150 帧那个色相），而同样两帧在不定格时相差 50°。
+ * 这一条只有走完整条导出才验得到——reader 那侧是"游标停在同一帧不再前进"这条路径
+ * （`advance` 里那个循环），而它和"余量不足时夹住"共用同一段代码。
+ *
+ * 定格帧刻意**不取源片第 0 帧**：0 会让 `frameToMicros(sourceIn, …)` 恒等于 0，那时
+ * "取帧位置来自 `sourceIn`"这件事被乘以零、测不到（同 D35 那条被乘以零的因子）。
+ */
+const F_IN = 340;
+const F_OUT = 400;
+const F_SOURCE_IN = 150;
+/** F 里的两个取样帧，刻意隔得远：相邻两帧色相只差 1°，容差会把它吸收掉。 */
+const F_PROBE_EARLY = F_IN + 5;
+const F_PROBE_LATE = F_OUT - 5;
+
+/**
+ * "定格确实生效"的下限（度）。
+ *
+ * 不定格时那两帧相差 `F_PROBE_LATE - F_PROBE_EARLY = 50`°，定格时应该是 0（实测受
+ * 编码噪声影响约 1–2°）。阈值取 20 = `HUE_TOLERANCE`：它要同时离健康值（≈0）和
+ * 坏掉时的值（50）都远，同 `BLEND_MIN_DIFF` 那条的定法。
+ */
+const FREEZE_MIN_DIFF = 20;
+/** 定格段两帧"是同一帧"的容差（度）。同一个源片帧被编码两次，实测差 ≈ 0–2。 */
+const FREEZE_SAME_TOLERANCE = 10;
+
+const TIMELINE_FRAMES = F_OUT;
 const VERIFY_OUT = "kerf-verify-timeline.mp4";
 
 /** 色相容差。素材每帧变 1°，编码有损再加几度，20° 足够区分"差一帧"和"差一个片段"。 */
@@ -126,6 +155,10 @@ const PROBES: readonly Probe[] = [
   { frame: WIN_OUT + 5, label: "转场之后（纯 D）", expectSourceFrame: D_SOURCE_IN + WIN_OUT + 5 - D_IN },
   { frame: WIPE_PROBE, label: "擦除窗口内（shader 转场）", expectSourceFrame: "blend" },
   { frame: E_IN + 20, label: "擦除之后（纯 E）", expectSourceFrame: E_SOURCE_IN + 20 },
+  // 定格段的两帧**期望的都是同一个源片帧**，于是既有的那三条断言（导出取到第 N 帧 /
+  // 预览与导出一致 / 留边一致）对定格自动成立，不需要新写一套
+  { frame: F_PROBE_EARLY, label: "定格段·靠前一帧", expectSourceFrame: F_SOURCE_IN },
+  { frame: F_PROBE_LATE, label: "定格段·靠后一帧", expectSourceFrame: F_SOURCE_IN },
 ];
 
 /**
@@ -261,7 +294,21 @@ export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult>
     sourceIn: E_SOURCE_IN,
     transitionIn: { kind: "wipe", frames: WIPE_FRAMES },
   };
-  const track: Track = { id: "V1", kind: "video", clips: [clipA, clipB, clipC, clipD, clipE] };
+  // F 定格：整段只画源片第 F_SOURCE_IN 帧（D48）
+  const clipF: Clip = {
+    id: "F",
+    kind: "media",
+    sourceId: probe.source.id,
+    timelineIn: F_IN,
+    timelineOut: F_OUT,
+    sourceIn: F_SOURCE_IN,
+    freeze: true,
+  };
+  const track: Track = {
+    id: "V1",
+    kind: "video",
+    clips: [clipA, clipB, clipC, clipD, clipE, clipF],
+  };
   const timeline: Timeline = {
     fps: probe.source.fps,
     width: OUT_SIZE,
@@ -279,6 +326,7 @@ export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult>
   let noTransition = new Map<number, Bands>();
   let pureFrom = new Map<number, Bands>();
   let pureTo = new Map<number, Bands>();
+  let freezeControl = new Map<number, Bands>();
   try {
     // 引擎画布接了 Pixi 之后是 WebGL 画布，不能直接 getContext("2d")——
     // 一张画布只能有一种上下文类型。先 drawImage 到干净的 2D 画布上再量
@@ -338,6 +386,19 @@ export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult>
         ],
       },
       DISSOLVE_PROBES,
+    );
+
+    // 定格的对照组：同一个 F 去掉 `freeze`，同样两帧走预览路径。
+    // **没有它，"定格段两帧画面相同"在取帧整个坏掉（恒定返回某一帧）时同样成立**
+    // ——那正是 `BLEND_MIN_DIFF` 那条对照断言存在的理由，一字不差
+    const thawedF: Clip = { ...clipF };
+    delete (thawedF as { freeze?: unknown }).freeze;
+    freezeControl = await shoot(
+      {
+        ...timeline,
+        tracks: [{ ...track, clips: [clipA, clipB, clipC, clipD, clipE, thawedF] }],
+      },
+      [F_PROBE_EARLY, F_PROBE_LATE],
     );
   } finally {
     engine.dispose();
@@ -516,6 +577,36 @@ export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult>
       `不接近色相 ${wrongHue}°（那是没换游标的表现）`,
       `${boundary.exportedHue}°`,
       hueDistance(boundary.exportedHue, wrongHue) > HUE_TOLERANCE,
+    ),
+  );
+
+  // ---- 5b. 定格：整段是同一帧，而且这个量法看得见帧差（D48）----
+  //
+  // 上面那三条（导出取到第 150 帧 / 预览与导出一致 / 留边一致）对 F 的两个取样帧
+  // 已经各成立一次，但它们**单独不足以说明定格生效**：两帧各自都接近 150° 只说明
+  // 期望值写对了，而如果取帧整个坏掉、恒定返回某一帧，它们照样绿。所以再要两条——
+  // 一条量"这两帧确实是同一张画面"，一条**对照**（同两帧不定格时必须不同）。
+  const frozenEarly = rows.find((r) => r.frame === F_PROBE_EARLY)!;
+  const frozenLate = rows.find((r) => r.frame === F_PROBE_LATE)!;
+  const frozenDelta = hueDistance(frozenEarly.exportedHue, frozenLate.exportedHue);
+  checks.push(
+    check(
+      `定格段里相隔 ${F_PROBE_LATE - F_PROBE_EARLY} 帧的两帧是同一张画面`,
+      `Δ ≤ ${FREEZE_SAME_TOLERANCE}°`,
+      `${frozenDelta}°`,
+      frozenDelta <= FREEZE_SAME_TOLERANCE,
+    ),
+  );
+  const controlDelta = hueDistance(
+    freezeControl.get(F_PROBE_EARLY)!.hue,
+    freezeControl.get(F_PROBE_LATE)!.hue,
+  );
+  checks.push(
+    check(
+      "对照：同两帧不定格时画面不同（证明这个量法看得见帧差）",
+      `Δ ≥ ${FREEZE_MIN_DIFF}°`,
+      `${controlDelta}°`,
+      controlDelta >= FREEZE_MIN_DIFF,
     ),
   );
 

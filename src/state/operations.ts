@@ -38,6 +38,7 @@ import {
   clipSourceId,
   clipSpeed,
   findFont,
+  isFrozen,
   scaleBySpeed,
   sourceDurationFrames,
   SPEED_RANGE,
@@ -183,8 +184,27 @@ function dropOrphanTransitions(sorted: readonly Clip[], kind: TrackKind): Clip[]
   });
 }
 
+/**
+ * 音频轨上的 `freeze` 一律清掉。**第二道兜底**，理由和 `dropOrphanTransitions` 里那条
+ * "种类和轨道对不上"完全一样（D48）：编辑入口（`freezeClipAt`）已经拦着，而片段不能跨
+ * 轨道种类拖，所以这一条实际拦不到东西——它防的是手工快照和将来某个新编辑操作。
+ *
+ * 值得单独兜是因为**它的失效形态是静音而不是"没效果"**：定格让 `sourceMicrosAt` 恒定，
+ * 而 `mix-plan` 用它算源片区间的两端，于是 `srcStart === srcEnd`，那一段整个没声音、
+ * 不抛错。同 D19 那条"存了但不生效"里最坏的一档。
+ */
+function dropFreezeOnAudio(clips: Clip[], kind: TrackKind): Clip[] {
+  if (kind !== "audio") return clips;
+  return clips.map((clip) =>
+    clip.kind === "media" && clip.freeze !== undefined
+      ? setOptional(clip, "freeze", undefined)
+      : clip,
+  );
+}
+
 function withClips(track: Track, clips: readonly Clip[]): Track {
-  return { ...track, clips: dropOrphanTransitions(sortClips(clips), track.kind) };
+  const sorted = dropOrphanTransitions(sortClips(clips), track.kind);
+  return { ...track, clips: dropFreezeOnAudio(sorted, track.kind) };
 }
 
 function mapTrack(
@@ -444,7 +464,12 @@ export function trimClip(
     // "源片开头"和"至少 1 帧"互斥，所以先后顺序不影响提示语：前者只可能在
     // deltaFrames 为负时触发，那时 newIn 一定还小于 timelineOut
     if (newIn >= clip.timelineOut) return reject(timeline, "片段至少要保留 1 帧");
-    if (clip.kind === "media") {
+    if (clip.kind === "media" && isFrozen(clip)) {
+      // **定格片段裁入点不推 `sourceIn`**（D48）：定住的是"那一帧"，而裁左边缘改的是
+      // 这一帧要停多久。推了的表现是"把定格片段的头往右拖一下，定住的画面就换了一张"
+      // ——而用户的手势是改时长。于是它和文字片段走同一条路（两头都不受源片限制）
+      next = { ...clip, timelineIn: newIn };
+    } else if (clip.kind === "media") {
       // 变速片段：时间轴上裁掉 Δ 帧，源片要跳过 Δ×speed 帧。取整只在
       // `scaleBySpeed` 一处发生（1.5× 下一帧对不上整数源片帧，量化误差 < 0.5 帧、
       // 看不出来；散着取整两次才会变成"裁一帧、画面动两帧"）
@@ -514,7 +539,7 @@ export function splitClipAt(timeline: Timeline, clipId: ClipId, frame: number): 
   const rightId = `${clip.id}-s${++splitSeq}`;
   const cut = frame - clip.timelineIn;
   let right: Clip =
-    clip.kind === "media"
+    clip.kind === "media" && !isFrozen(clip)
       ? {
           ...clip,
           id: rightId,
@@ -524,7 +549,8 @@ export function splitClipAt(timeline: Timeline, clipId: ClipId, frame: number): 
           // 右半段从中间跳回去了"，而 1× 的项目上完全正常
           sourceIn: clip.sourceIn + scaleBySpeed(cut, clipSpeed(clip)),
         }
-      // 文字层没有源片游标，两半段显示同一段文字
+      // 文字层没有源片游标，两半段显示同一段文字；**定格片段同理**（D48）——
+      // 它整段就是一帧，两半段定的是同一帧，推进 `sourceIn` 会让右半段换一张画面
       : { ...clip, id: rightId, timelineIn: frame };
   // 与裁入点同理：右半段的起点换了内容，关键帧偏移要减掉切掉的那一段。
   // 左半段起点没动，原样保留（超出新长度的关键帧不删，见 shiftKeyframes）
@@ -1451,6 +1477,10 @@ export function setClipSpeed(timeline: Timeline, clipId: ClipId, speed: Rational
   const { clip, track } = found;
   // 图片片段没有"源片的哪一刻"，它要停多久是改长度；文字同理。见 `MediaClip.speed`
   if (clip.kind !== "media") return reject(timeline, "只有素材片段能变速");
+  // **定格片段没有速度可言**（D48）：它整段就是一帧，改速度只会改长度而画面纹丝不动。
+  // 放过去不是"没效果"而是 D19 那类"存了但不生效"——检查器写着 2× 而什么都没变；
+  // 界面上那一节在定格时整个不出现，这道门是给纯函数自己的（同 `setClipCrop` 那条）
+  if (isFrozen(clip)) return reject(timeline, "定格片段没有速度，先解除定格");
   if (!Number.isFinite(speed.num) || !Number.isFinite(speed.den)) {
     return reject(timeline, "速度必须是有限数");
   }
@@ -1495,6 +1525,92 @@ export function setClipSpeed(timeline: Timeline, clipId: ClipId, speed: Rational
   }
 
   return ok(replaceClip(timeline, track.id, next));
+}
+
+/**
+ * 把片段定格在 `timelineFrame` 那一帧（**D48**）。
+ *
+ * 「定格」这个动作做的是**两件事一起**：把 `sourceIn` 挪到播放头指着的那一帧，再置上
+ * `freeze`。之所以不给 `freeze` 配一个"定在哪一帧"的字段，理由在 `MediaClip.freeze`：
+ * 那会造出第二个真值来源，而错了不报错、只表现成"定格定在了别的地方"。
+ *
+ * **要求播放头落在片段内**（左闭右开，同 `splitClipAt` 那道判据）。落在外面时定在哪一帧
+ * 没有答案——夹到最近的一端等于替用户改了目标（"选了 A 拿到 B"），所以拒绝并说明。
+ *
+ * 三条门：
+ *
+ * - **只有素材片段能定格。** 文字片段的画面是现场生成的、本来就不动；图片片段整段就是
+ *   一张图（那正是 D36 里它没有 `sourceIn` 的理由），给它们一个"定格"是造第二种表达
+ *   同一件事的方式。
+ * - **只有画面轨上的片段能定格**（同 `setClipCrop` 那条）。"定格一帧声音"没有意义，
+ *   而真存下去的后果不是没效果而是**静音**：`mix-plan` 拿恒定的 `sourceMicrosAt` 会算出
+ *   `srcStart === srcEnd` 的零长区间，那一段整个没声音且不报错。
+ * - **已经定格了就是"值没变"**，不是失败：定格期间每一帧都映射到同一个源片帧，所以在
+ *   任何位置再定一次都不产生新状态（滑块那条 `EditResult` 三态的同一个形态）。
+ */
+export function freezeClipAt(
+  timeline: Timeline,
+  clipId: ClipId,
+  timelineFrame: number,
+): EditResult {
+  if (!Number.isInteger(timelineFrame)) return reject(timeline, "定格位置必须是整数帧");
+
+  const found = findClip(timeline, clipId);
+  if (!found) return reject(timeline, `找不到片段 ${clipId}`);
+  if (found.track.locked) return reject(timeline, "轨道已锁定");
+  const { clip, track } = found;
+  if (clip.kind !== "media") {
+    return reject(
+      timeline,
+      clip.kind === "image" ? "图片片段本来就是静止的" : "只有素材片段能定格",
+    );
+  }
+  if (track.kind !== "video") return reject(timeline, "只有画面轨上的片段能定格");
+  if (isFrozen(clip)) return unchanged(timeline);
+  if (timelineFrame < clip.timelineIn || timelineFrame >= clip.timelineOut) {
+    return reject(timeline, "播放头不在这个片段里，定不了格");
+  }
+
+  // 换算和裁入点**完全一样**（`scaleBySpeed` 一处取整）：都是"从片段起点走了 Δ 个时间轴帧，
+  // 源片走到哪一帧"。抄一份别的算式出来就等于给同一个问题开第二个答案
+  const sourceIn = clip.sourceIn + scaleBySpeed(timelineFrame - clip.timelineIn, clipSpeed(clip));
+  return ok(replaceClip(timeline, track.id, { ...clip, sourceIn, freeze: true }));
+}
+
+/**
+ * 解除定格：从定住的那一帧接着往后播（**D48**）。
+ *
+ * **必须当场校验素材够不够长。** 定格把这个片段的"源片长度"变成了无穷（`clipSourceFrames`
+ * 返回 1），所以用户可以把它拉到任意长；解除之后它要真的消耗 `clipSourceFrames` 帧，而
+ * 那些帧可能根本不存在——不校验的表现是**尾部那一层画面静默消失**（同 `trimClip` 出点
+ * 那道判据守着的东西，也同 D39 漏乘速度的形态）。报出来才让用户知道该先收出点。
+ *
+ * **`sourceIn` 留在定住的那一帧**，不退回定格之前的位置：那个位置已经没有记录了（见
+ * `MediaClip.freeze`：刻意只有一个字段），而"从定住的这一帧继续播"本身是个说得通的结果。
+ */
+export function unfreezeClip(timeline: Timeline, clipId: ClipId): EditResult {
+  const found = findClip(timeline, clipId);
+  if (!found) return reject(timeline, `找不到片段 ${clipId}`);
+  if (found.track.locked) return reject(timeline, "轨道已锁定");
+  const { clip, track } = found;
+  if (clip.kind !== "media") return reject(timeline, "只有素材片段能定格");
+  if (!isFrozen(clip)) return unchanged(timeline);
+
+  // 关掉要把字段整个删掉，不留 `freeze: false`（同 `speed` / `preservePitch`）
+  const thawed = setOptional(clip, "freeze", undefined) as MediaClip;
+  const source = timeline.sources.find((s) => s.id === clip.sourceId);
+  if (source) {
+    const limit = sourceDurationFrames(source, timeline.fps);
+    const needed = clipSourceFrames(thawed);
+    const available = limit - clip.sourceIn;
+    if (needed > available) {
+      return reject(
+        timeline,
+        `解除定格要 ${needed} 帧素材，定住那一帧之后只剩 ${Math.max(0, available)} 帧，先把出点往回收`,
+      );
+    }
+  }
+  return ok(replaceClip(timeline, track.id, thawed));
 }
 
 /**

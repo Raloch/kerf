@@ -53,6 +53,8 @@ import {
   moveKeyframe,
   addLut,
   addFont,
+  freezeClipAt,
+  unfreezeClip,
   renameProject,
   setClipColor,
   setClipCrop,
@@ -229,6 +231,15 @@ export interface TimelineState {
   setClipSpeed: (clipId: ClipId, speed: Rational) => void;
   /** 开关变速保持音高。不改长度、不动速度，见 `setClipPreservePitch`。 */
   setClipPreservePitch: (clipId: ClipId, on: boolean) => void;
+  /**
+   * 把片段定格在**当前播放头**那一帧（**D48**）。
+   *
+   * 播放头由 store 读、纯函数收一个显式帧号，同 `setKeyframeAt` 那条分工：换算和"现在
+   * 是第几帧"归这一层，判据归纯函数。播放头不在片段里时纯函数拒绝并报到状态栏。
+   */
+  freezeAtPlayhead: (clipId: ClipId) => void;
+  /** 解除定格，从定住那一帧继续播。素材不够长会被拒（见 `unfreezeClip`）。 */
+  unfreezeClip: (clipId: ClipId) => void;
   /**
    * 开关轨道的锁定 / 静音 / 隐藏。**进撤销栈**——这三个字段在 `Timeline` 里，
    * 而静音和隐藏会改变成片，理由见 `setTrackFlag`。
@@ -583,6 +594,15 @@ export const useTimeline = create<TimelineState>((set, get) => {
     setClipPreservePitch(clipId, on) {
       // 不给合并键：这是一次点击，不是连续拖拽
       apply(setClipPreservePitch(get().timeline(), clipId, on), on ? "保持音高" : "允许变调");
+    },
+
+    freezeAtPlayhead(clipId) {
+      const state = get();
+      apply(freezeClipAt(state.timeline(), clipId, state.playhead), "定格");
+    },
+
+    unfreezeClip(clipId) {
+      apply(unfreezeClip(get().timeline(), clipId), "解除定格");
     },
 
     setTrackFlag(trackId, flag, on) {

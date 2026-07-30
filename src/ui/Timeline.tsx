@@ -11,6 +11,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import {
   clipDuration,
+  clipIsFrozen,
+  isFrozen,
   clipSourceFrames,
   clipSourceId,
   clipSpeed,
@@ -90,6 +92,8 @@ export function TimelinePanel() {
   const addTextClip = useTimeline((s) => s.addTextClip);
   const addTrack = useTimeline((s) => s.addTrack);
   const removeTrack = useTimeline((s) => s.removeTrack);
+  const freezeAtPlayhead = useTimeline((s) => s.freezeAtPlayhead);
+  const unfreezeClip = useTimeline((s) => s.unfreezeClip);
   const copySelected = useTimeline((s) => s.copySelected);
   const duplicateSelected = useTimeline((s) => s.duplicateSelected);
   const paste = useTimeline((s) => s.paste);
@@ -221,6 +225,37 @@ export function TimelinePanel() {
       const found = findClip(timeline, id);
       return found ? playhead > found.clip.timelineIn && playhead < found.clip.timelineOut : false;
     });
+
+    /**
+     * 定格 / 解除定格。**只在恰好选中一个画面轨素材片段时出现。**
+     *
+     * 不做批量：定格要回答"定哪一帧"，而那个答案只能来自播放头——它只落在选中的其中
+     * 一部分片段里（同 D45 那条"批量里没有关键帧按钮"的理由，一字不差）。多选时整项
+     * **不出现**而不是灰掉：灰掉一个永远也点不到的东西只会让菜单变长（对比"播放头不在
+     * 片段内"，那个灰掉是有用的——移一下播放头就能点）。
+     */
+    const freezeItem: MenuItem[] = [];
+    const sole = n === 1 ? findClip(timeline, selectedClipIds[0]!) : undefined;
+    if (sole && sole.clip.kind === "media" && sole.track.kind === "video") {
+      // 收窄之后把片段绑进一个局部变量：`as MediaClip` 强转会把判别联合这层保护关掉，
+      // 而这里恰恰要读 `sourceIn`（文字片段没有这个字段）
+      const target = sole.clip;
+      freezeItem.push(
+        isFrozen(target)
+          ? {
+              label: `解除定格（定在源片第 ${target.sourceIn} 帧）`,
+              onSelect: () => unfreezeClip(target.id),
+            }
+          : {
+              label: "在播放头定格",
+              ...(playhead >= target.timelineIn && playhead < target.timelineOut
+                ? {}
+                : { disabledReason: "播放头不在片段内" }),
+              onSelect: () => freezeAtPlayhead(target.id),
+            },
+      );
+    }
+
     return [
       { label: `复制${many} ⌘C`, onSelect: copySelected },
       { label: `做副本${many} ⌘D`, onSelect: duplicateSelected },
@@ -236,6 +271,7 @@ export function TimelinePanel() {
         ...(splittable ? {} : { disabledReason: "播放头不在片段内" }),
         onSelect: () => splitAtPlayhead(),
       },
+      ...freezeItem,
       { label: `删除${many} ⌫`, separatorBefore: true, onSelect: () => removeSelected(false) },
       { label: `波纹删除${many} ⇧⌫`, onSelect: () => removeSelected(true) },
     ];
@@ -243,12 +279,14 @@ export function TimelinePanel() {
     clipboardCount,
     copySelected,
     duplicateSelected,
+    freezeAtPlayhead,
     paste,
     playhead,
     removeSelected,
     selectedClipIds,
     splitAtPlayhead,
     timeline,
+    unfreezeClip,
   ]);
 
   return (
@@ -1053,6 +1091,15 @@ function ClipView({
       </span>
       {/* 片段太窄时藏掉帧数，否则会溢出成一团 */}
       {widthPx > 56 && <span className="len m">{length}f</span>}
+      {/* 定格要在**片段上**看得见（D48）。缩略图条铺满同一张图已经是个暗示，但那也可能是
+          "这一段素材本来就静止"——而"定格了"和"内容恰好不动"是两个结论，只有软件知道。
+          不说的话用户看到的是"拖了播放头画面不变"，那和素材坏了长得一样。同 D43 那条
+          "静音 / 隐藏的状态必须在轨道上看得见" */}
+      {clipIsFrozen(clip) && (
+        <span className="frz" title={`定格：整段只画源片第 ${sourceInFrame} 帧`}>
+          定格
+        </span>
+      )}
 
       {/* 裁切手柄。窄片段也要留出可抓区域，否则短片段无法裁切 */}
       <span

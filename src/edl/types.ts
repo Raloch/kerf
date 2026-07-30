@@ -399,6 +399,28 @@ export interface MediaClip extends ClipBase {
    * 值，所以这不是正确性问题；但"这个片段有没有开过保音高"要能在数据层一眼看出来。
    */
   readonly preservePitch?: boolean;
+  /**
+   * 定格：整段只画 `sourceIn` 那**一帧**（**D48**）。缺省 = 正常播放。
+   *
+   * **只有这一个字段，没有"定格在哪一帧"那个字段**——定住的就是 `sourceIn`。给它另加一个
+   * `freezeAt` 会立刻造出两个真值来源（"`sourceIn` 和 `freezeAt` 都设了听谁的"），而错了
+   * 不报错、只表现成"定格定在了别的地方"。所以「在播放头定格」这个动作做的是**把 `sourceIn`
+   * 挪到播放头那一帧**（`freezeClipAt`），和裁入点用的是同一套整数帧换算。
+   *
+   * 写成 `?: true` 而不是 `?: boolean`（同 `Timeline.namedByUser`）：关掉要把字段整个
+   * `delete`，`freeze: false` 那种中间状态在类型上就不存在。
+   *
+   * **它让这个片段的"源片长度"变成无穷**（`clipSourceFrames` 返回 1，一帧就够铺任意长），
+   * 所以定格片段的出点拉不到尽头、转场余量也永远够——后者由 `availableHandle` 返回
+   * `Infinity` 表达。**解除定格反过来要当场校验素材够不够长**，见 `unfreezeClip`。
+   *
+   * **只作用在画面上，声音一行不改。** 带音轨的素材导进来是两个片段（画面在 V1、声音在
+   * A1，见 `addSource`），定格只属于画面那一个；`freezeClipAt` 拒绝音频轨上的片段，
+   * 因为"定格一帧声音"没有意义——真按 `sourceMicrosAt` 恒定去混，`mix-plan` 会算出一个
+   * 零长的源片区间，表现是**那一段整个静音且不报错**。归一化里还有一道兜底（同
+   * `dropOrphanTransitions`：防将来新的编辑操作忘了校验）。
+   */
+  readonly freeze?: true;
 }
 
 /**
@@ -611,6 +633,21 @@ export function clipPreservesPitch(clip: MediaClip): boolean {
 }
 
 /**
+ * 定格吗（**D48**）。取帧、消耗多少源片帧、转场余量都先问它。
+ *
+ * 判据只有这一个字段，**不掺"速度是不是 0"之类的等价说法**：速度不允许为 0（`setClipSpeed`
+ * 拒绝，理由见那里——0 算出来的长度是 Infinity），所以"定格"在数据上只有一种表达。
+ */
+export function isFrozen(clip: MediaClip): boolean {
+  return clip.freeze === true;
+}
+
+/** 这个片段定格了吗。判别联合上的版本，给拿着 `Clip` 的调用点（UI 居多）用。 */
+export function clipIsFrozen(clip: Clip): boolean {
+  return clip.kind === "media" && isFrozen(clip);
+}
+
+/**
  * 这个片段从 `sourceIn` 起消耗多少源片帧——裁出点那道"还有没有更多素材"就是拿它判的。
  *
  * 片段占 L 帧，末帧落在源片的 `sourceIn + (L-1)×speed`，所以要 L-1 而不是 L 乘速度，
@@ -623,6 +660,10 @@ export function clipPreservesPitch(clip: MediaClip): boolean {
 export function clipSourceFrames(clip: MediaClip): number {
   const frames = clipDuration(clip);
   if (frames <= 0) return 0;
+  // 定格只消耗**一帧**，与占位多长、速度多少全都无关（D48）。这一条必须在速度那两条
+  // 之前判：定格片段身上可能还留着 `speed`（改速度在定格期间被拒、但字段是之前设的，
+  // 同 D40 那条"字段不跟着清掉"），按速度算出来的数会把出点上限和转场余量一起算错
+  if (isFrozen(clip)) return 1;
   if (isNormalSpeed(clip)) return frames;
   const s = clipSpeed(clip);
   return Math.ceil(((frames - 1) * s.num) / s.den) + 1;

@@ -47,6 +47,8 @@ import {
   clipSourceId,
   clipSpeed,
   findLut,
+  isFrozen,
+  isNormalSpeed,
   sourceHasPicture,
   SPEED_RANGE,
   type Clip,
@@ -270,9 +272,18 @@ export function Inspector() {
         <SourceSection clip={clip} timeline={timeline} />
       )}
 
+      {/* 定格只作用在画面上，所以只给画面轨上的素材片段（判据同 `freezeClipAt`，D48） */}
+      {clip.kind === "media" && track.kind === "video" && (
+        <FreezeSection clip={clip} timeline={timeline} playhead={playhead} />
+      )}
+
       {/* 变速两种轨道都有：画面片段和配乐都可能要放快放慢。图片没有"源片的哪一刻"
-          （见 `MediaClip.speed`），文字更没有，所以只给素材片段 */}
-      {clip.kind === "media" && <SpeedSection clip={clip} timeline={timeline} />}
+          （见 `MediaClip.speed`），文字更没有，所以只给素材片段。
+          **定格时整节不出现**：那时改速度只会改长度而画面纹丝不动，`setClipSpeed` 也当场
+          拒绝——摆一个不起作用的控件是在说假话（同 D40 那条原速下不显示「声音」） */}
+      {clip.kind === "media" && !isFrozen(clip) && (
+        <SpeedSection clip={clip} timeline={timeline} />
+      )}
 
       {/* 转场两种轨道都有（画面混像素、声音混增益） */}
       <TransitionSection clip={clip} track={track} timeline={timeline} />
@@ -381,6 +392,82 @@ const SPEED_PRESETS: readonly Rational[] = [
 /** 把倍数显示成百分比整数（2× → 200）。 */
 function speedPercent(speed: Rational): number {
   return Math.round(toNumber(speed) * 100);
+}
+
+/**
+ * 定格那一节（**D48**）。
+ *
+ * 三件事在这里定下来：
+ *
+ * - **入口是「在播放头定格」而不是一个勾选框。** 定格必须回答"定哪一帧"，而那个答案只能
+ *   来自播放头（模型里刻意只有一个字段，见 `MediaClip.freeze`）。勾选框读起来像"定格
+ *   这个片段"，用户按下之后定在哪一帧完全没法预期。**播放头不在片段里时按钮灰掉，
+ *   而原因写在按钮的 title 和下面那句提示里**——纯置灰不解释是黑箱（D3）。
+ * - **定住的是源片第几帧要报出来。** 这个功能的全部内容就是"哪一帧"，不报的话用户没有
+ *   任何办法确认自己定的是不是想要的那一帧（尤其在缩略图条上同一张图铺满之后）。
+ * - **`speed` 还留着这件事要说出来。** 定格期间速度不起作用、整节都不显示（同 D40），
+ *   但字段没清——解除之后它会立刻生效。不说的话用户会遇到"解除定格之后它怎么快了一倍"。
+ */
+function FreezeSection({
+  clip,
+  timeline,
+  playhead,
+}: {
+  readonly clip: MediaClip;
+  readonly timeline: Timeline;
+  readonly playhead: number;
+}) {
+  const freezeAtPlayhead = useTimeline((s) => s.freezeAtPlayhead);
+  const unfreezeClip = useTimeline((s) => s.unfreezeClip);
+  const frozen = isFrozen(clip);
+  const source = timeline.sources.find((s) => s.id === clip.sourceId);
+  /** 播放头落在片段内才定得了格。判据和 `freezeClipAt` 一样是左闭右开。 */
+  const inside = playhead >= clip.timelineIn && playhead < clip.timelineOut;
+  const speedKept = !isNormalSpeed(clip);
+
+  return (
+    <>
+      <div className="grp-title">定格</div>
+      <div className="fields">
+        <div className="f ctl wide3">
+          <label>画面</label>
+          {frozen ? (
+            <>
+              <span className="val">定在源片第 {clip.sourceIn} 帧</span>
+              <button type="button" className="mini" onClick={() => unfreezeClip(clip.id)}>
+                解除
+              </button>
+            </>
+          ) : (
+            <button
+              type="button"
+              className="mini"
+              disabled={!inside}
+              title={inside ? "整段只画播放头这一帧" : "播放头不在这个片段里"}
+              onClick={() => freezeAtPlayhead(clip.id)}
+            >
+              在播放头定格
+            </button>
+          )}
+        </div>
+        {frozen && (
+          <div className="f">
+            <label>源时间码</label>
+            <span className="val">{framesToTimecode(clip.sourceIn, timeline.fps)}</span>
+          </div>
+        )}
+      </div>
+      {frozen ? (
+        <p className="hint">
+          整段只画这一帧，出点想拉多长都行（一帧素材就够）。
+          {source?.hasAudio === true && "声音在音频轨上那个片段里，照旧播放。"}
+          {speedKept && `解除之后会回到 ${speedPercent(clipSpeed(clip))}% 播放。`}
+        </p>
+      ) : (
+        !inside && <p className="hint">把播放头移到这个片段里，才能决定定住哪一帧。</p>
+      )}
+    </>
+  );
 }
 
 /**

@@ -42,7 +42,7 @@
  */
 
 import type { Clip, MediaClip, Transition } from "./types";
-import { clipDuration, clipSourceFrames, clipSpeed, unscaleBySpeed } from "./types";
+import { clipDuration, clipSourceFrames, clipSpeed, isFrozen, unscaleBySpeed } from "./types";
 
 /** 转场时长的下限。低于 2 帧对称窗口就退化成空。 */
 export const MIN_TRANSITION_FRAMES = 2;
@@ -217,12 +217,19 @@ export function clipRenderSpan(
  * **余量在源片侧算、报出来时换成时间轴帧**（`unscaleBySpeed`）。两者在变速下不是
  * 一回事：2× 的片段有 30 帧源片余量，只够铺 15 个时间轴帧。混着用不报错，表现是
  * 界面说"余量够 30 帧"而窗口开到第 16 帧就开始定格。
+ *
+ * **定格片段的余量是无穷**（D48）：窗口往它入点之前 / 出点之后借的每一帧，取帧算出来
+ * 都还是同一帧（`sourceMicrosAt` 里那条恒定分支），所以它**永远不会定格边缘帧**。
+ * 不给这条的话，一个定在源片第 0 帧的定格片段会被算成"入场侧一帧余量都没有"，于是
+ * 检查器报出一个不存在的定格帧数——那是句假话，而画面上完全正常（同 `IMAGE_SOURCE_FRAMES`
+ * 用 `Infinity` 表达"想占多久都行"的理由）。
  */
 export function availableHandle(
   clip: MediaClip,
   role: "from" | "to",
   sourceDurationFrames: number,
 ): number {
+  if (isFrozen(clip)) return Number.POSITIVE_INFINITY;
   const inSource =
     role === "from"
       ? sourceDurationFrames - (clip.sourceIn + clipSourceFrames(clip))

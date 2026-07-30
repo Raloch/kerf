@@ -26,6 +26,7 @@ import {
   clipSpeed,
   findLut,
   findSource,
+  isFrozen,
   isNormalSpeed,
   sourceDurationFrames,
   sourceGridFps,
@@ -73,6 +74,11 @@ export function sourceMicrosAt(
   // 速度只作用于后一项：把 `sourceIn` 也乘进去的表现是"裁过入点的片段一变速就
   // 跳到别的地方"，而入点为 0 的片段完全正常（同 D35 那个被乘以零的因子）
   const base = frameToMicros(clip.sourceIn, sourceFps);
+  // 定格：整段就是入点那一帧，**走过多久这一项整个不存在**（D48）。这是这个功能唯一的
+  // 语义，其余一切（出点上限、转场余量、缩略图铺法）都是从这里派生的。判在速度之前——
+  // 定格片段身上可能还留着 `speed`，而那时倍率乘的是一个恒为 0 的量，看着对、其实是
+  // 靠"另一个因子恰好是 0"蒙对的（同 D35 那条被乘以零的因子）
+  if (isFrozen(clip)) return base;
   const elapsedFrames = timelineFrame - clip.timelineIn;
   // 原速走不乘不除的原路径。见 `MediaClip.speed`：这不是性能，是保证没变速的
   // 项目逐像素、逐样本与加变速之前完全相同

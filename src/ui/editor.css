@@ -1163,6 +1163,19 @@
   font-size: 9px;
   color: rgba(255, 255, 255, 0.62);
 }
+/* 定格标记（D48）。贴右下角、不和 `.len`（左下）抢位置，窄片段上两者也不会重叠。
+   给底色是因为它压在缩略图条上——纯文字在亮画面上读不出来。 */
+.ed .clip .frz {
+  position: absolute;
+  right: 4px;
+  bottom: 3px;
+  padding: 0 3px;
+  border-radius: 2px;
+  font-size: 9px;
+  line-height: 13px;
+  color: var(--ink);
+  background: rgba(255, 214, 102, 0.92);
+}
 /* ---------- 拖拽反馈 ---------- */
 .ed .clip {
   cursor: grab;
