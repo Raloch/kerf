@@ -31,7 +31,30 @@ export interface Bands {
   readonly chroma: number;
   /** 整幅画面的最大通道值。判断"是不是纯黑"用它。 */
   readonly maxChannel: number;
+  /**
+   * 上黑边边界那两行"最亮采样点的三通道之和"：`topLastBlackSum` 是最后一行还算黑的，
+   * `topFirstLitSum` 是第一行不算黑的。判黑阈值是 `BLACK_ROW_SUM`，所以这两个数说的是
+   * **离阈值多远**。
+   *
+   * 加它是因为"留边差 1px"有两种根因，而只印 `top`/`bottom` 分不开，两种长得一模一样：
+   * 几何真的分叉了（那一行是内容，`topFirstLitSum` 会是几百），还是编码往返在黑边
+   * 边界留下的量化噪声把一行染到了阈值之上（会是 25–60）。后者不是产品的问题，
+   * 是这个量法对有损编码太紧——而导出侧的像素恰恰是从**解回来的成片**里读的，
+   * 预览侧读的是无损画布，所以这条差异只会出现在导出那一侧。
+   *
+   * 实测遇到过一次：桌面 Safari 上 15 个取样帧里有 2 帧报 `预览 70 / 导出 69`，
+   * 而 Chrome 全绿。没有这两个数就只能靠猜。
+   */
+  readonly topLastBlackSum: number;
+  readonly topFirstLitSum: number;
 }
+
+/**
+ * 判"这一行算黑吗"的阈值：一行里最亮采样点的三通道之和不超过它就算黑。
+ *
+ * 24 = 平均每通道 8。这个数**只对无损像素安全**，见 `topFirstLitSum` 的注释。
+ */
+export const BLACK_ROW_SUM = 24;
 
 /**
  * 只测画面里的一块矩形。坐标是画布绝对坐标，黑边则相对**这块矩形**的四条边算。
@@ -63,24 +86,31 @@ export function measure(
   const rh = region ? Math.max(1, Math.min(height - ry, Math.round(region.height))) : height;
   const { data } = ctx.getImageData(rx, ry, rw, rh);
 
-  const rowIsBlack = (y: number): boolean => {
+  // 返回这一行最亮采样点的三通道之和，而不是直接返回"黑不黑"：那个布尔丢掉了
+  // "离阈值多远"，而判 1px 差异的根因时要的正是这个数（见 `topFirstLitSum`）
+  const rowMaxSum = (y: number): number => {
+    let max = 0;
     for (let x = 0; x < rw; x += 4) {
       const i = (y * rw + x) * 4;
-      if (data[i]! + data[i + 1]! + data[i + 2]! > 24) return false;
+      const sum = data[i]! + data[i + 1]! + data[i + 2]!;
+      if (sum > max) max = sum;
     }
-    return true;
+    return max;
   };
+  const rowIsBlack = (y: number): boolean => rowMaxSum(y) <= BLACK_ROW_SUM;
 
   const colIsBlack = (x: number): boolean => {
     for (let y = 0; y < rh; y += 4) {
       const i = (y * rw + x) * 4;
-      if (data[i]! + data[i + 1]! + data[i + 2]! > 24) return false;
+      if (data[i]! + data[i + 1]! + data[i + 2]! > BLACK_ROW_SUM) return false;
     }
     return true;
   };
 
   let top = 0;
   while (top < rh && rowIsBlack(top)) top++;
+  const topLastBlackSum = top > 0 ? rowMaxSum(top - 1) : -1;
+  const topFirstLitSum = top < rh ? rowMaxSum(top) : -1;
   let bottom = 0;
   while (bottom < rh && rowIsBlack(rh - 1 - bottom)) bottom++;
   let left = 0;
@@ -118,7 +148,20 @@ export function measure(
   const meanB = Math.round(b / Math.max(1, n));
   const { hue, chroma } = hueOf(meanR, meanG, meanB);
 
-  return { top, bottom, left, right, meanR, meanG, meanB, hue, chroma, maxChannel };
+  return {
+    top,
+    bottom,
+    left,
+    right,
+    meanR,
+    meanG,
+    meanB,
+    hue,
+    chroma,
+    maxChannel,
+    topLastBlackSum,
+    topFirstLitSum,
+  };
 }
 
 /** RGB → 色相（度）与彩度（max-min，0–255）。 */

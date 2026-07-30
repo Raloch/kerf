@@ -29,11 +29,35 @@ import { readExportFile, removeExportFile } from "../export/write-target";
 import { createPreviewEngine } from "../preview/preview-engine";
 import type { Clip, Timeline, Track } from "../edl/types";
 import { frameDurationMicros, frameToSeconds, MICROS_PER_SECOND } from "../time/timebase";
-import { hueDistance, measure, sampleHueAt, type Bands } from "./measure";
+import { BLACK_ROW_SUM, hueDistance, measure, sampleHueAt, type Bands } from "./measure";
 import type { Check } from "./verify-m0";
 
 /** 方形输出：让 16:9 素材必然产生上下黑边，从而能比较留边几何。 */
 const OUT_SIZE = 320;
+/** 源片尺寸（`makeSampleVideo` 的缺省值）。留边的手算值要用它。 */
+const SRC_W = 640;
+const SRC_H = 360;
+/**
+ * 上下留边各多少像素，**手算**：内容高 = 320 × 360/640 = 180，留边 = (320−180)/2 = 70。
+ *
+ * 刻意不调 `containRect()` 算——那是被测代码，拿它当期望值会让断言恒成立
+ * （同 D46 那条"命中手算的 `containRect`"）。改 `OUT_SIZE` 或源片尺寸要跟着改这里。
+ */
+const EXPECTED_BAND = (OUT_SIZE - Math.round((OUT_SIZE * SRC_H) / SRC_W)) / 2;
+
+/**
+ * "两条路径的留边相差多少还算一致"（像素）。
+ *
+ * **不能是 0**，而这个 1 是实测逼出来的：导出侧的像素是从**解回来的成片**里读的，
+ * 而黑边紧邻内容的那一行会被 H.264 的变换块染上亮度。`measure` 判黑的阈值是
+ * 三通道之和 24，实测导出侧那一行在 0–16 之间跳（预览侧恒为 0）——余量只剩 8。
+ * 于是同一份代码在 Chrome 上全绿、在**桌面 Safari 上红 2 帧**，而红的正是 Chrome
+ * 上余量最小的那两帧（都是 16/24）。那是量法贴着健康值，不是产品差了一个像素。
+ *
+ * 放掉这 1px 之后"两边一起偏了 1px"就没人抓了，所以下面补了一条**预览侧命中
+ * 手算值**的断言——预览读的是无损画布（那一行恒为 0），那条可以用 0 容差。
+ */
+const LETTERBOX_TOLERANCE = 1;
 /** 源片总帧数。色相 = frame/300*300，即色相数值恰好等于帧号，便于对照。 */
 const SOURCE_FRAMES = 300;
 
@@ -207,6 +231,15 @@ export interface TimelineVerifyRow {
   readonly exportedBlack: boolean;
   readonly previewBands: string;
   readonly exportedBands: string;
+  /**
+   * 上黑边边界两行的最亮采样和（`黑的那行/不黑的那行`），判黑阈值见 `BLACK_ROW_SUM`。
+   *
+   * **绿的时候也记**：这两个数回答的是"这条断言还剩多少余量"，而那个问题只有在
+   * 断言还没红的时候问才有用。留边差 1px 时它把"几何分叉"（不黑的那行是几百）
+   * 和"编码噪声顶过了阈值"（25–60）分开，而只看 `top/bottom` 两者一模一样。
+   */
+  readonly previewTopEdge: string;
+  readonly exportedTopEdge: string;
 }
 
 export interface TimelineVerifyResult {
@@ -229,6 +262,29 @@ function rgbDistance(
       Math.abs(a.meanG - b.meanG),
       Math.abs(a.meanB - b.meanB),
     ),
+  );
+}
+
+function bandsAgree(pv: Bands, ex: Bands): boolean {
+  return (
+    Math.abs(pv.top - ex.top) <= LETTERBOX_TOLERANCE &&
+    Math.abs(pv.bottom - ex.bottom) <= LETTERBOX_TOLERANCE
+  );
+}
+
+/**
+ * 留边读数。**不一致时**追加边界行的亮度，因为只印 `top/bottom` 的话两种根因
+ * 长得一模一样：几何真的分叉了（第一行不黑的值会是几百），还是编码往返在黑边
+ * 边界的量化噪声把一行染过了阈值（25–60）。后者只会出现在**导出**那一侧——
+ * 那边的像素是从解回来的成片里读的，预览侧读的是无损画布。
+ *
+ * 一致时不印，否则 13 条绿断言各拖一串数字，反而看不见红的那两条。
+ */
+function bandsReading(b: Bands, agree: boolean): string {
+  if (agree) return `${b.top}/${b.bottom}`;
+  return (
+    `${b.top}/${b.bottom}（上边界行最亮采样和：黑的那行 ${b.topLastBlackSum}、` +
+    `不黑的那行 ${b.topFirstLitSum}，判黑阈值 ${BLACK_ROW_SUM}）`
   );
 }
 
@@ -493,6 +549,8 @@ export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult>
       exportedBlack: ex.maxChannel <= BLACK_MAX_CHANNEL,
       previewBands: `${pv.top}/${pv.bottom}`,
       exportedBands: `${ex.top}/${ex.bottom}`,
+      previewTopEdge: `${pv.topLastBlackSum}/${pv.topFirstLitSum}`,
+      exportedTopEdge: `${ex.topLastBlackSum}/${ex.topFirstLitSum}`,
     });
 
     if (p.expectSourceFrame === "blend") {
@@ -511,9 +569,9 @@ export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult>
       checks.push(
         check(
           `帧 ${p.frame}（${p.label}）留边几何一致`,
-          `${pv.top}/${pv.bottom}`,
-          `${ex.top}/${ex.bottom}`,
-          pv.top === ex.top && pv.bottom === ex.bottom,
+          bandsReading(pv, bandsAgree(pv, ex)),
+          bandsReading(ex, bandsAgree(pv, ex)),
+          bandsAgree(pv, ex),
         ),
       );
       continue;
@@ -561,12 +619,37 @@ export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult>
     checks.push(
       check(
         `帧 ${p.frame}（${p.label}）留边几何一致`,
-        `${pv.top}/${pv.bottom}`,
-        `${ex.top}/${ex.bottom}`,
-        pv.top === ex.top && pv.bottom === ex.bottom,
+        bandsReading(pv, bandsAgree(pv, ex)),
+        bandsReading(ex, bandsAgree(pv, ex)),
+        bandsAgree(pv, ex),
       ),
     );
   }
+
+  // 留边命中**手算值**，只判预览侧、0 容差。
+  //
+  // 上面那条"两条路径一致"给编码噪声留了 ±1（见 `LETTERBOX_TOLERANCE`），于是
+  // "**两边一起**偏了 1px"就没人抓了——而那正是"某条路径自己加了一次取整"的形态，
+  // 两条路径共用 `containRect()` 也挡不住。这一条补上：预览读的是无损画布，
+  // 那一行恒为纯黑，所以它可以要求精确相等。
+  //
+  // 一条汇总断言而不是每帧一条：15 帧各加一条会把这个自检从 62 项顶到 77 项，
+  // 而它们全部只在同一件事上有信息量（几何是不是整体偏了）。
+  const contentProbes = PROBES.filter((p) => p.expectSourceFrame !== null);
+  const offBand = contentProbes
+    .map((p) => ({ frame: p.frame, b: previewBands.get(p.frame)! }))
+    .filter(({ b }) => b.top !== EXPECTED_BAND || b.bottom !== EXPECTED_BAND);
+  checks.push(
+    check(
+      `预览侧留边命中手算值（${OUT_SIZE} 方形输出 · ${SRC_W}×${SRC_H} 源片）`,
+      `${contentProbes.length} 个取样帧全部 ${EXPECTED_BAND}/${EXPECTED_BAND}`,
+      offBand.length === 0
+        ? `${contentProbes.length} 帧全部命中`
+        : `${offBand.length} 帧不命中，例如帧 ${offBand[0]!.frame} 是 ` +
+          `${offBand[0]!.b.top}/${offBand[0]!.b.bottom}`,
+      offBand.length === 0,
+    ),
+  );
 
   // 跨片段边界这条单独再断言一次：它是 EDL 化最容易错、后果最严重的地方
   const boundary = rows.find((r) => r.frame === B_IN)!;

@@ -151,6 +151,24 @@ interface Edges {
   readonly right: number;
 }
 
+/**
+ * 边缘位置比较的容差（像素）。
+ *
+ * **判据是"比较里有没有一侧是从解回来的成片读的"**：有就必须给 1px，没有才能要求
+ * 精确相等。理由是黑边紧邻内容的那一行会被 H.264 的变换块染上亮度，而 `measure`
+ * 判黑的阈值是三通道之和 24——实测导出侧那一行在 0–24 之间跳（预览侧恒为 0），
+ * 余量随帧内容变化，最小的时候只剩几个数。
+ *
+ * 这不是"松一点比较保险"：容差 0 的那几条在 Chrome 上全绿，而**桌面 Safari 上
+ * 直接红**（它的编码器噪声更大），于是同一份正确的代码在两个浏览器上给出不同结论，
+ * 而红的理由和"几何真的分叉了"长得一模一样。文字块位置和图片留边那两条本来就
+ * 写着 `≤ 1px`，这里只是把同一条理由推广到其余几条并写明白。
+ *
+ * 放掉这 1px 之后"**两侧一起**偏了 1px"就没人抓了，所以凡是有手算期望值的地方，
+ * **预览侧仍然用 0 容差**（它读的是无损画布）——见"落在手算的位置上"那两条。
+ */
+const EDGE_TOLERANCE = 1;
+
 function worstEdgeDelta(a: Edges, b: Edges): number {
   return Math.max(
     Math.abs(a.top - b.top),
@@ -438,12 +456,12 @@ export async function verifyPreviewMatchesExport(): Promise<PreviewVerifyResult>
   const gradeEdgeDelta = worstEdgeDelta(gradedExport, exportedBands);
   checks.push(
     check(
-      "调色不改变几何（黑边与不调色时完全相同）",
-      "0px",
+      "调色不改变几何（黑边与不调色时相同）",
+      `≤ ${EDGE_TOLERANCE}px`,
       gradeEdgeDelta === 0
         ? `完全相同（${edgesText(gradedExport)}）`
         : `差 ${gradeEdgeDelta}px · 调色 ${edgesText(gradedExport)} / 原始 ${edgesText(exportedBands)}`,
-      gradeEdgeDelta === 0,
+      gradeEdgeDelta <= EDGE_TOLERANCE,
     ),
   );
 
@@ -514,12 +532,12 @@ export async function verifyPreviewMatchesExport(): Promise<PreviewVerifyResult>
   const lutEdgeDelta = worstEdgeDelta(lutExport, exportedBands);
   checks.push(
     check(
-      "套 LUT 不改变几何（黑边与不套时完全相同）",
-      "0px",
+      "套 LUT 不改变几何（黑边与不套时相同）",
+      `≤ ${EDGE_TOLERANCE}px`,
       lutEdgeDelta === 0
         ? `完全相同（${edgesText(lutExport)}）`
         : `差 ${lutEdgeDelta}px · LUT ${edgesText(lutExport)} / 原始 ${edgesText(exportedBands)}`,
-      lutEdgeDelta === 0,
+      lutEdgeDelta <= EDGE_TOLERANCE,
     ),
   );
 
@@ -560,11 +578,11 @@ export async function verifyPreviewMatchesExport(): Promise<PreviewVerifyResult>
   checks.push(
     check(
       "裁剪后预览与导出的留边逐条相同",
-      "0px",
+      `≤ ${EDGE_TOLERANCE}px`,
       cropEdgeDelta === 0
         ? `完全相同（${edgesText(cropExport)}）`
         : `差 ${cropEdgeDelta}px · 预览 ${edgesText(cropPreview)} / 导出 ${edgesText(cropExport)}`,
-      cropEdgeDelta === 0,
+      cropEdgeDelta <= EDGE_TOLERANCE,
     ),
   );
 
@@ -655,35 +673,47 @@ export async function verifyPreviewMatchesExport(): Promise<PreviewVerifyResult>
   checks.push(
     check(
       "带关键帧时预览与导出的摆位逐帧一致",
-      "0px",
+      `≤ ${EDGE_TOLERANCE}px`,
       worstPair === 0
         ? `${XFORM_PROBES.length} 帧全部相同`
         : `第 ${worstPairAt} 帧差 ${worstPair}px`,
-      worstPair === 0,
+      worstPair <= EDGE_TOLERANCE,
     ),
   );
 
-  // 2. 跟手算的位置对得上。只比一致性的话，两边同时算错也能过
-  let worstExpected = 0;
-  let worstExpectedText = "";
+  // 2. 跟手算的位置对得上。只比一致性的话，两边同时算错也能过。
+  //
+  // **两侧的容差刻意不同**：预览读的是无损画布，要求精确命中；导出读的是解回来的
+  // 成片，给 `EDGE_TOLERANCE`。上面那条一致性断言已经把那 1px 放掉了，所以
+  // "**两侧一起**偏了 1px"（= 某条路径自己多加了一次取整）**只剩预览这一半抓得住**。
+  let worstPreview = 0;
+  let worstExport = 0;
+  let worstText = "";
   XFORM_PROBES.forEach((frame, i) => {
-    for (const [label, bands] of [
-      ["预览", animatedPreview[i]!],
-      ["导出", animatedExport[i]!],
-    ] as const) {
-      const delta = worstEdgeDelta(bands, XFORM_EXPECTED[i]!);
-      if (delta > worstExpected) {
-        worstExpected = delta;
-        worstExpectedText = `第 ${frame} 帧${label} 期望 ${edgesText(XFORM_EXPECTED[i]!)}，实际 ${edgesText(bands)}`;
+    const dPv = worstEdgeDelta(animatedPreview[i]!, XFORM_EXPECTED[i]!);
+    const dEx = worstEdgeDelta(animatedExport[i]!, XFORM_EXPECTED[i]!);
+    if (dPv > worstPreview) {
+      worstPreview = dPv;
+      if (dPv >= worstExport) {
+        worstText = `第 ${frame} 帧预览 期望 ${edgesText(XFORM_EXPECTED[i]!)}，实际 ${edgesText(animatedPreview[i]!)}`;
+      }
+    }
+    if (dEx > worstExport) {
+      worstExport = dEx;
+      if (dEx > worstPreview) {
+        worstText = `第 ${frame} 帧导出 期望 ${edgesText(XFORM_EXPECTED[i]!)}，实际 ${edgesText(animatedExport[i]!)}`;
       }
     }
   });
+  const placementOk = worstPreview === 0 && worstExport <= EDGE_TOLERANCE;
   checks.push(
     check(
       "带关键帧时的摆位落在手算的位置上（上/下/左/右）",
-      "0px",
-      worstExpected === 0 ? "两条路径全部精确命中" : `最差 ${worstExpected}px · ${worstExpectedText}`,
-      worstExpected === 0,
+      `预览 0px · 导出 ≤ ${EDGE_TOLERANCE}px`,
+      placementOk
+        ? `预览精确命中、导出最差 ${worstExport}px`
+        : `预览最差 ${worstPreview}px、导出最差 ${worstExport}px · ${worstText}`,
+      placementOk,
     ),
   );
 
