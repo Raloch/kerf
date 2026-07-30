@@ -88,6 +88,8 @@ export function TimelinePanel() {
   const zoom = useTimeline((s) => s.zoom);
   const setZoom = useTimeline((s) => s.setZoom);
   const addTextClip = useTimeline((s) => s.addTextClip);
+  const addTrack = useTimeline((s) => s.addTrack);
+  const removeTrack = useTimeline((s) => s.removeTrack);
   const copySelected = useTimeline((s) => s.copySelected);
   const duplicateSelected = useTimeline((s) => s.duplicateSelected);
   const paste = useTimeline((s) => s.paste);
@@ -116,6 +118,50 @@ export function TimelinePanel() {
     },
     [],
   );
+
+  /**
+   * 轨道菜单的落点。和片段菜单分成两个状态：两者的菜单项来源完全不同（一个看选中
+   * 集合、一个看轨道），并且都可能在对方开着时被唤起——window 级的 pointerdown
+   * 会先把旧的关掉，所以不会同屏出现两个。
+   */
+  const [trackMenu, setTrackMenu] = useState<{
+    x: number;
+    y: number;
+    /** 右键的那条轨；工具栏的「新建轨道」按钮开的菜单没有目标轨，是 null。 */
+    trackId: TrackId | null;
+  } | null>(null);
+  const closeTrackMenu = useCallback(() => setTrackMenu(null), []);
+  const onTrackContextMenu = useCallback(
+    (event: ReactMouseEvent<HTMLElement>, trackId: TrackId) => {
+      event.preventDefault();
+      setTrackMenu({ x: event.clientX, y: event.clientY, trackId });
+    },
+    [],
+  );
+
+  const trackMenuItems = useMemo((): MenuItem[] => {
+    if (!trackMenu) return [];
+    const items: MenuItem[] = [
+      { label: "新建画面轨（加在最上面）", onSelect: () => addTrack("video") },
+      { label: "新建音频轨（加在最下面）", onSelect: () => addTrack("audio") },
+    ];
+    const track =
+      trackMenu.trackId === null
+        ? undefined
+        : timeline.tracks.find((t) => t.id === trackMenu.trackId);
+    if (track) {
+      const clips = track.clips.length;
+      items.push({
+        // 连带的片段数写进标签：点下去会发生什么要在点之前看得见（删除可以撤销，
+        // 所以不弹确认框——标签已经把代价说完了）
+        label: clips > 0 ? `删除轨道（连同 ${clips} 个片段）` : "删除轨道",
+        separatorBefore: true,
+        ...(track.locked ? { disabledReason: "已锁定，先解锁" } : {}),
+        onSelect: () => removeTrack(track.id),
+      });
+    }
+    return items;
+  }, [addTrack, removeTrack, timeline, trackMenu]);
 
   /**
    * 代理就绪的 URL 表。
@@ -254,7 +300,16 @@ export function TimelinePanel() {
           <IconText />
         </button>
         <span className="sep" />
-        <button type="button" className="ib sm" title="新建轨道（M1 后续）" disabled>
+        <button
+          type="button"
+          className="ib sm"
+          title="新建轨道"
+          onClick={(e) => {
+            // 菜单开在按钮正下方而不是指针处：这是点按不是右键，落点该跟着控件走
+            const rect = e.currentTarget.getBoundingClientRect();
+            setTrackMenu({ x: rect.left, y: rect.bottom + 4, trackId: null });
+          }}
+        >
           <IconPlus />
         </button>
 
@@ -320,6 +375,7 @@ export function TimelinePanel() {
                 drag={drag}
                 onLanePointerDown={marquee.onLanePointerDown}
                 onClipContextMenu={onClipContextMenu}
+                onTrackContextMenu={onTrackContextMenu}
                 proxyUrls={proxyUrls}
               />
             ))}
@@ -348,6 +404,14 @@ export function TimelinePanel() {
       </div>
       {menuAt && (
         <ContextMenu x={menuAt.x} y={menuAt.y} items={menuItems} onClose={closeMenu} />
+      )}
+      {trackMenu && (
+        <ContextMenu
+          x={trackMenu.x}
+          y={trackMenu.y}
+          items={trackMenuItems}
+          onClose={closeTrackMenu}
+        />
       )}
     </div>
   );
@@ -405,6 +469,7 @@ function TrackRow({
   drag,
   onLanePointerDown,
   onClipContextMenu,
+  onTrackContextMenu,
   proxyUrls,
 }: {
   track: Track;
@@ -415,6 +480,7 @@ function TrackRow({
   drag: ClipDragApi;
   onLanePointerDown: (event: ReactPointerEvent<HTMLElement>) => void;
   onClipContextMenu: (event: ReactMouseEvent<HTMLElement>, clip: Clip) => void;
+  onTrackContextMenu: (event: ReactMouseEvent<HTMLElement>, trackId: TrackId) => void;
   proxyUrls: Record<string, string>;
 }) {
   const isAudio = track.kind === "audio";
@@ -440,7 +506,9 @@ function TrackRow({
         (isAudio ? track.muted : track.hidden) ? " off" : ""
       }`}
     >
-      <div className="th">
+      {/* 右键出轨道菜单（新建 / 删除轨道）。挂在轨道头上而不是整条 lane：
+          lane 里的右键属于片段菜单，两个菜单抢同一块区域会让"右键空白处"的含义不稳定 */}
+      <div className="th" onContextMenu={(e) => onTrackContextMenu(e, track.id)}>
         <div className="lb">
           <div className="k">{track.id}</div>
           <div className="d">{track.label ?? ""}</div>

@@ -26,7 +26,7 @@ import {
 } from "../state/persist-status";
 import { cleanupLabel, type CleanupPlan } from "../state/asset-cleanup";
 import { findClip } from "../state/operations";
-import { clipDuration, sourceDurationFrames } from "../edl/types";
+import { clipDuration, clipSourceId, sourceDurationFrames, type MediaSource } from "../edl/types";
 import { formatDuration, framesToTimecode } from "../time/timebase";
 import { formatFps } from "../time/rational";
 import { Inspector } from "./Inspector";
@@ -95,6 +95,7 @@ export function Editor({
   const paste = useTimeline((s) => s.paste);
   const duplicateSelected = useTimeline((s) => s.duplicateSelected);
   const removeSelected = useTimeline((s) => s.removeSelected);
+  const removeSource = useTimeline((s) => s.removeSource);
   const selectAll = useTimeline((s) => s.selectAll);
   const select = useTimeline((s) => s.select);
 
@@ -421,6 +422,39 @@ export function Editor({
   }, [selectedClipIds, timeline]);
   const hasContent = timeline.durationFrames > 0;
 
+  /**
+   * 每个素材被几个片段引用——素材行删除按钮的提示和确认框都要这个数。
+   * 判据问 `clipSourceId()`：图片片段同样带 `sourceId`，散写 `kind === "media"` 会漏掉它。
+   */
+  const sourceRefs = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const track of timeline.tracks) {
+      for (const clip of track.clips) {
+        const id = clipSourceId(clip);
+        if (id !== null) counts.set(id, (counts.get(id) ?? 0) + 1);
+      }
+    }
+    return counts;
+  }, [timeline]);
+
+  const confirmRemoveSource = useCallback(
+    (source: MediaSource, refs: number) => {
+      // 没有片段引用时直接删（撤销一步就回得来）；有片段时先确认——素材行上那个
+      // 按钮只是一下点击，误触的代价是时间轴上几个片段同时消失。锁定轨道上的引用
+      // 会被纯函数整体拒绝并报到状态栏（removeSource），这里不重复判
+      if (
+        refs > 0 &&
+        !window.confirm(
+          `删掉素材「${source.name}」？引用它的 ${refs} 个片段会一起删除（可以撤销）。`,
+        )
+      ) {
+        return;
+      }
+      removeSource(source.id);
+    },
+    [removeSource],
+  );
+
   return (
     <div className="ed">
       {/* ---------- 顶栏 ---------- */}
@@ -606,8 +640,9 @@ export function Editor({
               </p>
             ) : (
               <div className="assets">
+                {/* 行是 div 不是 button：里面要放真正的删除按钮，button 套 button 是非法标记 */}
                 {timeline.sources.map((source) => (
-                  <button type="button" className="asset" key={source.id} title={source.name}>
+                  <div className="asset" key={source.id} title={source.name}>
                     <span className="thumb">
                       {source.kind === "av" ? (
                         <IconFilm />
@@ -650,7 +685,19 @@ export function Editor({
                       </span>
                       <ProxyBadge info={proxies[source.id]} />
                     </span>
-                  </button>
+                    <button
+                      type="button"
+                      className="ib sm del"
+                      title={
+                        (sourceRefs.get(source.id) ?? 0) > 0
+                          ? `删除素材（时间轴上引用它的 ${sourceRefs.get(source.id)} 个片段会一起删除）`
+                          : "删除素材"
+                      }
+                      onClick={() => confirmRemoveSource(source, sourceRefs.get(source.id) ?? 0)}
+                    >
+                      <IconTrash />
+                    </button>
+                  </div>
                 ))}
               </div>
             )}

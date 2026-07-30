@@ -49,6 +49,7 @@ import {
   type LutSource,
   type MediaClip,
   type MediaSource,
+  type SourceId,
   type TextClip,
   type Timeline,
   type Track,
@@ -2215,6 +2216,116 @@ function placeOnFirstFittingTrack(
   }
   const what = kind === "video" ? "画面轨" : "音频轨";
   return reject(timeline, `所有${what}在这个位置都放不下：${lastReason}`);
+}
+
+/**
+ * 从项目里删掉一个素材，**引用它的片段一起删**。
+ *
+ * 它和 D37 第 3 刀那个"孤儿 + 够老"的清理不是一件事：那个回答"所有项目都不引用的
+ * 资产什么时候可以从磁盘上清掉"，这里回答"用户在这个项目里不要它了"。所以这里
+ * **只动 Timeline、不碰资产库**——字节的去留交给既有清理（它的判据必须跨项目算，
+ * 见 `asset-cleanup.ts`），顺带保住撤销：⌘Z 之后片段和素材原样回来，文件也还在库里。
+ *
+ * **全体或拒绝**（判据同 `moveClips`）：引用它的片段有一个在锁定轨道上就整个拒绝。
+ * "素材没了、片段还留着"不是部分成功，是一个非法状态——`resolveSource()` 对着
+ * 引用不到素材的片段直接抛，预览当场崩（`project-snapshot.ts` 那条"素材找不回来时
+ * 片段必须移除"守的就是它，这里不能亲手造一个出来）。
+ *
+ * 引用判据问 `clipSourceId()`：图片片段同样带 `sourceId`，散写 `kind === "media"`
+ * 会漏掉它——表现是"素材删了、图片片段还在"，渲染时那一层静默消失。
+ */
+export function removeSource(timeline: Timeline, sourceId: SourceId): EditResult {
+  const source = timeline.sources.find((s) => s.id === sourceId);
+  if (!source) return reject(timeline, `找不到素材 ${sourceId}`);
+
+  for (const track of timeline.tracks) {
+    if (!track.locked) continue;
+    if (track.clips.some((c) => clipSourceId(c) === sourceId)) {
+      return reject(
+        timeline,
+        `${track.label ?? track.id} 已锁定，上面还有引用这个素材的片段，先解锁`,
+      );
+    }
+  }
+
+  // 删掉片段的轨道要过 `withClips` 归一化：后继片段的转场此刻指向一个不存在的交界
+  // （转场挂在入场片段上、相邻关系不由类型保证），不清掉就是"界面显示有转场、画面上没有"
+  const tracks = timeline.tracks.map((t) =>
+    t.clips.some((c) => clipSourceId(c) === sourceId)
+      ? withClips(t, t.clips.filter((c) => clipSourceId(c) !== sourceId))
+      : t,
+  );
+  return ok({
+    ...replaceTracks(timeline, tracks),
+    sources: timeline.sources.filter((s) => s.id !== sourceId),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 轨道增删
+// ---------------------------------------------------------------------------
+
+/** 新建轨道要把 id 交回给调用方（同 `AddClipResult`：UI 可能要立刻指到它）。 */
+export interface AddTrackResult extends EditResult {
+  readonly trackId?: TrackId;
+}
+
+/**
+ * 下一个空闲的轨道 id：`V3` / `A3` 这种可读形式，不用 UUID。
+ *
+ * 轨道 id 直接显示在轨道头和状态栏上（片段 id 不显示，所以那边用 UUID），可读性是
+ * 界面的一部分。这**不违反** D36/D41 那条"不许用模块级计数器"：那两个坑坏在计数器
+ * 随页面加载重置、记不住快照里已经用掉的号，而这里每次都从当前时间轴现算——时间轴
+ * 本身就是唯一真值来源，快照恢复回来的轨道天然参与判重。
+ *
+ * 取"同前缀最大号 + 1"而不是"最小空号"：删掉 V2 再新建给的是 V4 不是 V2——剪贴板
+ * 按 `trackId` 记原轨道（`ClipboardEntry`），复用刚删掉的号会让旧剪贴板把片段粘进
+ * 一条毫不相干的新轨。末尾那道 while 防的是手工快照里"音频轨叫 V3"这类越界命名。
+ */
+function nextTrackId(tracks: readonly Track[], kind: TrackKind): TrackId {
+  const prefix = kind === "video" ? "V" : "A";
+  const pattern = new RegExp(`^${prefix}(\\d+)$`);
+  let max = 0;
+  for (const track of tracks) {
+    const match = pattern.exec(track.id);
+    if (match) max = Math.max(max, Number(match[1]));
+  }
+  let n = max + 1;
+  while (tracks.some((t) => t.id === `${prefix}${n}`)) n += 1;
+  return `${prefix}${n}`;
+}
+
+/**
+ * 新建一条空轨道。
+ *
+ * **画面轨插在最上面，音频轨加在最下面**：`tracks` 数组是自上而下的显示顺序，画面的
+ * z 序是"上面的压住下面的"（`videoTracksInDrawOrder` 反转这个数组），所以新画面轨
+ * 天然成为最上层的叠加位；音频没有 z 序，挂在末尾和"画面朝上长、声音朝下长"的
+ * NLE 习惯一致。不给 `label`：默认那五条的标签描述的是**角色**（主视频 / 人声），
+ * 新轨道没有预设角色，编一个「画面 4」不比轨道头上已有的 id 多说任何东西。
+ */
+export function addTrack(timeline: Timeline, kind: TrackKind): AddTrackResult {
+  const id = nextTrackId(timeline.tracks, kind);
+  const track: Track = { id, kind, clips: [] };
+  const tracks = kind === "video" ? [track, ...timeline.tracks] : [...timeline.tracks, track];
+  return { ...ok(replaceTracks(timeline, tracks)), trackId: id };
+}
+
+/**
+ * 删除一条轨道，上面的片段一起删。
+ *
+ * **锁定的轨道拒绝**：锁定的语义是"编辑会被拒绝"，而删掉整条轨是最大的一次编辑。
+ * D43 那条例外只属于 `locked` 开关本身（不然锁上就解不开），不延伸到删除。
+ *
+ * 轨道上**有片段时不在这里拦**：删除走撤销栈、一步就回得来，"要不要先确认"是界面
+ * 的事（菜单项的标签会写明连带几个片段）。也**不设"至少留一条"的下限**——空到没有
+ * 画面轨时，导入和新建文字都会带原因拒绝（"没有画面轨"），出路就是旁边的新建轨道。
+ */
+export function removeTrack(timeline: Timeline, trackId: TrackId): EditResult {
+  const track = findTrack(timeline, trackId);
+  if (!track) return reject(timeline, `找不到轨道 ${trackId}`);
+  if (track.locked) return reject(timeline, `${track.label ?? track.id} 已锁定，先解锁才能删除`);
+  return ok(replaceTracks(timeline, timeline.tracks.filter((t) => t.id !== trackId)));
 }
 
 // ---------------------------------------------------------------------------

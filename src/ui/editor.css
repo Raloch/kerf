@@ -381,7 +381,9 @@
 }
 .ed .asset {
   display: grid;
-  grid-template-columns: 56px 1fr;
+  /* 第三列给删除按钮。auto 而不是定宽：按钮藏起来时不占位置的写法（display:none）
+     会让 hover 一瞬间文字列变窄跳一下，所以按钮常驻布局、只用透明度显隐 */
+  grid-template-columns: 56px 1fr auto;
   gap: 9px;
   padding: 5px;
   border-radius: 5px;
@@ -391,10 +393,17 @@
   border: 1px solid transparent;
   color: inherit;
   font: inherit;
-  cursor: pointer;
 }
 .ed .asset:hover {
   background: var(--panel-2);
+}
+/* 删除按钮悬停这一行才显形，但键盘聚焦时也要看得见（透明的可聚焦按钮是个陷阱） */
+.ed .asset .del {
+  opacity: 0;
+}
+.ed .asset:hover .del,
+.ed .asset .del:focus-visible {
+  opacity: 1;
 }
 .ed .asset .thumb {
   aspect-ratio: 16/9;
@@ -409,8 +418,9 @@
   width: 15px;
   height: 15px;
 }
-/* 名称与规格必须各占一行：span 默认 inline，不写 block 会并排挤出去 */
-.ed .asset > span:last-child {
+/* 名称与规格必须各占一行：span 默认 inline，不写 block 会并排挤出去。
+   选择器指第 2 个子元素——末尾还有删除按钮，last-child 已经不指向文字列了 */
+.ed .asset > span:nth-child(2) {
   min-width: 0;
 }
 .ed .asset .nm {

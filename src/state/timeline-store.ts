@@ -19,8 +19,10 @@ import type {
   LutId,
   LutSource,
   MediaSource,
+  SourceId,
   Timeline,
   TrackId,
+  TrackKind,
   Transition,
 } from "../edl/types";
 import { FPS, type Rational } from "../time/rational";
@@ -39,12 +41,15 @@ import {
 import {
   addSource,
   addTextClip,
+  addTrack,
   clearKeyframes,
   findClip,
   moveClip,
   moveClips,
   removeClips,
   removeKeyframe,
+  removeSource,
+  removeTrack,
   moveKeyframe,
   addLut,
   addFont,
@@ -229,6 +234,15 @@ export interface TimelineState {
    * 而静音和隐藏会改变成片，理由见 `setTrackFlag`。
    */
   setTrackFlag: (trackId: TrackId, flag: TrackFlag, on: boolean) => void;
+  /** 新建一条空轨道（画面轨插最上、音频轨加最下，见 `addTrack`）。进撤销栈。 */
+  addTrack: (kind: TrackKind) => void;
+  /** 删除轨道，上面的片段一起删。锁定的会被拒；确认与否是界面的事（`removeTrack`）。 */
+  removeTrack: (trackId: TrackId) => void;
+  /**
+   * 把素材从项目里删掉，引用它的片段一起删（有片段在锁定轨道上就整体拒绝）。
+   * 只动 Timeline，资产库里的字节交给"孤儿 + 够老"的清理（见 `removeSource`）。
+   */
+  removeSource: (sourceId: SourceId) => void;
   /** 把选中的（可能多个）片段放进剪贴板。**不进撤销栈**——它什么都没改。 */
   copySelected: () => void;
   /** 把剪贴板那一组粘到播放头，各自落回原轨。放不下就整组拒绝。 */
@@ -573,6 +587,31 @@ export const useTimeline = create<TimelineState>((set, get) => {
 
     setTrackFlag(trackId, flag, on) {
       apply(setTrackFlag(get().timeline(), trackId, flag, on), trackFlagLabel(flag, on));
+    },
+
+    addTrack(kind) {
+      // 不给合并键：每按一次就是新的一条轨，两次新建合成一步撤销会让 ⌘Z 一下删掉两条
+      apply(addTrack(get().timeline(), kind), kind === "video" ? "新建画面轨" : "新建音频轨");
+    },
+
+    removeTrack(trackId) {
+      const result = removeTrack(get().timeline(), trackId);
+      // 删掉的轨道上可能有选中的片段。逐个过滤不整体清空，同 `removeSelected`
+      if (result.changed) {
+        set((s) => ({ selectedClipIds: liveSelection(result.timeline, s.selectedClipIds) }));
+      }
+      apply(result, "删除轨道");
+    },
+
+    removeSource(sourceId) {
+      const timeline = get().timeline();
+      const name = timeline.sources.find((s) => s.id === sourceId)?.name ?? sourceId;
+      const result = removeSource(timeline, sourceId);
+      // 引用它的片段随之消失，选中集合里的悬空引用同样要过滤
+      if (result.changed) {
+        set((s) => ({ selectedClipIds: liveSelection(result.timeline, s.selectedClipIds) }));
+      }
+      apply(result, `删除素材 ${name}`);
     },
 
     copySelected() {

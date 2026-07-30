@@ -931,3 +931,52 @@ describe("裁剪的 store 动作", () => {
     expect(cropOf("src1-v")).toEqual({ left: 0.6 });
   });
 });
+
+describe("轨道增删与删除素材的 store 连带处理", () => {
+  beforeEach(reset);
+
+  it("新建轨道进撤销栈，撤销一步回来", () => {
+    const s = () => useTimeline.getState();
+    const before = s().timeline().tracks.length;
+    s().addTrack("video");
+    expect(s().timeline().tracks.length).toBe(before + 1);
+    expect(s().timeline().tracks[0]!.kind).toBe("video");
+    expect(s().undoLabel()).toBe("新建画面轨");
+    s().undo();
+    expect(s().timeline().tracks.length).toBe(before);
+  });
+
+  it("删除轨道后过滤掉那条轨上的选中，其他轨的选中留着", () => {
+    const s = () => useTimeline.getState();
+    s().addSource(source(300)); // src1-v 落 V1、src1-a 落 A1
+    s().selectMany(["src1-v", "src1-a"]);
+    s().removeTrack("A1");
+    expect(s().selectedClipIds).toEqual(["src1-v"]);
+    expect(s().timeline().tracks.some((t) => t.id === "A1")).toBe(false);
+  });
+
+  it("删除素材后清掉引用它的选中，并把标签写成素材名", () => {
+    const s = () => useTimeline.getState();
+    s().addSource(source(300));
+    s().selectMany(["src1-v", "src1-a"]);
+    s().removeSource("src1");
+    expect(s().selectedClipIds).toEqual([]);
+    expect(s().timeline().sources).toEqual([]);
+    expect(s().undoLabel()).toBe("删除素材 test.mp4");
+    // 撤销后素材和片段一起回来
+    s().undo();
+    expect(s().timeline().sources).toHaveLength(1);
+    expect(findClip(s().timeline(), "src1-v")).toBeDefined();
+  });
+
+  it("锁定轨道挡住删素材时，拒绝原因报到 lastRejection 且什么都没变", () => {
+    const s = () => useTimeline.getState();
+    s().addSource(source(300));
+    s().setTrackFlag("A1", "locked", true);
+    const before = s().history.past.length;
+    s().removeSource("src1");
+    expect(s().lastRejection).toContain("已锁定");
+    expect(s().timeline().sources).toHaveLength(1);
+    expect(s().history.past.length).toBe(before);
+  });
+});

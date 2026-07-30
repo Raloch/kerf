@@ -19,6 +19,9 @@ import {
   addFont,
   addLut,
   addSource,
+  addTrack,
+  removeSource,
+  removeTrack,
   renameProject,
   addTextClip,
   IMAGE_DEFAULT_SECONDS,
@@ -2892,6 +2895,195 @@ describe("layerLooks：两条渲染路径的同一份字段", () => {
     expect(looks.transform).toEqual({ x: 20 });
     expect("color" in looks).toBe(false);
     expect("lut" in looks).toBe(false);
+  });
+});
+
+describe("轨道增删", () => {
+  it("新建画面轨插在最上面，id 取同前缀最大号加一", () => {
+    const base = timeline([
+      { id: "T1", kind: "video", clips: [] },
+      { id: "V2", kind: "video", clips: [] },
+      { id: "V1", kind: "video", clips: [clip("a", 0, 100)] },
+      { id: "A1", kind: "audio", clips: [] },
+    ]);
+    const result = addTrack(base, "video");
+    expect(result.changed).toBe(true);
+    expect(result.trackId).toBe("V3");
+    expect(result.timeline.tracks[0]).toEqual({ id: "V3", kind: "video", clips: [] });
+    // T1 用的是另一个前缀，不参与 V 系列的取号
+    expect(result.timeline.tracks).toHaveLength(5);
+  });
+
+  it("新建音频轨加在最下面", () => {
+    const base = twoClipTimeline();
+    const result = addTrack(base, "audio");
+    expect(result.trackId).toBe("A2");
+    const last = result.timeline.tracks[result.timeline.tracks.length - 1];
+    expect(last).toEqual({ id: "A2", kind: "audio", clips: [] });
+  });
+
+  it("删掉中间的号不复用：V1、V3 在场时新建给 V4 不是 V2", () => {
+    // 剪贴板按 trackId 记原轨道，复用刚删掉的号会让旧剪贴板粘进一条不相干的新轨
+    const base = timeline([
+      { id: "V3", kind: "video", clips: [] },
+      { id: "V1", kind: "video", clips: [] },
+    ]);
+    expect(addTrack(base, "video").trackId).toBe("V4");
+  });
+
+  it("同号被另一种轨道占着时继续往后找（手工快照里的越界命名）", () => {
+    const base = timeline([
+      { id: "V1", kind: "video", clips: [] },
+      { id: "A2", kind: "video", clips: [] }, // 一条叫 A2 的画面轨
+      { id: "A1", kind: "audio", clips: [] },
+    ]);
+    expect(addTrack(base, "audio").trackId).toBe("A3");
+  });
+
+  it("删除轨道连片段一起删，总长跟着重算", () => {
+    const base = timeline([
+      { id: "V1", kind: "video", clips: [clip("a", 0, 100)] },
+      { id: "A1", kind: "audio", clips: [clip("m", 0, 500)] },
+    ]);
+    expect(base.durationFrames).toBe(500);
+    const result = removeTrack(base, "A1");
+    expect(result.changed).toBe(true);
+    expect(result.timeline.tracks.map((t) => t.id)).toEqual(["V1"]);
+    expect(result.timeline.durationFrames).toBe(100);
+  });
+
+  it("锁定的轨道拒绝删除（D43 的例外只属于 locked 开关本身）", () => {
+    const base = timeline([{ id: "V1", kind: "video", locked: true, clips: [clip("a", 0, 100)] }]);
+    const result = removeTrack(base, "V1");
+    expect(result.changed).toBe(false);
+    expect(result.reason).toContain("已锁定");
+    expect(result.timeline).toBe(base);
+  });
+
+  it("找不到轨道时拒绝", () => {
+    const result = removeTrack(twoClipTimeline(), "V9");
+    expect(result.changed).toBe(false);
+    expect(result.reason).toContain("V9");
+  });
+
+  it("允许删到一种轨道一条不剩：随后导入带原因拒绝而不是崩", () => {
+    const base = timeline([
+      { id: "V1", kind: "video", clips: [] },
+      { id: "A1", kind: "audio", clips: [] },
+    ]);
+    const noVideo = removeTrack(base, "V1");
+    expect(noVideo.changed).toBe(true);
+    const readd = addSource(noVideo.timeline, {
+      source: source("src2", 100),
+      timelineIn: 0,
+    });
+    expect(readd.changed).toBe(false);
+    expect(readd.reason).toContain("没有画面轨");
+  });
+});
+
+describe("删除素材", () => {
+  /** V1 上 a(src) 和 b(src2) 相邻，b 带转场；A1 上 m(src)。 */
+  const withTwoSources = (): Timeline => {
+    const transition: Transition = { kind: "dissolve", frames: 12 };
+    return {
+      ...timeline([
+        {
+          id: "V1",
+          kind: "video",
+          clips: [clip("a", 0, 100), { ...clip("b", 100, 200), sourceId: "src2", transitionIn: transition }],
+        },
+        { id: "A1", kind: "audio", clips: [clip("m", 0, 150)] },
+      ]),
+      sources: [source("src", 1000), source("src2", 1000)],
+    };
+  };
+
+  it("素材和引用它的片段一起删，别的素材的片段保留", () => {
+    const result = removeSource(withTwoSources(), "src");
+    expect(result.changed).toBe(true);
+    expect(result.timeline.sources.map((s) => s.id)).toEqual(["src2"]);
+    const remaining = result.timeline.tracks.flatMap((t) => t.clips.map((c) => c.id));
+    expect(remaining).toEqual(["b"]);
+    // a 是最长引用之一（m 到 150），删完总长要重算
+    expect(result.timeline.durationFrames).toBe(200);
+  });
+
+  it("前驱被删掉后，后继片段的转场跟着归一化清掉", () => {
+    const result = removeSource(withTwoSources(), "src");
+    const b = findClip(result.timeline, "b");
+    expect(b?.clip.transitionIn).toBeUndefined();
+  });
+
+  it("图片片段同样算引用（判据是 clipSourceId，不是 kind === media）", () => {
+    const base: Timeline = {
+      ...timeline([
+        {
+          id: "V1",
+          kind: "video",
+          clips: [{ id: "p", kind: "image", sourceId: "img", timelineIn: 0, timelineOut: 100 }],
+        },
+      ]),
+      sources: [
+        {
+          id: "img",
+          kind: "image",
+          name: "p.png",
+          file: new File([], "p.png"),
+          hasAudio: false,
+          audioCodec: null,
+          width: 1200,
+          height: 800,
+          mimeType: "image/png",
+          frameCount: null,
+        },
+      ],
+    };
+    const result = removeSource(base, "img");
+    expect(result.changed).toBe(true);
+    expect(result.timeline.tracks[0]?.clips).toEqual([]);
+    expect(result.timeline.sources).toEqual([]);
+  });
+
+  it("引用片段在锁定轨道上时整体拒绝——素材没了片段还在是非法状态", () => {
+    const base = withTwoSources();
+    const locked: Timeline = {
+      ...base,
+      tracks: base.tracks.map((t) => (t.id === "A1" ? { ...t, locked: true } : t)),
+    };
+    const result = removeSource(locked, "src");
+    expect(result.changed).toBe(false);
+    expect(result.reason).toContain("已锁定");
+    // 全体或拒绝：V1 上那个没锁的引用片段也必须原样留着
+    expect(findClip(result.timeline, "a")).toBeDefined();
+    expect(result.timeline.sources).toHaveLength(2);
+  });
+
+  it("锁定轨道上没有引用片段时不挡道", () => {
+    const base = withTwoSources();
+    const locked: Timeline = {
+      ...base,
+      tracks: base.tracks.map((t) => (t.id === "A1" ? { ...t, locked: true } : t)),
+    };
+    // src2 只被 V1 上的 b 引用，A1 锁着与它无关
+    const result = removeSource(locked, "src2");
+    expect(result.changed).toBe(true);
+    expect(findClip(result.timeline, "b")).toBeUndefined();
+  });
+
+  it("没有片段引用时只删素材本身", () => {
+    const base: Timeline = { ...twoClipTimeline() };
+    const withOrphan: Timeline = { ...base, sources: [...base.sources, source("orphan", 100)] };
+    const result = removeSource(withOrphan, "orphan");
+    expect(result.changed).toBe(true);
+    expect(result.timeline.sources.map((s) => s.id)).toEqual(["src"]);
+    expect(result.timeline.tracks).toEqual(base.tracks);
+  });
+
+  it("找不到素材时拒绝", () => {
+    const result = removeSource(twoClipTimeline(), "ghost");
+    expect(result.changed).toBe(false);
+    expect(result.reason).toContain("ghost");
   });
 });
 
