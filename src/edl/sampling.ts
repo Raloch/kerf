@@ -55,7 +55,7 @@ import {
 } from "../time/timebase";
 import { resolveColor, resolveTransform } from "../anim/keyframes";
 import type { ColorAdjust } from "../compose/color";
-import type { LayerTransform } from "../compose/compositor";
+import type { CropInsets, LayerTransform } from "../compose/compositor";
 import type { Rational } from "../time/rational";
 
 /**
@@ -131,6 +131,12 @@ export interface VisibleMediaClip {
    */
   readonly transform?: LayerTransform;
   /**
+   * 这一层的裁剪。**不是求值出来的**（裁剪没有关键帧，见 D46），就是片段上那个字段。
+   * 放在这里而不是让两条渲染路径各自去读 `clip.crop`，理由同 `transform`：图层长什么样
+   * 只能由这一个函数说（硬规则 2）。
+   */
+  readonly crop?: CropInsets;
+  /**
    * 这一帧算完的调色。`undefined` 表示不调色，合成器据此**不挂滤镜**——
    * 同样不要补空对象，理由和 `transform` 完全相同（见 D17）。
    */
@@ -150,6 +156,7 @@ export interface VisibleTextClip {
   readonly trackId: string;
   readonly clip: TextClip;
   readonly transform?: LayerTransform;
+  readonly crop?: CropInsets;
   readonly color?: ColorAdjust;
   readonly lut?: LutSource;
 }
@@ -170,6 +177,7 @@ export interface VisibleImageClip {
   readonly clip: ImageClip;
   readonly source: ImageSource;
   readonly transform?: LayerTransform;
+  readonly crop?: CropInsets;
   readonly color?: ColorAdjust;
   readonly lut?: LutSource;
 }
@@ -337,6 +345,31 @@ export function visibleVideoClips(timeline: Timeline, frame: number): VisibleEnt
 }
 
 /**
+ * 把 `VisibleClip` 上"这一层长什么样"的那几个字段摘出来，摊给 `ComposeSourceLayer`。
+ *
+ * **抽成函数是因为它有两个调用点**（导出的 `pipeline.ts`、预览的 `preview-engine.ts`），
+ * 而它们必须给出同一份字段。原来那三行是各写一遍的，加第四个字段（裁剪）时漏掉一边的
+ * 表现是**预览里裁过、成片里没裁**——两条路径都不抛错，而"预览 / 导出一致性自检"要跑
+ * 一遍才发现。收成一处之后这类分叉在结构上不可能，同 `containRect` 那条"只有一处"。
+ *
+ * 条件展开而不是直接写 `transform: undefined`：`exactOptionalPropertyTypes` 下"字段不
+ * 存在"和"字段是 undefined"是两回事，而后端靠"没有这个字段"走恒等快路径（D9 / D17）。
+ */
+export function layerLooks(visible: VisibleClip): {
+  readonly transform?: LayerTransform;
+  readonly crop?: CropInsets;
+  readonly color?: ColorAdjust;
+  readonly lut?: LutSource;
+} {
+  return {
+    ...(visible.transform ? { transform: visible.transform } : {}),
+    ...(visible.crop ? { crop: visible.crop } : {}),
+    ...(visible.color ? { color: visible.color } : {}),
+    ...(visible.lut ? { lut: visible.lut } : {}),
+  };
+}
+
+/**
  * 把一个片段变成"这一帧要画的一层"。转场的两个输入和普通图层走的是**同一条**
  * 路径，所以摆位、调色、LUT、取帧夹紧在转场里的行为与平时完全一致。
  *
@@ -365,6 +398,8 @@ function visibleFor(
   const lut = clip.lutId ? findLut(timeline, clip.lutId) : null;
   const extras = {
     ...(transform ? { transform } : {}),
+    // 裁剪不求值，但同样要"没裁就不给字段"——后端的恒等快路径判的是这个
+    ...(clip.crop ? { crop: clip.crop } : {}),
     ...(color ? { color } : {}),
     ...(lut ? { lut } : {}),
   };

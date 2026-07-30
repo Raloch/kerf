@@ -54,10 +54,11 @@ import {
   createCanvas2DCompositor,
   type ComposeLayer,
   type Compositor,
+  type CropInsets,
   type LayerTransform,
 } from "../compose/compositor";
 import { createPixiCompositor, type PixiCompositor } from "../compose/pixi-compositor";
-import { measure, sampleHueAt, type Bands } from "./measure";
+import { measure, sampleHueAt, type Bands, type MeasureRegion } from "./measure";
 
 /** 方形输出 + 16:9 源片 → 必然产生上下黑边，留边几何才有得比。 */
 const OUT = 320;
@@ -183,6 +184,8 @@ export interface PixiProbeReport {
   readonly colors: readonly ColorComparison[];
   /** 同一个槽位上源尺寸变化时两个后端是否一致，见 `compareSizeSwitch`。 */
   readonly sizeSwitch: readonly SizeSwitchComparison[];
+  /** 裁剪在同一个槽位上来回变时两个后端是否一致，见 `compareCrop`。 */
+  readonly crop: readonly CropComparison[];
   /** 3D LUT：同上，外加"先调色再 LUT"这个顺序的钉子。 */
   readonly luts: readonly LutComparison[];
   readonly transitions: readonly TransitionComparison[];
@@ -452,14 +455,23 @@ export interface SizeSwitchComparison {
 const SIZE_SWITCH_BIG = { width: 640, height: 360 } as const;
 const SIZE_SWITCH_SMALL = { width: 200, height: 100 } as const;
 
+/**
+ * 探针图的左右两色。**提成常量是为了让断言拿它当期望值**：裁掉左半之后画面区该是右边那个
+ * 色，而"该是什么色"必须来自画上去的那个数，不能另写一个（第一版把期望色相写成 240°，
+ * 而 rgb(40,60,220) 的真实色相是 233.3°——那 7° 的差全是我自己造的，却被容差吸收掉了，
+ * 正是"先确认健康值量的是被测对象，而不是量法自己的偏差"那条）。
+ */
+const TWO_TONE_LEFT = [220, 40, 40] as const;
+const TWO_TONE_RIGHT = [40, 60, 220] as const;
+
 /** 造一张左右两色的位图。左右不同色是为了让"只显示了左边一小块"这种错露出来。 */
 async function twoToneBitmap(width: number, height: number): Promise<ImageBitmap> {
   const canvas = new OffscreenCanvas(width, height);
   const ctx = canvas.getContext("2d", { alpha: false });
   if (!ctx) throw new Error("造尺寸切换用的位图拿不到 2D 上下文");
-  ctx.fillStyle = "rgb(220,40,40)";
+  ctx.fillStyle = `rgb(${TWO_TONE_LEFT.join(",")})`;
   ctx.fillRect(0, 0, width / 2, height);
-  ctx.fillStyle = "rgb(40,60,220)";
+  ctx.fillStyle = `rgb(${TWO_TONE_RIGHT.join(",")})`;
   ctx.fillRect(width / 2, 0, width / 2, height);
   return createImageBitmap(canvas);
 }
@@ -508,6 +520,138 @@ async function compareSizeSwitch(): Promise<SizeSwitchComparison[]> {
     canvas2d.dispose();
     big.close();
     small.close();
+  }
+}
+
+/**
+ * **裁剪（D46）。** 三件事一起验：两个后端一致、留边按裁剪之后的宽高比算、以及**取的
+ * 确实是那一块画面**。
+ *
+ * 前两条同 `compareSizeSwitch`。第三条是这一组独有的，它靠的是探针图左红右蓝：裁掉左半
+ * 之后画面区应该是**纯蓝**，裁掉右半应该是**纯红**。只量留边的话"裁的位置算错了（取了另
+ * 半边）"完全测不出来——两个后端会一起取错同一块，一致性仍然成立（同"两条路径比对覆盖
+ * 不了渲染算法本身"）。
+ *
+ * **步骤顺序有意义：不裁 → 裁 → 裁另一边 → 换个方向裁 → 回到不裁。** 裁剪和源尺寸踩的是
+ * 同一块地（D36）：换 `Texture` 的 frame 同样通知不到 `Sprite` 的包围盒，所以槽位的判据
+ * 必须把取样矩形整个记下来。
+ *
+ * 每一步各自抓什么，是**注入验出来的**，不是推出来的（第一版注释里写的理由被实验推翻了：
+ * 我以为"判据只看源尺寸"要到最后一步才露出来，实际它在第一次裁剪就红）：
+ *
+ * - **判据退回"只看源尺寸"** → 红在「裁掉左半」和「上下各裁 25%」上：源尺寸没变于是纹理
+ *   不换，画面中心量到的是**左边那块**（220,40,40）而不是右边那块——裁剪对"取哪些像素"
+ *   完全没生效。
+ * - **只在"有裁剪"时才换纹理、回到不裁不换** → **只**红在最后一步「回到不裁」上
+ *   （上下 70/160，sprite 仍按裁过的那块算自己有多大）。这就是最后那一步存在的理由。
+ *   它同时会红掉源尺寸那一组，因为两组共用这一个判据——那正是把它们合并成一个矩形的收益。
+ * - **缩放的分母用源片全尺寸而不是裁剪后的尺寸** → 红在「裁掉左半」上，画面只有该有的一半宽。
+ */
+export interface CropComparison {
+  readonly name: string;
+  /** 手算的期望上下黑边。 */
+  readonly expectedTopBand: number;
+  /** 手算的期望左右黑边。裁剪改变宽高比，于是留边会从上下换到左右。 */
+  readonly expectedSideBand: number;
+  /**
+   * 画面区该是哪个颜色（就是画上去的那个 RGB）。null = 这一步不判色（半红半蓝的平均色
+   * 取决于两块各占多少像素，不是一个"画上去过"的值，拿它当判据就是自己编一个期望）。
+   */
+  readonly expectedRgb: readonly [number, number, number] | null;
+  readonly pixi: Bands;
+  readonly canvas2d: Bands;
+  /**
+   * **画面正中一小块**的平均色，两个后端各一份。
+   *
+   * 不能用 `Bands.meanR/G/B`：那个平均只避开**上下**黑边（`measure()` 里 x 从 4 到
+   * rw-4，见它的实现），而裁剪恰好把留边搬到了左右——于是黑边混进平均色，读数比画上去
+   * 的颜色等比暗一截。实测左右各 18px 黑边时读到 200 而画的是 220，手算
+   * (312-28)/312 × 220 = 200.2 分毫不差：那 20 的差**全部来自量法**，不是被测对象。
+   * 用 D6 那个分区测量取正中 60×60，那块一定落在画面里。
+   */
+  readonly pixiCenter: readonly [number, number, number];
+  readonly canvas2dCenter: readonly [number, number, number];
+}
+
+/** 取正中一小块量颜色用的矩形。60×60 在所有裁剪步骤里都落在画面区内部（手验过）。 */
+const CROP_CENTER: MeasureRegion = { x: OUT / 2 - 30, y: OUT / 2 - 30, width: 60, height: 60 };
+
+async function compareCrop(): Promise<CropComparison[]> {
+  // 左红右蓝的 640×360（16:9）。纯色两块而不是渐变：把被测对象从采样精度里剥出来
+  const bitmap = await twoToneBitmap(SIZE_SWITCH_BIG.width, SIZE_SWITCH_BIG.height);
+  const probe = new OffscreenCanvas(OUT, OUT);
+  const probeCtx = probe.getContext("2d", { willReadFrequently: true });
+  if (!probeCtx) throw new Error("裁剪探测画布没有 2D 上下文");
+
+  const snapshot = (
+    compositor: { composeFrame: (layers: ComposeLayer[]) => void; canvas: CanvasImageSource },
+    crop?: CropInsets,
+  ): { readonly bands: Bands; readonly center: readonly [number, number, number] } => {
+    compositor.composeFrame([
+      {
+        kind: "image",
+        image: bitmap,
+        width: bitmap.width,
+        height: bitmap.height,
+        ...(crop ? { crop } : {}),
+      },
+    ]);
+    probeCtx.clearRect(0, 0, OUT, OUT);
+    probeCtx.drawImage(compositor.canvas, 0, 0);
+    const bands = measure(probeCtx, OUT, OUT);
+    const mid = measure(probeCtx, OUT, OUT, CROP_CENTER);
+    return { bands, center: [mid.meanR, mid.meanG, mid.meanB] };
+  };
+
+  /** 手算：裁剪后的源片尺寸 → contain 进方形输出 → 上下 / 左右各留多少。 */
+  const bandsFor = (crop?: CropInsets) => {
+    const { top = 0, right = 0, bottom = 0, left = 0 } = crop ?? {};
+    const w = SIZE_SWITCH_BIG.width * (1 - left - right);
+    const h = SIZE_SWITCH_BIG.height * (1 - top - bottom);
+    const scale = Math.min(OUT / w, OUT / h);
+    return {
+      expectedTopBand: Math.round((OUT - h * scale) / 2),
+      expectedSideBand: Math.round((OUT - w * scale) / 2),
+    };
+  };
+
+  const steps: readonly {
+    readonly name: string;
+    readonly crop?: CropInsets;
+    readonly expectedRgb: readonly [number, number, number] | null;
+  }[] = [
+    // 16:9 进方形：上下各留 (320-180)/2 = 70，画面区半红半蓝
+    { name: "不裁（640×360）", expectedRgb: null },
+    // 裁掉左半：源片区间变成右半 320×360（0.89:1）→ 留边从上下换到左右，画面是右边那个色
+    { name: "裁掉左半（只剩右边那块）", crop: { left: 0.5 }, expectedRgb: TWO_TONE_RIGHT },
+    // 裁掉右半：只剩左边那块。这一步单独存在的理由是"取错了另半边"会红在颜色上
+    { name: "裁掉右半（只剩左边那块）", crop: { right: 0.5 }, expectedRgb: TWO_TONE_LEFT },
+    // 上下各裁 25%：宽高比变成 640:180 = 3.56:1，比原来更宽，上下黑边反而变多
+    { name: "上下各裁 25%", crop: { top: 0.25, bottom: 0.25 }, expectedRgb: null },
+    // **回到不裁**：这一步是 D36 那个陷阱的第二种入口，见上面的注释
+    { name: "回到不裁（同一个槽位）", expectedRgb: null },
+  ];
+
+  const pixi = await createPixiCompositor(OUT, OUT);
+  const canvas2d = createCanvas2DCompositor(OUT, OUT);
+  try {
+    return steps.map((step) => {
+      const p = snapshot(pixi, step.crop);
+      const c = snapshot(canvas2d, step.crop);
+      return {
+        name: step.name,
+        ...bandsFor(step.crop),
+        expectedRgb: step.expectedRgb,
+        pixi: p.bands,
+        canvas2d: c.bands,
+        pixiCenter: p.center,
+        canvas2dCenter: c.center,
+      };
+    });
+  } finally {
+    pixi.dispose();
+    canvas2d.dispose();
+    bitmap.close();
   }
 }
 
@@ -1409,6 +1553,8 @@ async function run(): Promise<PixiProbeReport> {
     const colors = await colorPass(probeSample);
     // 源尺寸在同一槽位上变化：这一组只用纯色位图，与解码无关（见 `compareSizeSwitch`）
     const sizeSwitch = await compareSizeSwitch();
+    // 裁剪：同一个槽位上换取样矩形（D46），与解码无关，同样只用纯色位图
+    const crop = await compareCrop();
 
     // ---- 5c. 3D LUT：GPU 查出来的是不是 sampleLutTexture() 查出来的 ----
     const luts = await lutPass(probeSample);
@@ -1445,6 +1591,7 @@ async function run(): Promise<PixiProbeReport> {
       transforms,
       colors,
       sizeSwitch,
+      crop,
       luts,
       transitions,
       perf,

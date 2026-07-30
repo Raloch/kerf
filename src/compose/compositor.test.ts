@@ -10,7 +10,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { containRect, isDefaultGeometry, placeLayer } from "./compositor";
+import { containRect, cropRect, isDefaultCrop, isDefaultGeometry, placeLayer } from "./compositor";
 
 describe("containRect", () => {
   it("16:9 源片进方形画布：按宽度贴满，上下留边", () => {
@@ -127,5 +127,75 @@ describe("placeLayer", () => {
     const p = placeLayer(fit, {});
     expect(p.centerX - p.width / 2).toBe(fit.dx);
     expect(p.centerY - p.height / 2).toBe(fit.dy);
+  });
+});
+
+/**
+ * 裁剪的几何。同上，期望值全部手算。
+ *
+ * 值得单测的理由和 `containRect` 完全一样，还多一条：**裁剪改变宽高比，于是留边跟着变**。
+ * 那条串联（`cropRect` → `containRect`）错了同样不报错，只表现为构图偏掉，而两条渲染路径
+ * 用的是同一份错数，一致性自检抓不到。
+ */
+describe("cropRect", () => {
+  it("不裁时就是整幅源片", () => {
+    expect(cropRect(640, 360)).toEqual({ sx: 0, sy: 0, width: 640, height: 360 });
+    expect(cropRect(640, 360, {})).toEqual({ sx: 0, sy: 0, width: 640, height: 360 });
+  });
+
+  it("四条边各自按源片尺寸的比例切", () => {
+    // 左 10% = 64，右 20% → 宽 640×(1-0.1-0.2) = 448；上 25% = 90，下 25% → 高 360×0.5 = 180
+    expect(cropRect(640, 360, { left: 0.1, right: 0.2, top: 0.25, bottom: 0.25 })).toEqual({
+      sx: 64,
+      sy: 90,
+      width: 448,
+      height: 180,
+    });
+  });
+
+  it("**比例存的裁剪换了源片分辨率仍然裁的是同一块画面**", () => {
+    // 这是"按比例不按像素"的全部理由（D37 的指认页允许重导一版 720p）
+    const half = { left: 0.25, right: 0.25 };
+    const big = cropRect(1920, 1080, half)!;
+    const small = cropRect(1280, 720, half)!;
+    expect(big.sx / 1920).toBeCloseTo(small.sx / 1280, 12);
+    expect(big.width / 1920).toBeCloseTo(small.width / 1280, 12);
+  });
+
+  it("**裁剪之后的宽高比才是留边的依据**", () => {
+    // 640×360（16:9）左右各裁 25% → 320×360，进 320×320 的方形画布：
+    // scale = min(320/320, 320/360) = 0.888…，画面 284.44×320，左右各留 17.77…
+    const src = cropRect(640, 360, { left: 0.25, right: 0.25 })!;
+    expect(src).toEqual({ sx: 160, sy: 0, width: 320, height: 360 });
+    const rect = containRect(src.width, src.height, 320, 320)!;
+    expect(rect.height).toBe(320);
+    expect(rect.width).toBeCloseTo((320 * 320) / 360, 10);
+    expect(rect.dy).toBe(0);
+    // 没裁的时候同一张源片在同一块画布上是"上下留边"，裁完变成"左右留边"——
+    // 这个反转就是"留边按裁剪之后算"的可见后果
+    expect(containRect(640, 360, 320, 320)!.dy).toBe(70);
+  });
+
+  it("对边加起来吃光画面时返回 null（这一层不画）", () => {
+    expect(cropRect(640, 360, { left: 0.5, right: 0.5 })).toBeNull();
+    expect(cropRect(640, 360, { top: 0.6, bottom: 0.6 })).toBeNull();
+    // 源片尺寸非法同样返回 null，同 containRect
+    expect(cropRect(0, 360, { left: 0.1 })).toBeNull();
+  });
+});
+
+describe("isDefaultCrop", () => {
+  it("没有字段、空对象、四条边全是 0 都算没裁", () => {
+    expect(isDefaultCrop()).toBe(true);
+    expect(isDefaultCrop({})).toBe(true);
+    expect(isDefaultCrop({ top: 0, right: 0, bottom: 0, left: 0 })).toBe(true);
+  });
+
+  it("任何一条边非 0 就不是恒等——四条都要判", () => {
+    // 漏判一条的表现是那条边的裁剪被静默忽略（走了整幅贴图的原路径）
+    expect(isDefaultCrop({ top: 0.1 })).toBe(false);
+    expect(isDefaultCrop({ right: 0.1 })).toBe(false);
+    expect(isDefaultCrop({ bottom: 0.1 })).toBe(false);
+    expect(isDefaultCrop({ left: 0.1 })).toBe(false);
   });
 });

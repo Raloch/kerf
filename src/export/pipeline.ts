@@ -47,7 +47,12 @@ import { registerFonts } from "../compose/font-registry";
 import { decodedImage, decodedImageBytes, prepareImages } from "../compose/image-store";
 import { residency, ResidencyTracker } from "./residency";
 import { rasterizeText, textRasterCacheBytes } from "../compose/text-raster";
-import { videoTracksInDrawOrder, visibleVideoClips, type VisibleClip } from "../edl/sampling";
+import {
+  layerLooks,
+  videoTracksInDrawOrder,
+  visibleVideoClips,
+  type VisibleClip,
+} from "../edl/sampling";
 import { decideFormat } from "../media/capability";
 import { probeCapabilities } from "../media/capability-probe";
 import { frameToSeconds, frameDurationMicros, MICROS_PER_SECOND } from "../time/timebase";
@@ -307,11 +312,8 @@ export async function runExport(
       // 第二步：按图层顺序装配。顺序、每层的变换和调色都来自 sampling.ts，
       // 导出侧一个都不自己算——预览侧拿的是同一个函数的同一份结果（硬规则 2）
       const toLayer = (visible: VisibleClip): ComposeSourceLayer | null => {
-        const looks = {
-          ...(visible.transform ? { transform: visible.transform } : {}),
-          ...(visible.color ? { color: visible.color } : {}),
-          ...(visible.lut ? { lut: visible.lut } : {}),
-        };
+        // 这一层长什么样只由 sampling.ts 说——预览侧调的是同一个函数（硬规则 2）
+        const looks = layerLooks(visible);
         if (visible.kind === "text") {
           // 与预览侧调的是同一个 rasterizeText、同一份缓存，所以字形一致是
           // 结构性的而不是靠对齐（硬规则 2）。缓存命中时这里不做任何排版工作

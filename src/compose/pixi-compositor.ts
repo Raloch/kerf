@@ -62,10 +62,13 @@ import {
 } from "./transition-shader";
 import {
   containRect,
+  cropRect,
+  isDefaultCrop,
   isDefaultGeometry,
   placeLayer,
   type ComposeSourceLayer,
   type Compositor,
+  type CropRect,
 } from "./compositor";
 
 /** 仅供自检使用的观察窗口。生产代码不要依赖这里的任何东西。 */
@@ -92,11 +95,16 @@ interface LayerSlot {
   texture: Texture;
   readonly sprite: Sprite;
   /**
-   * 上一帧这个槽位的源尺寸。**判据必须记在我们自己这边**：`texture.frame` 在
-   * `resize()` 之后已经跟上了新尺寸，拿它当判据的话条件恒为假（踩过）。
+   * 上一帧这个槽位**在源片里取的那块矩形**（`cropRect` 的结果，没裁时就是整幅）。
+   *
+   * **判据必须记在我们自己这边**：`texture.frame` 在 `resize()` 之后已经跟上了新尺寸，
+   * 拿它当判据的话条件恒为假（踩过）。
+   *
+   * 记矩形而不是只记源尺寸，是因为**裁剪变了同样要换纹理**：源尺寸没变而取样矩形变了
+   * 时，只更新 frame 通知不到 sprite 的包围盒，是 D36 那个 bug 的第二种入口。
+   * 一个矩形把两种情形都盖住，也就不会出现"改了源尺寸判据、忘了改裁剪判据"。
    */
-  sourceWidth: number;
-  sourceHeight: number;
+  frame: CropRect;
   /**
    * 调色滤镜。**懒建并跨帧复用**——和 `ImageSource` 是同一个理由：
    * 每帧 `new ColorMatrixFilter()` 会逐帧新建 GPU 资源，导出慢一个量级。
@@ -246,8 +254,7 @@ export async function createPixiCompositor(
       source,
       texture,
       sprite,
-      sourceWidth: 1,
-      sourceHeight: 1,
+      frame: { sx: 0, sy: 0, width: 1, height: 1 },
       colorFilter: null,
       lutFilter: null,
       lutData: null,
@@ -400,8 +407,10 @@ export async function createPixiCompositor(
       srcHeight = layer.height;
     }
 
-    const rect = containRect(srcWidth, srcHeight, width, height);
-    if (!rect) {
+    // 裁剪 → 留边 → 变换，顺序与 Canvas2D 后端完全一致（见 `drawLayer` 的注释）
+    const src = cropRect(srcWidth, srcHeight, layer.crop);
+    const rect = src ? containRect(src.width, src.height, width, height) : null;
+    if (!src || !rect) {
       temporary?.close();
       return false;
     }
@@ -432,13 +441,23 @@ export async function createPixiCompositor(
      * `resize()` 之后已经等于新尺寸了，拿它当判据的话条件恒为假、这段永不执行
      * （第一版就是这么写的，改完读数一点没变）。
      */
-    if (slot.sourceWidth !== srcWidth || slot.sourceHeight !== srcHeight) {
+    if (
+      slot.frame.sx !== src.sx ||
+      slot.frame.sy !== src.sy ||
+      slot.frame.width !== src.width ||
+      slot.frame.height !== src.height
+    ) {
       const previous = slot.texture;
-      slot.texture = new pixi.Texture({ source: slot.source });
+      // 没裁过时**不给 frame**，和加裁剪之前完全相同的构造（同 `isDefaultCrop`）
+      slot.texture = isDefaultCrop(layer.crop)
+        ? new pixi.Texture({ source: slot.source })
+        : new pixi.Texture({
+            source: slot.source,
+            frame: new pixi.Rectangle(src.sx, src.sy, src.width, src.height),
+          });
       slot.sprite.texture = slot.texture;
       previous.destroy(false);
-      slot.sourceWidth = srcWidth;
-      slot.sourceHeight = srcHeight;
+      slot.frame = src;
     }
 
     slot.sprite.visible = true;
@@ -454,15 +473,17 @@ export async function createPixiCompositor(
       slot.sprite.rotation = 0;
       slot.sprite.position.set(rect.dx, rect.dy);
       // 不用 sprite.width/height：那两个 setter 依赖纹理尺寸的记账，
-      // 换源尺寸时容易慢一帧。直接算缩放是确定的
-      slot.sprite.scale.set(rect.width / srcWidth, rect.height / srcHeight);
+      // 换源尺寸时容易慢一帧。直接算缩放是确定的。
+      // 分母是**裁剪后**的尺寸——sprite 的纹理就是那一块，拿源片全尺寸去除会让
+      // 裁过的图层缩得过小（裁掉一半时只画出该有的一半大）
+      slot.sprite.scale.set(rect.width / src.width, rect.height / src.height);
     } else {
       // 旋转要绕图层中心，所以 anchor 挪到中心、position 跟着变成中心点
       const placement = placeLayer(rect, layer.transform);
       slot.sprite.anchor.set(0.5, 0.5);
       slot.sprite.rotation = placement.rotation;
       slot.sprite.position.set(placement.centerX, placement.centerY);
-      slot.sprite.scale.set(placement.width / srcWidth, placement.height / srcHeight);
+      slot.sprite.scale.set(placement.width / src.width, placement.height / src.height);
     }
     return temporary;
   };

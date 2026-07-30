@@ -41,11 +41,13 @@ import { newFontFamily, registerFont } from "../compose/font-registry";
 import { parseCubeLut } from "../compose/lut";
 import { TEXT_STYLE_DEFAULTS } from "../compose/text-raster";
 import { decodeSizeFor } from "../compose/image-store";
+import { cropRect } from "../compose/compositor";
 import {
   clipDuration,
   clipSourceId,
   clipSpeed,
   findLut,
+  sourceHasPicture,
   SPEED_RANGE,
   type Clip,
   type ClipId,
@@ -61,6 +63,9 @@ import {
   isColorProperty,
   junctionInfo,
   DEFAULT_TRANSITION_KIND,
+  CROP_EDGES,
+  CROP_EDGE_LABELS,
+  CROP_EDGE_MAX,
   PROPERTY_LABELS,
   PROPERTY_RANGES,
   isAudioProperty,
@@ -71,6 +76,7 @@ import {
   TRANSITION_LABELS,
   TRANSITION_ORDER,
   type ColorPatch,
+  type CropPatch,
   type TransformPatch,
 } from "../state/operations";
 import { MAX_TRANSITION_FRAMES, MIN_TRANSITION_FRAMES } from "../edl/transition";
@@ -272,12 +278,92 @@ export function Inspector() {
       <TransitionSection clip={clip} track={track} timeline={timeline} />
       {/* 哪一组属性对这个片段有意义，判据在 `propertyApplies` 一处——多选面板问的是
           同一个函数。两处各写一遍 `track.kind === "video"` 迟早漂，见那个函数的注释 */}
+      {/* 裁剪排在变换之前：它决定这一层有多大，变换再把那个结果摆到画面上（`drawLayer`
+          的顺序就是这个），界面上倒过来读会让人以为变换先生效 */}
+      {track.kind === "video" && <CropSection clip={clip} timeline={timeline} />}
       {(["transform", "color", "audio"] as const).map(
         (group) =>
           groupApplies(group, clip, track) && (
             <PropertySection key={group} group={group} clip={clip} playhead={playhead} />
           ),
       )}
+    </>
+  );
+}
+
+/**
+ * 裁剪一节：四条边各一个百分比，加一行"裁完剩多大"。
+ *
+ * 那行读数不是装饰。裁剪按比例存（`CropInsets`），而用户想知道的是"我现在这一层是几乘几、
+ * 什么比例"——尤其因为**裁剪会改变宽高比，于是留边跟着变**：把 16:9 裁成 1:1 之后它在
+ * 16:9 输出里会左右留黑边，而这件事在检查器里说出来比让用户对着画面猜要好。
+ *
+ * 源片尺寸拿不到时（纯音频素材根本到不了这里，图片和视频都有尺寸）整行不显示，不编一个数。
+ */
+function CropSection({
+  clip,
+  timeline,
+}: {
+  readonly clip: Clip;
+  readonly timeline: Timeline;
+}) {
+  const setClipCrop = useTimeline((s) => s.setClipCrop);
+  const sourceId = clipSourceId(clip);
+  const source = sourceId ? timeline.sources.find((s) => s.id === sourceId) : undefined;
+  // 文字层的"源片"是输出尺寸那张栅格画布（见 `rasterizeText`），所以拿输出尺寸当它的尺寸
+  const size =
+    clip.kind === "text"
+      ? { width: timeline.width, height: timeline.height }
+      : source && sourceHasPicture(source)
+        ? { width: source.width, height: source.height }
+        : null;
+  const rect = size ? cropRect(size.width, size.height, clip.crop) : null;
+
+  return (
+    <>
+      <div className="grp-title row">
+        <span>裁剪</span>
+        <button
+          type="button"
+          className="mini"
+          disabled={clip.crop === undefined}
+          title="不裁了（四条边都回到 0）"
+          onClick={() =>
+            setClipCrop(
+              clip.id,
+              Object.fromEntries(CROP_EDGES.map((edge) => [edge, undefined])) as CropPatch,
+            )
+          }
+        >
+          重置
+        </button>
+      </div>
+      <div className="fields">
+        {CROP_EDGES.map((edge) => (
+          <div className="f ctl" key={edge}>
+            <label>{CROP_EDGE_LABELS[edge]}边</label>
+            <NumberField
+              value={(clip.crop?.[edge] ?? 0) * 100}
+              step={1}
+              min={0}
+              max={CROP_EDGE_MAX * 100}
+              digits={1}
+              suffix="%"
+              title={`从${CROP_EDGE_LABELS[edge]}边切掉源片的百分之几`}
+              onCommit={(display) => setClipCrop(clip.id, { [edge]: display / 100 } as CropPatch)}
+            />
+          </div>
+        ))}
+        {rect && (
+          <div className="f">
+            <label>裁完</label>
+            <span className="val">
+              {Math.round(rect.width)}×{Math.round(rect.height)} ·{" "}
+              {(rect.width / rect.height).toFixed(2)}:1
+            </span>
+          </div>
+        )}
+      </div>
     </>
   );
 }

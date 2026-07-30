@@ -20,7 +20,7 @@
  */
 
 import type { AvSource, ImageSource, Timeline } from "../edl/types";
-import { microsToSeconds, visibleVideoClips, type VisibleClip } from "../edl/sampling";
+import { layerLooks, microsToSeconds, visibleVideoClips, type VisibleClip } from "../edl/sampling";
 import { createCompositor, type CompositorBackend } from "../compose/backend";
 import type { ComposeLayer, ComposeSourceLayer, Compositor } from "../compose/compositor";
 import { rasterizeText } from "../compose/text-raster";
@@ -265,11 +265,8 @@ export async function createPreviewEngine(
     const toLayer = (visible: VisibleClip): ComposeSourceLayer | null => {
       // 摆位和调色都来自 visibleVideoClips，这一层一个都不自己算——
       // 导出侧拿的是同一份（硬规则 2 的第二个落点，见 edl/sampling.ts）
-      const looks = {
-        ...(visible.transform ? { transform: visible.transform } : {}),
-        ...(visible.color ? { color: visible.color } : {}),
-        ...(visible.lut ? { lut: visible.lut } : {}),
-      };
+      // 这一层长什么样只由 sampling.ts 说——导出侧调的是同一个函数（硬规则 2）
+      const looks = layerLooks(visible);
       if (visible.kind === "text") {
         const raster = rasterizeText(
           visible.clip.text,

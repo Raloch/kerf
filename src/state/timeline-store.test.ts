@@ -888,3 +888,46 @@ describe("批量改属性", () => {
     expect(s().lastRejection).toBeNull();
   });
 });
+
+describe("裁剪的 store 动作", () => {
+  beforeEach(() => {
+    reset();
+    useTimeline.getState().addSource(source(300));
+  });
+
+  const cropOf = (id: string) => findClip(useTimeline.getState().timeline(), id)?.clip.crop;
+
+  it("进撤销栈，连续输入按边合并成一步", () => {
+    const s = () => useTimeline.getState();
+    const before = s().history.past.length;
+    for (const v of [0.1, 0.2, 0.3]) s().setClipCrop("src1-v", { left: v });
+    expect(s().history.past.length).toBe(before + 1);
+    expect(s().undoLabel()).toBe("裁剪");
+    expect(cropOf("src1-v")).toEqual({ left: 0.3 });
+    s().undo();
+    expect(cropOf("src1-v")).toBeUndefined();
+  });
+
+  it("换一条边就是新的一步——合并键带边名", () => {
+    const s = () => useTimeline.getState();
+    const before = s().history.past.length;
+    s().setClipCrop("src1-v", { left: 0.1 });
+    s().setClipCrop("src1-v", { top: 0.1 });
+    expect(s().history.past.length).toBe(before + 2);
+  });
+
+  it("**音频轨上的片段被拒**，理由报到 lastRejection", () => {
+    const s = () => useTimeline.getState();
+    s().setClipCrop("src1-a", { left: 0.1 });
+    expect(s().lastRejection).toMatch(/只有画面轨/);
+    expect(cropOf("src1-a")).toBeUndefined();
+  });
+
+  it("对边加起来到 100% 时报出来，原值不动", () => {
+    const s = () => useTimeline.getState();
+    s().setClipCrop("src1-v", { left: 0.6 });
+    s().setClipCrop("src1-v", { right: 0.5 });
+    expect(s().lastRejection).toMatch(/左右一共要裁掉/);
+    expect(cropOf("src1-v")).toEqual({ left: 0.6 });
+  });
+});

@@ -28,7 +28,7 @@ import {
   type TransformProperty,
 } from "../anim/keyframes";
 import type { ColorAdjust } from "../compose/color";
-import type { LayerTransform } from "../compose/compositor";
+import type { CropInsets, LayerTransform } from "../compose/compositor";
 import { isCssColor } from "../compose/css-color";
 import { isManagedFamily } from "../compose/font-registry";
 import type { TextStyle } from "../compose/text-raster";
@@ -1010,6 +1010,86 @@ export function setClipLut(timeline: Timeline, clipId: ClipId, lutId?: LutId): E
   }
   if (found.clip.lutId === lutId) return unchanged(timeline);
   return ok(replaceClip(timeline, found.track.id, setOptional(found.clip, "lutId", lutId)));
+}
+
+/** 裁剪的四条边。顺序就是界面上的顺序（上 / 下 / 左 / 右 读起来比顺时针顺）。 */
+export type CropEdge = "top" | "bottom" | "left" | "right";
+
+export const CROP_EDGES: readonly CropEdge[] = ["top", "bottom", "left", "right"];
+
+export const CROP_EDGE_LABELS: Record<CropEdge, string> = {
+  top: "上",
+  bottom: "下",
+  left: "左",
+  right: "右",
+};
+
+/**
+ * 单边最多裁掉多少。**对边加起来还有一条更强的约束**（见 `setClipCrop`），这个上限只是
+ * 让界面上每个输入框各自有个头——两条一起才挡得住"左右各 60%"。
+ */
+export const CROP_EDGE_MAX = 0.9;
+
+/** 裁剪补丁：给数值就设，显式给 `undefined` 就**删掉**这条边（回到不裁）。 */
+export type CropPatch = { readonly [K in CropEdge]?: number | undefined };
+
+/**
+ * 改片段的裁剪。
+ *
+ * **只有画面轨上的片段能裁**：音频轨上的片段没有像素，裁剪存下来永远不会被求值，
+ * 那是 D19 那类"存了但不生效"——按钮亮着而什么都没变。判据和检查器那一节的门是
+ * 同一个（`track.kind`），而**这里必须自己判**，不能只靠界面不显示：纯函数单独拿出来
+ * 用也得安全（同 `pasteClip` 那条"素材必须在当前项目里"）。
+ *
+ * **对边加起来到 100% 时拒绝，不夹紧。** 夹紧要么改用户刚输的那个数、要么改另一边——
+ * 两个都是"选了 A 拿到 B"。报出来的话用户知道该先减哪一边。
+ *
+ * **四条边都回到 0 时把字段整个删掉**（同 `normalizeGroup`）：两个后端的恒等快路径判的
+ * 是"有没有这个字段"，而"这个片段裁过没有"也要能在数据层一眼看出来。
+ */
+export function setClipCrop(timeline: Timeline, clipId: ClipId, patch: CropPatch): EditResult {
+  const found = findClip(timeline, clipId);
+  if (!found) return reject(timeline, `找不到片段 ${clipId}`);
+  if (found.track.locked) return reject(timeline, "轨道已锁定");
+  if (found.track.kind !== "video") return reject(timeline, "只有画面轨上的片段能裁剪");
+
+  const merged: Record<string, number> = { ...found.clip.crop };
+  for (const edge of CROP_EDGES) {
+    if (!(edge in patch)) continue;
+    const raw = patch[edge];
+    if (raw === undefined) {
+      delete merged[edge];
+      continue;
+    }
+    // NaN 会让 cropRect 算出 NaN 尺寸，drawImage 静默不画、Pixi 画出一张空纹理
+    if (!Number.isFinite(raw)) return reject(timeline, `${CROP_EDGE_LABELS[edge]}边的裁剪必须是有限数`);
+    merged[edge] = Math.min(CROP_EDGE_MAX, Math.max(0, raw));
+  }
+
+  const pairs: readonly (readonly [CropEdge, CropEdge, string])[] = [
+    ["top", "bottom", "上下"],
+    ["left", "right", "左右"],
+  ];
+  for (const [a, b, label] of pairs) {
+    const sum = (merged[a] ?? 0) + (merged[b] ?? 0);
+    if (sum >= 1) {
+      return reject(timeline, `${label}一共要裁掉 ${Math.round(sum * 100)}%，画面就没有了`);
+    }
+  }
+
+  let any = false;
+  const next: Record<string, number> = {};
+  for (const edge of CROP_EDGES) {
+    const value = merged[edge];
+    if (value === undefined || value === 0) continue;
+    next[edge] = value;
+    any = true;
+  }
+  const crop = any ? (next as CropInsets) : undefined;
+  if (CROP_EDGES.every((edge) => (crop?.[edge] ?? 0) === (found.clip.crop?.[edge] ?? 0))) {
+    return unchanged(timeline);
+  }
+  return ok(replaceClip(timeline, found.track.id, setOptional(found.clip, "crop", crop)));
 }
 
 // ---------------------------------------------------------------------------

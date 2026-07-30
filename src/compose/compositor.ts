@@ -43,6 +43,70 @@ export interface LayerTransform {
   readonly opacity?: number;
 }
 
+/**
+ * 裁剪：从源片四边各切掉多少，**单位是源片尺寸的比例**（0–1），不是像素。
+ *
+ * 比例而不是像素，理由和 `LayerTransform` 相对留边位置、`TextStyle` 存"占输出高度的
+ * 比例"是同一条：**像素值一换源片分辨率就全错**。而源片分辨率是会换的——D37 的指认页
+ * 明确允许"我重导了一版 720p"（尺寸不一致只警告不阻止），那时按像素存的裁剪会静默
+ * 变成裁掉完全不同的一块画面，且不报错。
+ *
+ * 省略 = 不裁。**裁剪改变这一层的宽高比**，所以留边（`containRect`）是按裁剪**之后**
+ * 的尺寸算的——把 16:9 裁成 1:1 之后它应该在方形输出里铺满，而不是仍然留着 16:9 的黑边。
+ *
+ * 不是可动画属性（见 PLAN.md 的 D46）：它是一次静态重构图，而"推近"这种动画用
+ * 缩放 + 位移已经能表达，且那两个本来就在关键帧里。
+ */
+export interface CropInsets {
+  /** 从上边切掉源片高度的这个比例。 */
+  readonly top?: number;
+  /** 从右边切掉源片宽度的这个比例。 */
+  readonly right?: number;
+  readonly bottom?: number;
+  readonly left?: number;
+}
+
+/** 裁剪后要在源片里取的那块矩形，**源片像素**。 */
+export interface CropRect {
+  readonly sx: number;
+  readonly sy: number;
+  readonly width: number;
+  readonly height: number;
+}
+
+/**
+ * 裁剪后在源片里取哪一块。**只有这一处**算它，理由同 `containRect`——两个后端各算一遍
+ * 就会在"两后端逐像素一致"那条断言上差出来。
+ *
+ * 四边加起来把画面吃光时返回 null（这一层不画），不返回零尺寸矩形：后者会让 Canvas2D
+ * 的 `drawImage` 抛 `IndexSizeError`、让 Pixi 画出一张糊到整屏的单像素。编辑入口
+ * （`setClipCrop`）本来就会拒掉这种组合，所以这里是兜底，不是主要防线。
+ */
+export function cropRect(
+  srcWidth: number,
+  srcHeight: number,
+  crop?: CropInsets,
+): CropRect | null {
+  if (srcWidth <= 0 || srcHeight <= 0) return null;
+  const { top = 0, right = 0, bottom = 0, left = 0 } = crop ?? {};
+  const width = srcWidth * (1 - left - right);
+  const height = srcHeight * (1 - top - bottom);
+  if (width <= 0 || height <= 0) return null;
+  return { sx: srcWidth * left, sy: srcHeight * top, width, height };
+}
+
+/**
+ * 有没有裁过。两个后端据此走"整幅贴图"的原路径，让**没裁过的项目输出与加裁剪之前
+ * 逐字节相同**——同 `isDefaultGeometry`，也同样不是性能优化：`drawImage` 的 9 参数
+ * 形式即使给的是整幅源片，采样路径也未必和 5 参数形式逐字节相同，而留边断言是逐行
+ * 判黑的。Pixi 那边则是"给不给 `Texture` 一个 frame"的区别。
+ */
+export function isDefaultCrop(crop?: CropInsets): boolean {
+  if (!crop) return true;
+  const { top = 0, right = 0, bottom = 0, left = 0 } = crop;
+  return top === 0 && right === 0 && bottom === 0 && left === 0;
+}
+
 /** 一个**有画面来源**的图层。两种形态对应两条取帧路径，但走同一个合成函数。 */
 export type ComposeSourceLayer =
   | {
@@ -50,6 +114,8 @@ export type ComposeSourceLayer =
       /** mediabunny 解码出的帧。生命周期由调用方负责，合成器只读不关。 */
       readonly sample: VideoSample;
       readonly transform?: LayerTransform;
+      /** 裁剪。省略 = 不裁，后端据此走整幅贴图的原路径（见 `isDefaultCrop`）。 */
+      readonly crop?: CropInsets;
       /** 一级调色。省略 = 不调，后端据此不挂滤镜（见 `compose/color.ts`）。 */
       readonly color?: ColorAdjust;
       /** 3D LUT。省略 = 不套。强度在 `color.lutIntensity`（见 `compose/lut.ts`）。 */
@@ -62,6 +128,7 @@ export type ComposeSourceLayer =
       readonly width: number;
       readonly height: number;
       readonly transform?: LayerTransform;
+      readonly crop?: CropInsets;
       readonly color?: ColorAdjust;
       readonly lut?: LutTable;
     };
@@ -325,20 +392,25 @@ function drawSourceLayer(
     // 它的生命周期与传入的 sample 是分开的（mediabunny 明确要求）
     const frame = layer.sample.toVideoFrame();
     try {
-      drawLayer(ctx, frame, frame.displayWidth, frame.displayHeight, outWidth, outHeight, layer.transform);
+      drawLayer(ctx, frame, frame.displayWidth, frame.displayHeight, outWidth, outHeight, layer);
     } finally {
       frame.close();
     }
     return;
   }
-  drawLayer(ctx, layer.image, layer.width, layer.height, outWidth, outHeight, layer.transform);
+  drawLayer(ctx, layer.image, layer.width, layer.height, outWidth, outHeight, layer);
 }
 
 /**
- * 按"默认留边 + 变换"的几何贴图。几何本身不在这里算——见 `containRect` / `placeLayer`。
+ * 按"裁剪 + 默认留边 + 变换"的几何贴图。几何本身不在这里算——见 `cropRect` /
+ * `containRect` / `placeLayer`。
  *
- * 两条路径不是重复代码：恒等变换那条必须保持与加变换之前**完全相同的 drawImage 调用**，
- * 理由见 `isDefaultGeometry`。
+ * 顺序是**裁剪 → 留边 → 变换**，而且这个顺序是有内容的：留边按裁剪后的宽高比算
+ * （裁成 1:1 就该在方形输出里铺满），变换再相对那个留边位置作用。反过来（先留边再裁）
+ * 会变成"裁掉输出画布的一部分"，那是另一个效果（遮罩），而且会在画面上留下黑边。
+ *
+ * 两条 `drawImage` 路径不是重复代码：恒等那条必须保持与加这些功能之前**完全相同的调用
+ * 形式**，理由见 `isDefaultGeometry` / `isDefaultCrop`。
  */
 function drawLayer(
   ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
@@ -347,15 +419,27 @@ function drawLayer(
   srcHeight: number,
   outWidth: number,
   outHeight: number,
-  transform?: LayerTransform,
+  layer: { readonly transform?: LayerTransform; readonly crop?: CropInsets },
 ): void {
-  const rect = containRect(srcWidth, srcHeight, outWidth, outHeight);
+  const { transform, crop } = layer;
+  const src = cropRect(srcWidth, srcHeight, crop);
+  if (!src) return;
+  const rect = containRect(src.width, src.height, outWidth, outHeight);
   if (!rect) return;
   const opacity = transform?.opacity ?? 1;
 
+  /**
+   * 贴到目标矩形上。没裁过时走 5 参数的原路径——9 参数即使给的是整幅源片，
+   * 采样路径也未必逐字节相同（同 `isDefaultCrop`）。
+   */
+  const paint = (dx: number, dy: number, dw: number, dh: number): void => {
+    if (isDefaultCrop(crop)) ctx.drawImage(image, dx, dy, dw, dh);
+    else ctx.drawImage(image, src.sx, src.sy, src.width, src.height, dx, dy, dw, dh);
+  };
+
   if (isDefaultGeometry(transform)) {
     ctx.globalAlpha = opacity;
-    ctx.drawImage(image, rect.dx, rect.dy, rect.width, rect.height);
+    paint(rect.dx, rect.dy, rect.width, rect.height);
     ctx.globalAlpha = 1;
     return;
   }
@@ -367,12 +451,6 @@ function drawLayer(
   ctx.globalAlpha = opacity;
   ctx.translate(placement.centerX, placement.centerY);
   if (placement.rotation !== 0) ctx.rotate(placement.rotation);
-  ctx.drawImage(
-    image,
-    -placement.width / 2,
-    -placement.height / 2,
-    placement.width,
-    placement.height,
-  );
+  paint(-placement.width / 2, -placement.height / 2, placement.width, placement.height);
   ctx.restore();
 }

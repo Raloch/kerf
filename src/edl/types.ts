@@ -11,7 +11,7 @@
 import { COLOR_PROPERTIES, type KeyframeChannels } from "../anim/keyframes";
 import { isAudioTransitionKind, type AudioTransitionKind } from "../audio/crossfade";
 import type { ColorAdjust } from "../compose/color";
-import type { LayerTransform } from "../compose/compositor";
+import type { CropInsets, LayerTransform } from "../compose/compositor";
 import type { TextStyle } from "../compose/text-raster";
 import { isShaderTransition } from "../compose/transition-shader";
 import type { Rational } from "../time/rational";
@@ -294,6 +294,17 @@ interface ClipBase {
    * 这里存的是"用户调出来的那个值"，动画只是让它随时间变。
    */
   readonly transform?: LayerTransform;
+  /**
+   * 裁剪：从源片四边各切掉多少，**按比例存**（见 `CropInsets`）。缺省 = 不裁。
+   *
+   * 和 `transform` 分开而不是塞进它，理由同 `color` 那条：它们作用在合成层的两个不同
+   * 环节（**取源片的哪一块** vs 摆到画布的哪儿），而且顺序有内容——裁剪改变这一层的
+   * 宽高比，留边是按裁剪之后算的。混成一个字段的话合成器就得靠字段名猜这个数该进哪儿。
+   *
+   * **不在 `keyframes` 里**（不是可动画属性，见 D46）。所以它没有"静态值与关键帧并存"
+   * 那套东西，就是一个静态字段。
+   */
+  readonly crop?: CropInsets;
   /**
    * 静态一级调色：亮度 / 对比度 / 饱和度 / 色相。缺省 = 不调。
    *

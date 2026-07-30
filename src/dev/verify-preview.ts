@@ -31,6 +31,7 @@ import { runExport } from "../export/pipeline";
 import { readExportFile, removeExportFile } from "../export/write-target";
 import { createPreviewEngine } from "../preview/preview-engine";
 import { applyColorMatrix8, colorMatrixOf } from "../compose/color";
+import type { CropInsets } from "../compose/compositor";
 import { singleClipTimeline, type LutSource, type Timeline } from "../edl/types";
 import { frameDurationMicros, frameToMicros, MICROS_PER_SECOND } from "../time/timebase";
 import { FPS } from "../time/rational";
@@ -49,6 +50,18 @@ const VERIFY_COLOR_OUT = "kerf-verify-preview-color.mp4";
 const VERIFY_LUT_OUT = "kerf-verify-preview-lut.mp4";
 /** 图片层那一组的落盘名。 */
 const VERIFY_IMAGE_OUT = "kerf-verify-preview-image.mp4";
+/** 裁剪那一组的落盘名。 */
+const VERIFY_CROP_OUT = "kerf-verify-preview-crop.mp4";
+
+/**
+ * 比对用的裁剪：**左右各裁 25%**。
+ *
+ * 挑左右而不是上下，是因为它让"裁剪改变宽高比、于是留边跟着换"变成一条**可判方向**的
+ * 断言：素材是横的，不裁时留边在上下、左右恒为 0；裁窄之后画面变高瘦，留边必须**出现在
+ * 左右**。裁上下的话留边仍然只在上下，只是数字变了，"裁了没生效"就得靠比数字大小判——
+ * 而方向反转是一眼可判的（同那张 LUT 挑"通道轮换"的理由）。
+ */
+const VERIFY_CROP: CropInsets = { left: 0.25, right: 0.25 };
 
 /**
  * 比对用的 LUT：**红绿蓝轮换**（R←B、G←R、B←G）。
@@ -511,6 +524,87 @@ export async function verifyPreviewMatchesExport(): Promise<PreviewVerifyResult>
   );
 
   await removeExportFile(VERIFY_LUT_OUT);
+
+  // ---- 裁剪在两条路径上是否一致（D46）----
+  // 三条判据和 LUT 那一组同构：一致 / 真的生效 / 不顺手改别的。第二条这里格外重要——
+  // 裁剪"没生效"时画面完全正常（就是原片），两条路径会一致地都不裁
+  const cropped: Timeline = {
+    ...timeline,
+    tracks: timeline.tracks.map((track) =>
+      track.kind !== "video"
+        ? track
+        : { ...track, clips: track.clips.map((clip) => ({ ...clip, crop: VERIFY_CROP })) },
+    ),
+  };
+
+  const engineCr = await createPreviewEngine(document.createElement("div"), OUT_SIZE, OUT_SIZE);
+  let cropPreview: Bands;
+  try {
+    await engineCr.renderFrame(cropped, PROBE_FRAME);
+    cropPreview = measureCanvas(engineCr.canvas as CanvasImageSource, OUT_SIZE);
+  } finally {
+    engineCr.dispose();
+  }
+
+  const cropExport = (
+    await exportAndMeasure(
+      { ...cropped, durationFrames: PROBE_FRAME + 1 },
+      [PROBE_FRAME],
+      VERIFY_CROP_OUT,
+    )
+  )[0]![0]!;
+
+  // 1. 两条路径的留边逐条相同。裁剪的几何只有 `cropRect` 一处，所以这一条红了说明
+  //    某条路径没把 crop 传下去（`layerLooks` 漏了一边正是这个形态）
+  const cropEdgeDelta = worstEdgeDelta(cropPreview, cropExport);
+  checks.push(
+    check(
+      "裁剪后预览与导出的留边逐条相同",
+      "0px",
+      cropEdgeDelta === 0
+        ? `完全相同（${edgesText(cropExport)}）`
+        : `差 ${cropEdgeDelta}px · 预览 ${edgesText(cropPreview)} / 导出 ${edgesText(cropExport)}`,
+      cropEdgeDelta === 0,
+    ),
+  );
+
+  // 2. 裁剪**真的生效了**，判据是留边的方向翻过来：不裁时左右恒为 0（横屏素材），
+  //    裁窄之后画面变高瘦，留边必须出现在左右。"没生效"时上一条照样通过
+  const flipped = cropExport.left > 0 && cropExport.right > 0 && exportedBands.left === 0;
+  checks.push(
+    check(
+      "裁剪确实生效（留边从上下翻到左右）",
+      `不裁时左右 ${exportedBands.left}/${exportedBands.right} → 裁窄后应 > 0`,
+      `实际左右 ${cropExport.left}/${cropExport.right} · 上下 ${cropExport.top}/${cropExport.bottom}`,
+      flipped,
+    ),
+  );
+
+  // 3. 留边命中手算值。前两条都是"相对"判据（两条路径互比、方向翻转），一起错时仍然
+  //    成立——同 spike 里那条"两个后端一起错时一致性仍然成立"。
+  //
+  //    **算式的输入必须是源片尺寸，不是输出尺寸**：裁剪是源片的比例，裁完那块再 contain
+  //    进输出。第一版把 `OUT_SIZE` 当成了源片宽度，于是期望值算成 80 而实测 18——这一条
+  //    本来是用来抓"两条相对判据一起错"的，结果先抓住了我自己（同"两个操作数都要印出来"）
+  const srcW = probe.source.width;
+  const srcH = probe.source.height;
+  const cropW = srcW * (1 - VERIFY_CROP.left! - VERIFY_CROP.right!);
+  const cropScale = Math.min(OUT_SIZE / cropW, OUT_SIZE / srcH);
+  const expectedSide = Math.round((OUT_SIZE - cropW * cropScale) / 2);
+  const sideDelta = Math.max(
+    Math.abs(cropExport.left - expectedSide),
+    Math.abs(cropExport.right - expectedSide),
+  );
+  checks.push(
+    check(
+      "裁剪后的留边命中手算值",
+      `左右各 ${expectedSide}px（源片 ${srcW}×${srcH} 裁成 ${Math.round(cropW)}×${srcH}）`,
+      `实际 ${cropExport.left}/${cropExport.right}`,
+      sideDelta <= 1,
+    ),
+  );
+
+  await removeExportFile(VERIFY_CROP_OUT);
 
   // ---- M2：图层变换 + 关键帧在两条路径上是否一致 ----
   // 单独造一份带动画的 EDL，不动上面那份：上面几条断言的期望值依赖"没有变换"，

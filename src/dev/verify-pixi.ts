@@ -470,6 +470,93 @@ export async function verifyPixiBackend(): Promise<PixiVerifyResult> {
     );
   }
 
+  // ---- 9b''. 裁剪（D46）----
+  // 三条判据：**和 Canvas2D 一致**（抓后端分歧）、**命中手算的留边**（两个后端一起错时
+  // 一致性仍然成立）、**取的是哪一块**（只量留边的话"取了另半边"完全测不出来）。
+  {
+    let worstPair = 0;
+    let worstPairName = "";
+    let worstBand = 0;
+    let worstBandName = "";
+    let worstHue = 0;
+    let worstHueName = "";
+    for (const c of report.crop) {
+      const pair = Math.max(
+        Math.abs(c.pixi.top - c.canvas2d.top),
+        Math.abs(c.pixi.bottom - c.canvas2d.bottom),
+        Math.abs(c.pixi.left - c.canvas2d.left),
+        Math.abs(c.pixi.right - c.canvas2d.right),
+      );
+      if (pair > worstPair) {
+        worstPair = pair;
+        worstPairName =
+          `${c.name}：Pixi 上下 ${c.pixi.top}/${c.pixi.bottom} 左右 ${c.pixi.left}/${c.pixi.right}` +
+          ` vs Canvas2D ${c.canvas2d.top}/${c.canvas2d.bottom} ${c.canvas2d.left}/${c.canvas2d.right}`;
+      }
+      const band = Math.max(
+        Math.abs(c.pixi.top - c.expectedTopBand),
+        Math.abs(c.pixi.bottom - c.expectedTopBand),
+        Math.abs(c.pixi.left - c.expectedSideBand),
+        Math.abs(c.pixi.right - c.expectedSideBand),
+      );
+      if (band > worstBand) {
+        worstBand = band;
+        worstBandName =
+          `${c.name}：期望上下 ${c.expectedTopBand} 左右 ${c.expectedSideBand}，` +
+          `实际 ${c.pixi.top}/${c.pixi.bottom} ${c.pixi.left}/${c.pixi.right}`;
+      }
+      if (c.expectedRgb) {
+        // 逐通道对**画上去的那个 RGB**比，不换算成色相：期望值就是探针图里那个字面量，
+        // 中间不经过第二个实现（色相那一版把期望写成 240 而真实是 233.3，那 7° 的差是我
+        // 自己造的、却被容差吸收了）。量的是**画面正中一小块**，理由见 `pixiCenter`
+        const [er, eg, eb] = c.expectedRgb;
+        for (const [who, got] of [
+          ["Pixi", c.pixiCenter],
+          ["Canvas2D", c.canvas2dCenter],
+        ] as const) {
+          const diff = Math.max(
+            Math.abs(got[0] - er),
+            Math.abs(got[1] - eg),
+            Math.abs(got[2] - eb),
+          );
+          if (diff > worstHue) {
+            worstHue = diff;
+            worstHueName = `${c.name} / ${who}：期望 ${er},${eg},${eb}，实际 ${got.join(",")}`;
+          }
+        }
+      }
+    }
+    checks.push(
+      check(
+        "裁剪在同一个槽位上来回变时两个后端一致",
+        "≤ 1px",
+        worstPair === 0
+          ? `${report.crop.length} 步逐条完全相同`
+          : `差 ${worstPair}px · ${worstPairName}`,
+        worstPair <= 1,
+      ),
+    );
+    checks.push(
+      check(
+        "留边按裁剪之后的宽高比算（裁成竖的就该左右留边）",
+        "≤ 1px",
+        worstBand === 0 ? `${report.crop.length} 步都命中手算值` : `差 ${worstBand}px · ${worstBandName}`,
+        worstBand <= 1,
+      ),
+    );
+    // 容差 4：这条路上没有编码，正中那块是纯色。定这个数之前修了两处量法——期望值改成
+    // 探针图里那个字面量（原来写死 240° 而真实 233.3°），取样从整幅平均改成正中一小块
+    // （整幅平均把左右黑边算进去了，读数等比暗 9%，实测 200 vs 画上去的 220）
+    checks.push(
+      check(
+        "裁剪取的是那一块画面（裁掉左半只剩右边那块，反之亦然）",
+        "逐通道差 ≤ 4",
+        worstHueName === "" ? "两块都命中" : `差 ${worstHue} · ${worstHueName}`,
+        worstHue <= 4,
+      ),
+    );
+  }
+
   // ---- 9c. 3D LUT（M2 后半段）----
   // 比调色那三条更要紧：调色错了还能靠"画面偏绿了"看出来，LUT 本来就是用来把
   // 颜色改成另一样的，查歪了肉眼分不出来。半纹素偏移、切片拼接、蓝方向的手动

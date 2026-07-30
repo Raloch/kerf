@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { FPS } from "../time/rational";
 import { clipSourceFrames, clipsUsingEffects } from "../edl/types";
-import { videoTracksInDrawOrder } from "../edl/sampling";
+import { layerLooks, videoTracksInDrawOrder, visibleVideoClips, type VisibleClip } from "../edl/sampling";
 import type { LutSource } from "../edl/types";
 import type {
   AudioOnlySource,
@@ -47,6 +47,8 @@ import {
   setClipSpeed,
   setClipVolume,
   setClipsProperty,
+  setClipCrop,
+  CROP_EDGE_MAX,
   resetClipsProperties,
   propertyApplies,
   summarizeProperty,
@@ -2798,6 +2800,98 @@ describe("多选：批量改属性", () => {
       expect(resetClipsProperties(t, ["m"], ["opacity"]).changed).toBe(false);
       expect(resetClipsProperties(t, [], ["volume"]).reason).toMatch(/都没有/);
     });
+  });
+});
+
+describe("裁剪（D46）", () => {
+  const base = () =>
+    timeline([
+      { id: "V1", kind: "video", clips: [clip("a", 0, 100)] },
+      { id: "A1", kind: "audio", clips: [clip("m", 0, 100)] },
+    ]);
+
+  const cropOf = (t: Timeline, id: string) => findClip(t, id)?.clip.crop;
+
+  it("按比例存，四条边独立", () => {
+    const r = setClipCrop(base(), "a", { left: 0.1, top: 0.2 });
+    expect(r.changed).toBe(true);
+    expect(cropOf(r.timeline, "a")).toEqual({ top: 0.2, left: 0.1 });
+  });
+
+  it("补丁是合并的，没提到的边保持原样", () => {
+    const t = setClipCrop(base(), "a", { left: 0.1 }).timeline;
+    const r = setClipCrop(t, "a", { right: 0.2 });
+    expect(cropOf(r.timeline, "a")).toEqual({ left: 0.1, right: 0.2 });
+  });
+
+  it("**四条边都回到 0 时把字段整个删掉**", () => {
+    // 两个后端的恒等快路径判的是"有没有这个字段"，留一个 `{left: 0}` 会让没裁的片段
+    // 掉出整幅贴图那条原路径
+    const t = setClipCrop(base(), "a", { left: 0.1 }).timeline;
+    const r = setClipCrop(t, "a", { left: 0 });
+    expect(r.changed).toBe(true);
+    expect("crop" in findClip(r.timeline, "a")!.clip).toBe(false);
+  });
+
+  it("显式给 undefined 也是删掉那条边（重置按钮走这条）", () => {
+    const t = setClipCrop(base(), "a", { left: 0.1, top: 0.2 }).timeline;
+    const r = setClipCrop(t, "a", { left: undefined, top: undefined, right: undefined, bottom: undefined });
+    expect("crop" in findClip(r.timeline, "a")!.clip).toBe(false);
+  });
+
+  it("**对边加起来到 100% 时拒绝，不夹紧**", () => {
+    // 夹紧要么改用户刚输的那个数、要么改另一边，两个都是"选了 A 拿到 B"
+    const t = setClipCrop(base(), "a", { left: 0.6 }).timeline;
+    const r = setClipCrop(t, "a", { right: 0.5 });
+    expect(r.changed).toBe(false);
+    expect(r.reason).toMatch(/左右一共要裁掉 110%/);
+    expect(cropOf(r.timeline, "a")).toEqual({ left: 0.6 });
+    expect(setClipCrop(base(), "a", { top: 0.5, bottom: 0.5 }).reason).toMatch(/上下/);
+  });
+
+  it("单边超过上限被夹紧（那只是给输入框一个头）", () => {
+    const r = setClipCrop(base(), "a", { left: 5 });
+    expect(cropOf(r.timeline, "a")).toEqual({ left: CROP_EDGE_MAX });
+    expect(setClipCrop(base(), "a", { left: -3 }).changed).toBe(false); // 夹到 0 = 值没变
+  });
+
+  it("**只有画面轨上的片段能裁**", () => {
+    // 音频轨上的片段没有像素，存下来永远不会被求值——D19 那类"存了但不生效"
+    const r = setClipCrop(base(), "m", { left: 0.1 });
+    expect(r.changed).toBe(false);
+    expect(r.reason).toMatch(/只有画面轨/);
+  });
+
+  it("锁定轨道拒绝，NaN 拒绝，值没变不给 reason", () => {
+    const locked = timeline([{ id: "V1", kind: "video", locked: true, clips: [clip("a", 0, 100)] }]);
+    expect(setClipCrop(locked, "a", { left: 0.1 }).reason).toMatch(/锁定/);
+    expect(setClipCrop(base(), "a", { left: Number.NaN }).reason).toMatch(/有限数/);
+    const same = setClipCrop(base(), "a", { left: 0 });
+    expect(same.changed).toBe(false);
+    expect(same.reason).toBeUndefined();
+  });
+
+  it("文字片段也能裁（栅格出来的文字层在合成器眼里就是一张图）", () => {
+    const t = timeline([{ id: "T1", kind: "video", clips: [textClip("t", 0, 100)] }]);
+    expect(setClipCrop(t, "t", { top: 0.1 }).changed).toBe(true);
+  });
+});
+
+describe("layerLooks：两条渲染路径的同一份字段", () => {
+  it("四个字段都带上，而且没设过的一个都不出现", () => {
+    // "没有这个字段"是后端走恒等快路径的判据（D9 / D17），补一个空对象就把快路径关了
+    const t = timeline([{ id: "V1", kind: "video", clips: [clip("a", 0, 100)] }]);
+    const plain = visibleVideoClips(t, 10)[0];
+    expect(plain).toBeDefined();
+    expect(layerLooks(plain as VisibleClip)).toEqual({});
+
+    let cropped = setClipCrop(t, "a", { left: 0.1 }).timeline;
+    cropped = setClipTransform(cropped, "a", { x: 20 }).timeline;
+    const looks = layerLooks(visibleVideoClips(cropped, 10)[0] as VisibleClip);
+    expect(looks.crop).toEqual({ left: 0.1 });
+    expect(looks.transform).toEqual({ x: 20 });
+    expect("color" in looks).toBe(false);
+    expect("lut" in looks).toBe(false);
   });
 });
 

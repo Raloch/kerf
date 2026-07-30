@@ -132,6 +132,22 @@ describe("快照往返", () => {
     expect(r.droppedLuts).toEqual([]);
   });
 
+  it("**裁剪这类纯加法的可选字段要能原样往返**（`SNAPSHOT_VERSION` 刻意不 +1）", () => {
+    // 这一层是整体展开、不按字段白名单重建的，所以加字段自动往返——但这条断言钉的是
+    // 那个前提：哪天有人改成"逐字段挑着存"，漏掉的表现是"存了、打开就没了"且不报错。
+    // 版本号不动的理由同 D39 / D40：纯加法的可选字段不属于"老记录读出来是坏的"那一类，
+    // 为它 +1 会把用户现有项目全部变成不可见
+    const withCrop = {
+      ...original,
+      tracks: original.tracks.map((t) =>
+        t.id === "V1" ? { ...t, clips: t.clips.map((c) => ({ ...c, crop: { left: 0.25 } })) } : t,
+      ),
+    };
+    const r = fromSnapshot(toSnapshot(withCrop, 0, 0), allAssets(withCrop));
+    expect(r.timeline.tracks.find((t) => t.id === "V1")?.clips[0]?.crop).toEqual({ left: 0.25 });
+    expect(toSnapshot(withCrop, 0, 0).version).toBe(5);
+  });
+
   it("带上存盘时刻和播放头", () => {
     const snap = toSnapshot(original, 7, 1_700_000_000_000);
     expect(snap.savedAt).toBe(1_700_000_000_000);

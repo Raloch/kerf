@@ -50,6 +50,7 @@ import {
   addFont,
   renameProject,
   setClipColor,
+  setClipCrop,
   setClipLut,
   copyClips,
   duplicateClips,
@@ -74,6 +75,7 @@ import {
   type AddTextOptions,
   type BatchResult,
   type ColorPatch,
+  type CropPatch,
   type EditResult,
   type MoveOptions,
   type TextStylePatch,
@@ -194,6 +196,12 @@ export interface TimelineState {
   setClipTransform: (clipId: ClipId, patch: TransformPatch) => void;
   /** 改静态调色。合并策略同上。 */
   setClipColor: (clipId: ClipId, patch: ColorPatch) => void;
+  /**
+   * 改裁剪。合并键带上"改的是哪几条边"，理由同 `setClipTransform`。
+   *
+   * 不是可动画属性（D46），所以没有"改的是静态值还是关键帧"那套分岔。
+   */
+  setClipCrop: (clipId: ClipId, patch: CropPatch) => void;
   /** 改片段音量。合并键带 clipId，理由同 `setClipTransform`。 */
   setClipVolume: (clipId: ClipId, volume: number) => void;
   /**
@@ -531,6 +539,11 @@ export const useTimeline = create<TimelineState>((set, get) => {
     setClipColor(clipId, patch) {
       const keys = Object.keys(patch).sort().join(",");
       apply(setClipColor(get().timeline(), clipId, patch), "调色", `color:${clipId}:${keys}`);
+    },
+
+    setClipCrop(clipId, patch) {
+      const keys = Object.keys(patch).sort().join(",");
+      apply(setClipCrop(get().timeline(), clipId, patch), "裁剪", `crop:${clipId}:${keys}`);
     },
 
     setClipVolume(clipId, volume) {
