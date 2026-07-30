@@ -292,10 +292,18 @@ function speedPercent(speed: Rational): number {
  * 片段在时间轴上缩短一半，不说明的话那看起来像"我的片段被吃掉了一半"。放不下时
  * `setClipSpeed` 拒绝，原因走 `lastRejection` 到状态栏（同别的编辑操作）。
  *
- * **变调提示只在真的会变调时出现**：速度不是 1× **且**这个素材有音轨。给一个无声
- * 的画面片段挂"声音会变调"是句假话，而产品里的假话要删不是补充说明（同 D37）。
- * 这条提示本身是必须的——变调是一次**看得见（听得见）的取舍**，静默变调就是硬规则 10
- * 那种"选了 A 拿到 B"；同余量不足时把定格帧数报到界面上（D19）。
+ * **声音那一行和它下面的提示都只在"速度不是 1× 且这个素材有音轨"时出现**。给一个
+ * 无声的画面片段挂"声音会变调"是句假话，而产品里的假话要删不是补充说明（同 D37）；
+ * 原速下那个选择**不产生任何效果**（`clipPreservesPitch()` 先判速度），摆一个不起作用
+ * 的控件同样是在说假话。字段本身不跟着藏起来的时候清掉——调回 2× 时选择要还在
+ * （见 `setClipPreservePitch`）。
+ *
+ * 提示本身是必须的——两种做法各有一次**听得见的取舍**，静默变调就是硬规则 10 那种
+ * "选了 A 拿到 B"；同余量不足时把定格帧数报到界面上（D19）。
+ *
+ * **做成下拉而不是勾选框**，同 D21 那两条淡化曲线不是风格选项：勾选框的未勾状态会
+ * 读成"默认/中性"，而它的实际含义是"声音会变调"——那个结果得被指名，不能靠用户
+ * 从"没勾保持音高"里自己推出来。两边都有代价，所以两边都写出来。
  *
  * 范围从 `SPEED_RANGE` 取，**不在这里写第二份**：两处不一致时用户看到的是
  * "输入框允许、松手弹回"（同 `PROPERTY_RANGES` 那条）。
@@ -308,10 +316,14 @@ function SpeedSection({
   readonly timeline: Timeline;
 }) {
   const setClipSpeed = useTimeline((s) => s.setClipSpeed);
+  const setClipPreservePitch = useTimeline((s) => s.setClipPreservePitch);
   const speed = clipSpeed(clip);
   const percent = speedPercent(speed);
   const source = timeline.sources.find((x) => x.id === clip.sourceId);
   const frames = clip.timelineOut - clip.timelineIn;
+  /** 声音那一行有没有意义：原速下那个选择不产生任何效果，无声素材上更是空谈。 */
+  const soundMatters = percent !== 100 && source?.hasAudio === true;
+  const preserving = clip.preservePitch === true;
 
   return (
     <>
@@ -353,9 +365,29 @@ function SpeedSection({
             {frames} 帧 · {framesToTimecode(frames, timeline.fps)}
           </span>
         </div>
+        {/* 声音那一行放在**同一个 `fields` 块**里：另起一块会在"片段长度"和它之间多出
+            一档间距，读起来像两组无关的设置，而它恰恰是"改了速度之后声音怎么办" */}
+        {soundMatters && (
+          <div className="f ctl wide3">
+            <label>声音</label>
+            <select
+              className="sel wide"
+              value={preserving ? "stretch" : "resample"}
+              title="重采样：把源片当磁带快放/慢放，音高跟着变。时间伸缩：按块重叠相加，音高不变"
+              onChange={(e) => setClipPreservePitch(clip.id, e.target.value === "stretch")}
+            >
+              <option value="resample">跟着变调（重采样）</option>
+              <option value="stretch">保持音高（时间伸缩）</option>
+            </select>
+          </div>
+        )}
       </div>
-      {percent !== 100 && source?.hasAudio === true && (
-        <p className="hint">声音会跟着变调（变速用的是重采样）。画面不受影响。</p>
+      {soundMatters && (
+        <p className="hint">
+          {preserving
+            ? "音高不变。代价是混音更慢，而且鼓点这类瞬态会被抹掉一点。"
+            : "声音会跟着变调（速度直接改采样率）。画面不受影响。"}
+        </p>
       )}
     </>
   );
