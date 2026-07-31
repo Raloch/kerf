@@ -153,11 +153,24 @@ export async function verifyM0(options: VerifyOptions = {}): Promise<VerifyResul
     );
   }
 
+  /**
+   * 实时倍率**只当读数，不当断言**（面板顶部那行已经在显示它）。
+   *
+   * 曾经有一条"导出快于实时（> 1×）"，删掉的理由是它把**两件处置完全不同的事**混进
+   * 了一个判据：设备慢，和代码坏。
+   *
+   * - **这个规模量不出吞吐。** M0 只导 120 帧（4 秒），里面还额外做了一次编码延迟
+   *   探测——建编码器、探延迟、写容器索引这些固定开销占了大头。同一台 iPhone 在
+   *   长片自检里是 **7.05–7.43×**，而在这里实测 **0.79×**，于是那条断言在真机上恒红。
+   *   这正是 `export/throughput.ts` 那条"样本要 ≥120 帧"说的事，只是站在自检这一侧。
+   * - **慢于实时本身不是故障**（D25）：iPhone 上 2160p 只有 0.66× 实时，而那是已知
+   *   且接受的取舍——产品侧的处置是"预测耗时 + 提醒"，不是拦下来。
+   * - "这台机器快不快"有专门的量法（`export/throughput.ts`：≥120 帧、跨后端不复用、
+   *   30 天过期），而"合成慢了一个数量级"这类结构性回归由 Pixi spike 的
+   *   `SLOWDOWN_LIMIT` 抓。这条断言两头都不占。
+   */
   const realtimeFactor =
     frameToSeconds(exported.encodedFrames, probe.source.fps) / (exported.elapsedMs / 1000);
-  checks.push(
-    check("导出快于实时", "> 1×", `${realtimeFactor.toFixed(2)}×`, realtimeFactor > 1),
-  );
 
   // ---- 4. 读回导出文件断言 ----
   // 从 OPFS 读回而不是从内存：管道已改成流式写盘，不再回传字节（硬规则 9）。

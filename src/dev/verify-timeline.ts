@@ -30,6 +30,7 @@ import { createPreviewEngine } from "../preview/preview-engine";
 import type { Clip, Timeline, Track } from "../edl/types";
 import { frameDurationMicros, frameToSeconds, MICROS_PER_SECOND } from "../time/timebase";
 import { BLACK_ROW_SUM, hueDistance, measure, sampleHueAt, type Bands } from "./measure";
+import { probePreviewFrame, summarizeAttempts, type PreviewProbe } from "./preview-probe";
 import type { Check } from "./verify-m0";
 
 /** 方形输出：让 16:9 素材必然产生上下黑边，从而能比较留边几何。 */
@@ -377,6 +378,8 @@ export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult>
   // ---- 2. 预览路径：逐个取样帧渲染并测量 ----
   const engine = await createPreviewEngine(document.createElement("div"), OUT_SIZE, OUT_SIZE);
   const previewBands = new Map<number, Bands>();
+  /** 每次取样的重画情况，最后汇总成一条诊断读数（见 preview-probe.ts）。 */
+  const previewShots: PreviewProbe[] = [];
   let previewWipe: { left: Bands; right: Bands } | null = null;
   let exportedWipe: { left: Bands; right: Bands } | null = null;
   let noTransition = new Map<number, Bands>();
@@ -384,22 +387,21 @@ export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult>
   let pureTo = new Map<number, Bands>();
   let freezeControl = new Map<number, Bands>();
   try {
-    // 引擎画布接了 Pixi 之后是 WebGL 画布，不能直接 getContext("2d")——
-    // 一张画布只能有一种上下文类型。先 drawImage 到干净的 2D 画布上再量
-    const probe = document.createElement("canvas");
-    probe.width = OUT_SIZE;
-    probe.height = OUT_SIZE;
-    const pctx = probe.getContext("2d", { willReadFrequently: true });
-    if (!pctx) throw new Error("探测画布没有 2D 上下文");
+    // 取一帧下来量走 `probePreviewFrame`：**不能只 await renderFrame 就认为画好了**，
+    // 它内部对 seek 有 400ms 兜底，而真机上首次 seek 比它慢——理由和实测都在
+    // preview-probe.ts 的文件头（那个缺陷在这个自检上的表现就是帧 139 那条差 31°）。
+    // 空档帧要点名说明期望是纯黑，否则会白重画 10 次再报"空画布"
     for (const p of PROBES) {
-      await engine.renderFrame(timeline, p.frame);
-      pctx.drawImage(engine.canvas as CanvasImageSource, 0, 0);
-      previewBands.set(p.frame, measure(pctx, OUT_SIZE, OUT_SIZE));
+      const shot = await probePreviewFrame(engine, timeline, p.frame, OUT_SIZE, {
+        expectBlank: p.expectSourceFrame === null,
+      });
+      previewShots.push(shot);
+      previewBands.set(p.frame, measure(shot.ctx, OUT_SIZE, OUT_SIZE));
       // 擦除那一帧另外做分区测量（D6）：整幅平均色对左右分区的效果是瞎的
       if (p.frame === WIPE_PROBE) {
         previewWipe = {
-          left: measure(pctx, OUT_SIZE, OUT_SIZE, WIPE_LEFT),
-          right: measure(pctx, OUT_SIZE, OUT_SIZE, WIPE_RIGHT),
+          left: measure(shot.ctx, OUT_SIZE, OUT_SIZE, WIPE_LEFT),
+          right: measure(shot.ctx, OUT_SIZE, OUT_SIZE, WIPE_RIGHT),
         };
       }
     }
@@ -412,9 +414,9 @@ export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult>
     const shoot = async (tl: Timeline, frames: readonly number[]) => {
       const out = new Map<number, Bands>();
       for (const f of frames) {
-        await engine.renderFrame(tl, f);
-        pctx.drawImage(engine.canvas as CanvasImageSource, 0, 0);
-        out.set(f, measure(pctx, OUT_SIZE, OUT_SIZE));
+        const shot = await probePreviewFrame(engine, tl, f, OUT_SIZE);
+        previewShots.push(shot);
+        out.set(f, measure(shot.ctx, OUT_SIZE, OUT_SIZE));
       }
       return out;
     };
@@ -530,6 +532,19 @@ export async function verifyTimelineConsistency(): Promise<TimelineVerifyResult>
   }
 
   // ---- 5. 比对 ----
+  //
+  // 先报一条**前提**：预览那一侧每一帧都真的画出来了。空画布的读数是"四边留白各等于
+  // 整个画布"，它会让下面十几条几何和色相断言一起假红，而那些红长得像"摆位算错了"
+  // ——真机上实测发生过（见 preview-probe.ts）。把它变成一条说得清的断言，比让人从
+  // 一片红里反推便宜得多；重画次数照常印出来，那是"这台设备 seek 有多慢"的读数。
+  const checksPrelude = check(
+    "预览每一帧都画出来了（空画布会让下面的几何断言一起假红）",
+    "没有空画布",
+    summarizeAttempts(previewShots),
+    previewShots.every((shot) => !shot.blank),
+  );
+  checks.push(checksPrelude);
+
   const rows: TimelineVerifyRow[] = [];
   for (const p of PROBES) {
     const pv = previewBands.get(p.frame)!;

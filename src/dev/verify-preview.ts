@@ -36,6 +36,7 @@ import { singleClipTimeline, type LutSource, type Timeline } from "../edl/types"
 import { frameDurationMicros, frameToMicros, MICROS_PER_SECOND } from "../time/timebase";
 import { FPS } from "../time/rational";
 import { measure, type Bands, type MeasureRegion } from "./measure";
+import { probePreviewFrame, summarizeAttempts, type PreviewProbe } from "./preview-probe";
 import type { Check } from "./verify-m0";
 
 /** 单帧比对结果的落盘文件名。 */
@@ -264,6 +265,14 @@ function check(name: string, expected: unknown, actual: unknown, pass?: boolean)
 
 export async function verifyPreviewMatchesExport(): Promise<PreviewVerifyResult> {
   const checks: Check[] = [];
+  /**
+   * 每次从预览取帧的重画情况，最后汇总成**一条前提断言**。
+   *
+   * 空画布会让下面十几条几何和颜色断言一起假红，而那些红长得像"摆位算错了"或
+   * "调色没生效"——真机上实测发生过（见 preview-probe.ts）。有这一条，一片红里
+   * 就有一句说得清的话。
+   */
+  const shots: PreviewProbe[] = [];
 
   // ---- 准备素材与 EDL ----
   const sample = await makeSampleVideo({ durationFrames: 300, withAudio: false });
@@ -278,10 +287,11 @@ export async function verifyPreviewMatchesExport(): Promise<PreviewVerifyResult>
   const engine = await createPreviewEngine(document.createElement("div"), OUT_SIZE, OUT_SIZE);
   let previewBands: Bands;
   try {
-    // 不需要手动等待：renderFrame 内部会等素材就绪（ensureLoaded）。
-    // 早先版本在这里 sleep 是无效的——video 元素是 renderFrame 时才按需创建的。
-    await engine.renderFrame(timeline, PROBE_FRAME);
-    previewBands = measureCanvas(engine.canvas as CanvasImageSource, OUT_SIZE);
+    // **不能只 await renderFrame 就量**：它内部对 seek 有 400ms 兜底，而真机上首次
+    // seek 比它慢，那时量到的是空画布——理由和实测都在 preview-probe.ts 的文件头
+    const shot = await probePreviewFrame(engine, timeline, PROBE_FRAME, OUT_SIZE);
+    shots.push(shot);
+    previewBands = measure(shot.ctx, OUT_SIZE, OUT_SIZE);
   } finally {
     engine.dispose();
   }
@@ -392,8 +402,9 @@ export async function verifyPreviewMatchesExport(): Promise<PreviewVerifyResult>
   const engineC = await createPreviewEngine(document.createElement("div"), OUT_SIZE, OUT_SIZE);
   let gradedPreview: Bands;
   try {
-    await engineC.renderFrame(graded, PROBE_FRAME);
-    gradedPreview = measureCanvas(engineC.canvas as CanvasImageSource, OUT_SIZE);
+    const shot = await probePreviewFrame(engineC, graded, PROBE_FRAME, OUT_SIZE);
+    shots.push(shot);
+    gradedPreview = measure(shot.ctx, OUT_SIZE, OUT_SIZE);
   } finally {
     engineC.dispose();
   }
@@ -484,8 +495,9 @@ export async function verifyPreviewMatchesExport(): Promise<PreviewVerifyResult>
   const engineL = await createPreviewEngine(document.createElement("div"), OUT_SIZE, OUT_SIZE);
   let lutPreview: Bands;
   try {
-    await engineL.renderFrame(luted, PROBE_FRAME);
-    lutPreview = measureCanvas(engineL.canvas as CanvasImageSource, OUT_SIZE);
+    const shot = await probePreviewFrame(engineL, luted, PROBE_FRAME, OUT_SIZE);
+    shots.push(shot);
+    lutPreview = measure(shot.ctx, OUT_SIZE, OUT_SIZE);
   } finally {
     engineL.dispose();
   }
@@ -558,8 +570,9 @@ export async function verifyPreviewMatchesExport(): Promise<PreviewVerifyResult>
   const engineCr = await createPreviewEngine(document.createElement("div"), OUT_SIZE, OUT_SIZE);
   let cropPreview: Bands;
   try {
-    await engineCr.renderFrame(cropped, PROBE_FRAME);
-    cropPreview = measureCanvas(engineCr.canvas as CanvasImageSource, OUT_SIZE);
+    const shot = await probePreviewFrame(engineCr, cropped, PROBE_FRAME, OUT_SIZE);
+    shots.push(shot);
+    cropPreview = measure(shot.ctx, OUT_SIZE, OUT_SIZE);
   } finally {
     engineCr.dispose();
   }
@@ -649,8 +662,9 @@ export async function verifyPreviewMatchesExport(): Promise<PreviewVerifyResult>
   const engine2 = await createPreviewEngine(document.createElement("div"), OUT_SIZE, OUT_SIZE);
   try {
     for (const frame of XFORM_PROBES) {
-      await engine2.renderFrame(animated, frame);
-      animatedPreview.push(measureCanvas(engine2.canvas as CanvasImageSource, OUT_SIZE));
+      const shot = await probePreviewFrame(engine2, animated, frame, OUT_SIZE);
+      shots.push(shot);
+      animatedPreview.push(measure(shot.ctx, OUT_SIZE, OUT_SIZE));
     }
   } finally {
     engine2.dispose();
@@ -768,8 +782,13 @@ export async function verifyPreviewMatchesExport(): Promise<PreviewVerifyResult>
   let previewText: Bands;
   let previewFull: Bands;
   try {
-    await engine3.renderFrame(titled, 0);
-    const ctx = probeContextOf(engine3.canvas as CanvasImageSource, OUT_SIZE);
+    // 判据限定在**背景区**：文字是纯色实心块，拿整幅判会让"非黑"被文字满足，
+    // 而视频背景还是黑的（见 preview-probe.ts 的 paintedRegion）
+    const shot = await probePreviewFrame(engine3, titled, 0, OUT_SIZE, {
+      paintedRegion: BG_REGION,
+    });
+    shots.push(shot);
+    const ctx = shot.ctx;
     previewBg = measure(ctx, OUT_SIZE, OUT_SIZE, BG_REGION);
     previewText = measure(ctx, OUT_SIZE, OUT_SIZE, TEXT_REGION);
     previewFull = measure(ctx, OUT_SIZE, OUT_SIZE);
@@ -845,6 +864,17 @@ export async function verifyPreviewMatchesExport(): Promise<PreviewVerifyResult>
   await removeExportFile(VERIFY_TEXT_OUT);
 
   checks.push(...(await verifyImageLayer()));
+
+  // **前提断言放最前面**：真机报告是从上往下看的，而"预览没画出来"必须在那十几条
+  // 几何/颜色断言之前说出来，否则读的人要从一片红里反推（实测反推花了半个多小时）
+  checks.unshift(
+    check(
+      "预览每一帧都画出来了（空画布会让下面的几何与颜色断言一起假红）",
+      "没有空画布",
+      summarizeAttempts(shots),
+      shots.every((shot) => !shot.blank),
+    ),
+  );
 
   return {
     checks,
@@ -923,8 +953,9 @@ async function verifyImageLayer(): Promise<Check[]> {
   let previewLeft: Bands;
   let previewRight: Bands;
   try {
-    await engine.renderFrame(timeline, 0);
-    const ctx = probeContextOf(engine.canvas as CanvasImageSource, OUT_SIZE);
+    // 同上走重画路径。这一节的"图片层在两条路径上都画出来了"本来就是判据，
+    // 所以不另外汇总；重画只是让它别因为一次没解好就假红
+    const { ctx } = await probePreviewFrame(engine, timeline, 0, OUT_SIZE);
     previewFull = measure(ctx, OUT_SIZE, OUT_SIZE, FULL_REGION);
     previewLeft = measure(ctx, OUT_SIZE, OUT_SIZE, IMAGE_LEFT_REGION);
     previewRight = measure(ctx, OUT_SIZE, OUT_SIZE, IMAGE_RIGHT_REGION);
@@ -999,24 +1030,3 @@ async function verifyImageLayer(): Promise<Check[]> {
   return checks;
 }
 
-/**
- * 把引擎画布上的内容读进一张 2D 探测画布再量。
- *
- * **不能直接对引擎画布 `getContext("2d")`**：接了 Pixi 后端之后那是一张 WebGL
- * 画布，一张画布只能有一种上下文类型，那句会返回 null（或在别的浏览器上抛错）。
- * 先 `drawImage` 到一张干净的 2D 画布上，量的还是同一批像素。
- */
-function probeContextOf(source: CanvasImageSource, size: number): CanvasRenderingContext2D {
-  const probe = document.createElement("canvas");
-  probe.width = size;
-  probe.height = size;
-  const ctx = probe.getContext("2d", { willReadFrequently: true });
-  if (!ctx) throw new Error("探测画布没有 2D 上下文");
-  ctx.drawImage(source, 0, 0);
-  return ctx;
-}
-
-/** 分区测量要在同一份快照上量多次，所以拆成上面那个取上下文 + 这个便捷版。 */
-function measureCanvas(source: CanvasImageSource, size: number): Bands {
-  return measure(probeContextOf(source, size), size, size);
-}
