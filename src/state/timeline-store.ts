@@ -76,9 +76,12 @@ import {
   setKeyframe,
   setTextContent,
   setTextStyle,
+  primarySelection,
   snapDrag,
   snapTargets,
-  splitClipAt,
+  splitAtFrame,
+  linkedIds,
+  unlinkClips,
   trimClip,
   type AddTextOptions,
   type BatchResult,
@@ -214,6 +217,11 @@ export interface TimelineState {
   trimClip: (clipId: ClipId, edge: TrimEdge, deltaFrames: number) => void;
   splitAtPlayhead: () => void;
   removeSelected: (ripple?: boolean) => void;
+  /**
+   * 解除选中片段的音画链接（**D55**）。两边一起解——只清一边会留下一个指着没人
+   * 认领的 id 的片段。做 J-cut / L-cut（声音先进、画面后进）就必须能解开。
+   */
+  unlinkSelected: () => void;
   /** 改静态变换。连续拖滑块按"片段 + 改的是哪几个属性"合并成一步撤销。 */
   setClipTransform: (clipId: ClipId, patch: TransformPatch) => void;
   /** 改静态调色。合并策略同上。 */
@@ -394,6 +402,42 @@ export const useTimeline = create<TimelineState>((set, get) => {
   }
 
   /**
+   * 移动一个片段，**连它的音画伙伴一起**（**D55**）。
+   *
+   * 被拖的那个可以换轨，伙伴**只跟着平移同样的帧数**——它在音频轨上，换不到画面轨去
+   * （反过来同理）。所以这不是 `moveClips` 能表达的：那个函数是"整组同一位移、不换轨"。
+   *
+   * **全体或拒绝**：伙伴放不下时整次移动都不做，因为"画面挪过去了、声音留在原地"正是
+   * 这一刀要消灭的状态（同 `addSource` 那条"不允许画面放下了、声音挪到了别处"）。
+   *
+   * 两个调用方——`moveClip`（真实拖拽走这条，磁吸已在 `use-clip-drag` 里算完）和
+   * `dragClipTo`（按 store 的磁吸设置再吸一次）。**必须共用**：只改其中一个的后果是
+   * "键盘/程序移动会联动、鼠标拖拽不会"，而那种半联动比完全不联动更难查（实测就是
+   * 只改了 `dragClipTo`，浏览器里拖完发现声音没跟上，而单测全绿）。
+   */
+  function moveWithPartners(clipId: ClipId, delta: number, options: MoveOptions): void {
+    const timeline = get().timeline();
+    const partners = linkedIds(timeline, [clipId]).filter((id) => id !== clipId);
+    const first = moveClip(timeline, clipId, delta, options);
+    if (partners.length === 0 || !first.changed) {
+      apply(first, "移动片段", `move:${clipId}`);
+      return;
+    }
+    let working = first.timeline;
+    for (const id of partners) {
+      // 位移为 0 时 `moveClip` 返回"值没变"（`changed:false` 且不给 reason），那不是
+      // 失败——跨轨拖拽就是这种情形（delta 恒为 0，只换轨）
+      const step = moveClip(working, id, delta);
+      if (!step.changed && step.reason !== undefined) {
+        set({ lastRejection: `声音那一段放不下：${step.reason}` });
+        return;
+      }
+      if (step.changed) working = step.timeline;
+    }
+    apply({ timeline: working, changed: true }, "移动片段", `move:${clipId}`);
+  }
+
+  /**
    * 打或清一个标记，带上标签和合并键（D50）。
    *
    * 合并键按**端**给（`mark:in` / `mark:out`），所以"拖着播放头连打几次入点"合成
@@ -455,11 +499,12 @@ export const useTimeline = create<TimelineState>((set, get) => {
           coalesceKey: null,
           at: now(),
         }),
-        // 选中新片段（画面在前）。**只选第一个，不把音画两个都选上**：多选态下检查器
-        // 只报计数（那是刻意的，见 `soleSelectedClipId`），两个都选中就等于导入之后
-        // 看不到这个片段的属性。**不动播放头**：导入配乐时用户正停在某一处，
-        // 把它拨回 0 等于让"在播放头处插入"这件事自己失效
-        selectedClipIds: result.clipIds?.[0] ? [result.clipIds[0]] : [],
+        // 选中新片段。**音画两个不能都选上**：多选态下检查器只报计数（那是刻意的，
+        // 见 `soleSelectedClipId`），两个都选中就等于导入之后看不到这个片段的属性。
+        // 判据和粘贴 / 副本共用一处（`primarySelection`）——散写必然漏一家。
+        // **不动播放头**：导入配乐时用户正停在某一处，把它拨回 0 等于让
+        // "在播放头处插入"这件事自己失效
+        selectedClipIds: primarySelection(result.timeline, result.clipIds ?? []),
         lastRejection: null,
         // 自动新建的轨道要说出来（见 `lastNotice`）。这里直接写进同一次 set，
         // 不像 `applyBatch` 那样分两步——那条纪律针对的是 `apply()` 会把消息擦掉，
@@ -503,18 +548,16 @@ export const useTimeline = create<TimelineState>((set, get) => {
     },
 
     moveClip(clipId, deltaFrames, options) {
-      apply(
-        moveClip(get().timeline(), clipId, deltaFrames, options ?? {}),
-        "移动片段",
-        `move:${clipId}`,
-      );
+      moveWithPartners(clipId, deltaFrames, options ?? {});
     },
 
     moveClips(clipIds, deltaFrames, clampToBounds) {
+      // 整组拖拽同样要带上音画伙伴（D55）。这里比 `dragClipTo` 简单：`moveClips`
+      // 本来就是"整组同一个位移、不换轨"（D42），伙伴天然符合那个形状
       apply(
         moveClips(
           get().timeline(),
-          clipIds,
+          linkedIds(get().timeline(), clipIds),
           deltaFrames,
           clampToBounds === undefined ? {} : { clampToBounds },
         ),
@@ -545,11 +588,9 @@ export const useTimeline = create<TimelineState>((set, get) => {
       const delta = target - found.clip.timelineIn;
       const sameTrack = toTrack === undefined || toTrack === found.track.id;
       if (delta === 0 && sameTrack) return; // 真的没动才不产生历史条目
-      apply(
-        moveClip(timeline, clipId, delta, toTrack === undefined ? {} : { toTrack }),
-        "移动片段",
-        `move:${clipId}`,
-      );
+
+      // 音画联动收在 `moveWithPartners` 一处，两条移动路径共用（见那里的注释）
+      moveWithPartners(clipId, delta, toTrack === undefined ? {} : { toTrack });
     },
 
     trimClip(clipId, edge, deltaFrames) {
@@ -562,34 +603,10 @@ export const useTimeline = create<TimelineState>((set, get) => {
 
     splitAtPlayhead() {
       const state = get();
-      const timeline = state.timeline();
-      const frame = state.playhead;
-      // 没选中片段时，切播放头下所有未锁定轨道里的片段
-      const targets = state.selectedClipIds.length
-        ? state.selectedClipIds
-        : timeline.tracks
-            .filter((t) => !t.locked)
-            .flatMap((t) => t.clips.filter((c) => frame > c.timelineIn && frame < c.timelineOut))
-            .map((c) => c.id);
-
-      if (targets.length === 0) {
-        set({ lastRejection: "播放头下没有可切分的片段" });
-        return;
-      }
-
-      let working = timeline;
-      let changed = false;
-      let reason: string | undefined;
-      for (const id of targets) {
-        const result = splitClipAt(working, id, frame);
-        if (result.changed) {
-          working = result.timeline;
-          changed = true;
-        } else {
-          reason = result.reason;
-        }
-      }
-      apply({ timeline: working, changed, ...(reason === undefined ? {} : { reason }) }, "切分片段");
+      // 判据整个在 `splitAtFrame()` 里（含音画联动和右半段重新配对）——`null` 表示
+      // "没选中，切播放头下所有未锁定轨道里的片段"
+      const ids = state.selectedClipIds.length ? state.selectedClipIds : null;
+      apply(splitAtFrame(state.timeline(), state.playhead, ids), "切分片段");
     },
 
     removeSelected(ripple = false) {
@@ -598,12 +615,23 @@ export const useTimeline = create<TimelineState>((set, get) => {
         set({ lastRejection: "没有选中片段" });
         return;
       }
-      const result = removeClips(get().timeline(), selectedClipIds, ripple);
+      // 连音画伙伴一起删：只删一半会留下一个"有声音没画面"的片段，而用户看得见
+      // 它还在那儿（D55）
+      const result = removeClips(get().timeline(), linkedIds(get().timeline(), selectedClipIds), ripple);
       // 删掉的那些当然不能还选着；部分成功时留下没删掉的那几个仍然选中
       if (result.changed) {
         set({ selectedClipIds: liveSelection(result.timeline, selectedClipIds) });
       }
       applyBatch(result, ripple ? "波纹删除" : "删除片段");
+    },
+
+    unlinkSelected() {
+      const { selectedClipIds } = get();
+      if (selectedClipIds.length === 0) {
+        set({ lastRejection: "没有选中片段" });
+        return;
+      }
+      applyBatch(unlinkClips(get().timeline(), selectedClipIds), "解除音画链接");
     },
 
     setClipTransform(clipId, patch) {
@@ -702,7 +730,8 @@ export const useTimeline = create<TimelineState>((set, get) => {
     copySelected() {
       const state = get();
       if (state.selectedClipIds.length === 0) return;
-      const entries = copyClips(state.timeline(), state.selectedClipIds);
+      // 复制一个画面片段要连它的声音一起（D55），否则粘出来的是一段哑片
+      const entries = copyClips(state.timeline(), linkedIds(state.timeline(), state.selectedClipIds));
       // **不走 `apply`**：复制什么都没改，进撤销栈的话用户要按两次 ⌘Z 才回到上一次真编辑。
       // 一个都没抓到时不动剪贴板——上一次复制的东西还能粘，比清空更有用
       if (entries.length > 0) set({ clipboard: entries, lastRejection: null });
@@ -715,16 +744,28 @@ export const useTimeline = create<TimelineState>((set, get) => {
       const result = pasteClips(state.timeline(), entries, state.playhead);
       apply(result, "粘贴片段");
       // 整组选中粘出来的那些：接着按 ⌘V 之外的任何编辑，作用对象都是刚粘的这一组
-      if (result.changed && result.clipIds) set({ selectedClipIds: result.clipIds });
+      // 选中不跟着链接扩展：粘出来的那一段该是一个可编辑的选中，两个都选中
+      // 会让检查器只报计数（见 `primarySelection`）
+      if (result.changed && result.clipIds) {
+        set({ selectedClipIds: primarySelection(result.timeline, result.clipIds) });
+      }
     },
 
     duplicateSelected() {
       const state = get();
       if (state.selectedClipIds.length === 0) return;
-      const result = duplicateClips(state.timeline(), state.selectedClipIds);
+      // 同 copySelected：⌘D 出来的副本要连声音一起
+      const result = duplicateClips(
+        state.timeline(),
+        linkedIds(state.timeline(), state.selectedClipIds),
+      );
       apply(result, "片段副本");
       // 选中副本而不是原片段：接着按 ⌘D 就能连着复制一串
-      if (result.changed && result.clipIds) set({ selectedClipIds: result.clipIds });
+      // 选中不跟着链接扩展：粘出来的那一段该是一个可编辑的选中，两个都选中
+      // 会让检查器只报计数（见 `primarySelection`）
+      if (result.changed && result.clipIds) {
+        set({ selectedClipIds: primarySelection(result.timeline, result.clipIds) });
+      }
     },
 
     addLut(lut) {

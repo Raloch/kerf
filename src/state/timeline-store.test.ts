@@ -4,7 +4,7 @@ import { findClip } from "./operations";
 import { FPS } from "../time/rational";
 import type { MediaSource } from "../edl/types";
 
-function source(durationFrames = 300): MediaSource {
+function source(durationFrames = 300, over: Partial<MediaSource> = {}): MediaSource {
   return {
     id: "src1",
     kind: "av",
@@ -17,7 +17,8 @@ function source(durationFrames = 300): MediaSource {
     hasAudio: true,
     videoCodec: "avc",
     audioCodec: "aac",
-  };
+    ...over,
+  } as MediaSource;
 }
 
 /** 纯音频素材（配乐）。10 秒，29.97 下派生成 299 帧。 */
@@ -542,7 +543,8 @@ describe("剪贴板", () => {
     const s = seeded();
     s.select("src1-v");
     useTimeline.getState().copySelected();
-    expect(useTimeline.getState().clipboard).toHaveLength(1);
+    // 2 个而不是 1 个：复制一个画面片段连它的声音一起进剪贴板（D55）
+    expect(useTimeline.getState().clipboard).toHaveLength(2);
     useTimeline.getState().openProject("p2", EMPTY_TIMELINE, 0);
     expect(useTimeline.getState().clipboard).toEqual([]);
     useTimeline.getState().closeProject();
@@ -572,6 +574,94 @@ describe("多选", () => {
     s().splitAtPlayhead();
     return (s().timeline().tracks.find((t) => t.id === "V1")?.clips ?? []).map((c) => c.id);
   }
+
+  // ---- 音画联动（D55）----
+  //
+  // 这一组钉的是"编辑一个片段时还有谁跟着动"。`addSource` 守着"两个片段必须同起点"，
+  // 而在这之前那个不变量**只在导入那一刻成立**：实测把画面拖到 360 帧之后，声音还留
+  // 在 0 帧，不报错——音画错位而软件一个字都没说。
+
+  it("拖画面，声音跟着平移同样的帧数", () => {
+    const s = () => useTimeline.getState();
+    s().addSource(source(300), 0);
+    const before = s().timeline().tracks.find((t) => t.id === "A1")!.clips[0]!.timelineIn;
+    expect(before).toBe(0);
+    s().dragClipTo("src1-v", 500);
+    const v = s().timeline().tracks.find((t) => t.id === "V1")!.clips[0]!;
+    const a = s().timeline().tracks.find((t) => t.id === "A1")!.clips[0]!;
+    expect(v.timelineIn).toBe(500);
+    expect(a.timelineIn).toBe(500);
+  });
+
+  it("**真实拖拽走的是 `moveClip` 不是 `dragClipTo`**，两条路都要联动", () => {
+    const s = () => useTimeline.getState();
+    s().addSource(source(300), 0);
+    // `use-clip-drag` 松手时调的是 `moveClip`（磁吸已在它内部算完，走 `dragClipTo`
+    // 会按 store 的设置再吸一次、把 ⌥ 临时关闭覆盖掉）。只改一条路的后果是
+    // "半联动"——浏览器里拖完发现声音没跟上，而单测全绿（实测踩过）
+    s().moveClip("src1-v", 500);
+    expect(s().timeline().tracks.find((t) => t.id === "A1")!.clips[0]!.timelineIn).toBe(500);
+  });
+
+  it("跨轨拖画面时声音**不跟着换轨**，只平移", () => {
+    const s = () => useTimeline.getState();
+    s().addSource(source(300), 0);
+    s().dragClipTo("src1-v", 400, "V2");
+    const tl = s().timeline();
+    // 画面上了 V2，声音仍在 A1——它换不到画面轨去
+    expect(tl.tracks.find((t) => t.id === "V2")!.clips.map((c) => c.id)).toEqual(["src1-v"]);
+    expect(tl.tracks.find((t) => t.id === "V1")!.clips).toHaveLength(0);
+    expect(tl.tracks.find((t) => t.id === "A1")!.clips[0]!.timelineIn).toBe(400);
+  });
+
+  it("伙伴放不下时**整次拖拽都不做**，并说清是声音那一段挡住了", () => {
+    const s = () => useTimeline.getState();
+    s().addSource(source(300), 0);                        // V1/A1 [0,300)
+    s().addSource(source(300, { id: "src2" }), 300);      // V1/A1 [300,600)
+    // 把第二段的**画面**挪到 V2，于是 V1 的 300 之后空着、而 A1 的 300–600 仍占着。
+    // 这就造出了"画面放得下、声音放不下"——只有这种局面才测得到这条分支
+    s().dragClipTo("src2-v", 300, "V2");
+    const before = JSON.stringify(s().timeline().tracks);
+    s().dragClipTo("src1-v", 400);
+    expect(JSON.stringify(s().timeline().tracks)).toBe(before);
+    expect(s().lastRejection).toContain("声音那一段放不下");
+  });
+
+  it("删一个连伙伴一起删——只删一半会留下一段用户看得见的哑片", () => {
+    const s = () => useTimeline.getState();
+    s().addSource(source(300), 0);
+    s().select("src1-v");
+    s().removeSelected();
+    expect(s().timeline().tracks.find((t) => t.id === "V1")!.clips).toHaveLength(0);
+    expect(s().timeline().tracks.find((t) => t.id === "A1")!.clips).toHaveLength(0);
+  });
+
+  it("复制一个画面片段连声音一起进剪贴板，粘出来不是哑片", () => {
+    const s = () => useTimeline.getState();
+    s().addSource(source(300), 0);
+    s().select("src1-v");
+    s().copySelected();
+    expect(s().clipboard).toHaveLength(2);
+    expect(s().clipboard.map((e) => e.trackId).sort()).toEqual(["A1", "V1"]);
+  });
+
+  it("没有音轨的素材不给 linkId——那会造一个永远配不到对的孤儿", () => {
+    const s = () => useTimeline.getState();
+    s().addSource(source(300, { hasAudio: false }), 0);
+    expect(s().timeline().tracks.find((t) => t.id === "V1")!.clips[0]!.linkId).toBeUndefined();
+  });
+
+  it("解除链接之后各走各的（做 J-cut / L-cut 就必须能解开）", () => {
+    const s = () => useTimeline.getState();
+    s().addSource(source(300), 0);
+    s().select("src1-v");
+    s().unlinkSelected();
+    expect(s().timeline().tracks.find((t) => t.id === "V1")!.clips[0]!.linkId).toBeUndefined();
+    // **两边都要清**：只清一边会留下一个指着没人认领的 id 的片段
+    expect(s().timeline().tracks.find((t) => t.id === "A1")!.clips[0]!.linkId).toBeUndefined();
+    s().dragClipTo("src1-v", 500);
+    expect(s().timeline().tracks.find((t) => t.id === "A1")!.clips[0]!.timelineIn).toBe(0);
+  });
 
   it("⌘ 点选加进集合，再点一次移出", () => {
     const ids = seeded();
@@ -638,7 +728,8 @@ describe("多选", () => {
     s().select(ids[0]!);
     s().toggleSelect(ids[2]!); // 0-100 和 200-300，中间隔一个
     s().copySelected();
-    expect(s().clipboard).toHaveLength(2);
+    // 4 个：两个画面片段各带一个声音伙伴（D55）
+    expect(s().clipboard).toHaveLength(4);
     // 播放头被 `setPlayhead` 夹在 [0, durationFrames]，所以这里落在 300 而不是 500
     s().setPlayhead(500);
     const at = s().playhead;
@@ -719,15 +810,37 @@ describe("多选", () => {
     expect(after).not.toContain(ids[2]);
   });
 
-  it("多选时 ⌘K 只切选中的那些", () => {
+  it("⌘K 切选中的那些**连同它们的音画伙伴**，不切不相干的片段", () => {
     const ids = seeded();
     const s = () => useTimeline.getState();
     s().select(ids[0]!);
     s().setPlayhead(50);
     s().splitAtPlayhead();
-    // 只有被选中的那一段被切开；A1 的第一段同样跨过 50，但它没被选中
+    // 选中的画面片段被切开
     expect(s().timeline().tracks.find((t) => t.id === "V1")?.clips).toHaveLength(4);
-    expect(s().timeline().tracks.find((t) => t.id === "A1")?.clips).toHaveLength(3);
+    // **它的声音也被切开**（D55）：用户按 ⌘K 要的是"在这里切一刀"，而不是
+    // "把画面切开、声音留着不动"——那是音画分离，而且不报错
+    expect(s().timeline().tracks.find((t) => t.id === "A1")?.clips).toHaveLength(4);
+    // 原意仍然成立：跨过 50 但既没被选中、也不是伙伴的片段不会被切
+    const v1 = s().timeline().tracks.find((t) => t.id === "V1")!.clips;
+    expect(v1.filter((c) => c.timelineIn === 100 || c.timelineIn === 200)).toHaveLength(2);
+  });
+
+  it("切开之后左右两半各自成对，不是四个连成一组", () => {
+    const ids = seeded();
+    const s = () => useTimeline.getState();
+    s().select(ids[0]!);
+    s().setPlayhead(50);
+    s().splitAtPlayhead();
+    const tl = s().timeline();
+    const at = (track: string, frame: number) =>
+      tl.tracks.find((t) => t.id === track)!.clips.find((c) => c.timelineIn === frame)!;
+    // 左边那一对共用一个 id、右边那一对共用**另一个**
+    expect(at("V1", 0).linkId).toBe(at("A1", 0).linkId);
+    expect(at("V1", 50).linkId).toBe(at("A1", 50).linkId);
+    expect(at("V1", 0).linkId).not.toBe(at("V1", 50).linkId);
+    // 不换的话拖右半段画面会把左半段也带走（`linkedIds` 按 id 相等收集，不看位置）
+    expect(at("V1", 50).linkId).toBeDefined();
   });
 
   it("**`selectMany` 去重**——⌘ 加框选时基础选中和框里那些天然会撞", () => {

@@ -24,7 +24,7 @@ import {
   type TrackId,
 } from "../edl/types";
 import { trackTransitionWindows } from "../edl/transition";
-import { findClip, TRANSITION_LABELS } from "../state/operations";
+import { linkedIds, findClip, TRANSITION_LABELS } from "../state/operations";
 import { framesToTimecode, secondsToFrameCount } from "../time/timebase";
 import { toNumber } from "../time/rational";
 import { useTimeline } from "../state/timeline-store";
@@ -88,6 +88,7 @@ export function TimelinePanel() {
   const toggleSnap = useTimeline((s) => s.toggleSnap);
   const splitAtPlayhead = useTimeline((s) => s.splitAtPlayhead);
   const removeSelected = useTimeline((s) => s.removeSelected);
+  const unlinkSelected = useTimeline((s) => s.unlinkSelected);
   const zoom = useTimeline((s) => s.zoom);
   const setZoom = useTimeline((s) => s.setZoom);
   const addTextClip = useTimeline((s) => s.addTextClip);
@@ -260,6 +261,20 @@ export function TimelinePanel() {
       );
     }
 
+    /**
+     * 解除音画链接（**D55**）。只在选中的片段里**真有**链接时出现。
+     *
+     * 不是"灰掉"而是整项不出现：没有链接的片段（文字、纯配乐、已经解开过的）永远
+     * 点不到它，摆在那儿只会让菜单变长（同上面定格那条的判据）。反过来**有链接时
+     * 必须出现**——做 J-cut / L-cut（声音先进、画面后进）就得先解开，而在此之前
+     * 用户完全找不到出路：拖画面声音会跟着走，那正是他要避免的。
+     */
+    const unlinkItem: MenuItem[] = selectedClipIds.some(
+      (id) => findClip(timeline, id)?.clip.linkId !== undefined,
+    )
+      ? [{ label: `解除音画链接${many}`, onSelect: unlinkSelected }]
+      : [];
+
     return [
       { label: `复制${many} ⌘C`, onSelect: copySelected },
       { label: `做副本${many} ⌘D`, onSelect: duplicateSelected },
@@ -276,6 +291,7 @@ export function TimelinePanel() {
         onSelect: () => splitAtPlayhead(),
       },
       ...freezeItem,
+      ...unlinkItem,
       { label: `删除${many} ⌫`, separatorBefore: true, onSelect: () => removeSelected(false) },
       { label: `波纹删除${many} ⇧⌫`, onSelect: () => removeSelected(true) },
     ];
@@ -287,6 +303,7 @@ export function TimelinePanel() {
     paste,
     playhead,
     removeSelected,
+    unlinkSelected,
     selectedClipIds,
     splitAtPlayhead,
     timeline,
@@ -578,6 +595,17 @@ function TrackRow({
   // TrackRow 的签名变长（同 `useClipDrag` 内部那几个）
   const setTrackFlag = useTimeline((s) => s.setTrackFlag);
   const ghosts = ghostsForTrack(drag.ghosts, track.id);
+  /**
+   * 会跟着一起动、但没被选中的那些（音画链接，D55）。
+   *
+   * 在这里算而不是从父组件传：`TrackRow` 手上已经有 `timeline` 和 `selectedClipIds`
+   * 两个输入，穿一层 prop 只会让签名更长；每条轨各算一遍的代价是 O(片段数)。
+   */
+  const linkedPreview = useMemo(() => {
+    const all = new Set(linkedIds(timeline, selectedClipIds));
+    for (const id of selectedClipIds) all.delete(id);
+    return all;
+  }, [timeline, selectedClipIds]);
   // 关键帧轨只给**这条轨上被选中的那个片段**展开，而且**只在恰好选中一个时**：全都展开
   // 的话一条有动画的字幕轨能顶出十几行；多选时展开谁的更是没有答案（两个片段可以在
   // 同一个偏移上各有一个点，叠在一行读不出来）。同 `soleSelectedClipId` 那条判据
@@ -679,6 +707,7 @@ function TrackRow({
             trackId={track.id}
             pxPerFrame={pxPerFrame}
             selected={selectedClipIds.includes(clip.id)}
+            linked={linkedPreview.has(clip.id)}
             onContextMenu={onClipContextMenu}
             onSelect={onSelect}
             drag={drag}
@@ -909,6 +938,7 @@ function ClipView({
   trackId,
   pxPerFrame,
   selected,
+  linked,
   onSelect,
   onContextMenu,
   drag,
@@ -920,6 +950,14 @@ function ClipView({
   trackId: TrackId;
   pxPerFrame: number;
   selected: boolean;
+  /**
+   * 没被选中，但**会跟着选中的那个一起动**（音画链接，D55）。
+   *
+   * 需要这条读数是因为选中集合刻意**不**跟着链接扩展（见 `primarySelection`）：
+   * 用户点了画面片段，检查器要显示它的属性，所以声音那一段不在选中里——那时
+   * 界面上就必须有别的办法说出"它也会动"，否则一拖两个跟着走会是个惊讶。
+   */
+  linked: boolean;
   onSelect: (id: string) => void;
   onContextMenu: (event: ReactMouseEvent<HTMLElement>, clip: Clip) => void;
   drag: ClipDragApi;
@@ -1107,7 +1145,7 @@ function ClipView({
 
   return (
     <div
-      className="clip"
+      className={linked ? "clip linked" : "clip"}
       role="option"
       tabIndex={0}
       aria-selected={selected}

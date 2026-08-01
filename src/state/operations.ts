@@ -65,7 +65,7 @@ import {
   frozenFrames,
   transitionWindow,
 } from "../edl/transition";
-import { newClipId } from "../media/source-id";
+import { newClipId, newLinkId } from "../media/source-id";
 import { rational, toNumber, type Rational } from "../time/rational";
 
 /** 操作失败时返回原对象，并给出原因，便于 UI 提示而不是静默无反应。 */
@@ -598,6 +598,94 @@ export function splitClipAt(timeline: Timeline, clipId: ClipId, frame: number): 
   );
 }
 
+/**
+ * 在某一帧切分：**连音画链接伙伴一起切，并让切出来的右半段各自重新成对**（**D55**）。
+ *
+ * `clipIds` 给 `null` 表示"播放头下所有未锁定轨道里的片段"（用户没选中任何东西时的
+ * 语义）。给了就以它为准，但**一律先过 `linkedIds()`**——选中一个画面片段按 ⌘K 时，
+ * 用户要的是"在这里切一刀"，而不是"把画面切开、声音留着不动"（实测就是后者）。
+ *
+ * ## 右半段必须换一个新的 `linkId`
+ *
+ * 切完之后有四个片段：画面左右、声音左右。它们还共用同一个 id 的话，**这一对就变成了
+ * 一组四个**——此后拖动右半段的画面，左半段的画面也会跟着走（`linkedIds()` 按 id
+ * 相等收集，它不看位置）。判据是"哪些片段的入点恰好落在切点上"：那就是右半段，
+ * 而 `splitClipAt` 本身不返回新 id（它只给 `EditResult`）。
+ *
+ * 按**原 `linkId` 分组**换：一次 ⌘K 可能切开好几对，每一对的右半段要拿到**各自**的新
+ * id，全都用同一个新 id 会把不相干的两对连成一组。
+ */
+export function splitAtFrame(
+  timeline: Timeline,
+  frame: number,
+  clipIds: readonly ClipId[] | null,
+): EditResult {
+  const targets =
+    clipIds === null
+      ? timeline.tracks
+          .filter((t) => !t.locked)
+          .flatMap((t) => t.clips.filter((c) => frame > c.timelineIn && frame < c.timelineOut))
+          .map((c) => c.id)
+      : linkedIds(timeline, clipIds);
+  if (targets.length === 0) return reject(timeline, "播放头下没有可切分的片段");
+
+  let working = timeline;
+  let changed = false;
+  let reason: string | undefined;
+  for (const id of targets) {
+    const result = splitClipAt(working, id, frame);
+    if (result.changed) {
+      working = result.timeline;
+      changed = true;
+    } else {
+      reason = result.reason;
+    }
+  }
+  if (!changed) return reason === undefined ? unchanged(timeline) : reject(timeline, reason);
+
+  // 右半段就是"入点恰好落在切点上"的那些
+  const rightHalves = working.tracks.flatMap((t) =>
+    t.clips.filter((c) => c.timelineIn === frame).map((c) => c.id),
+  );
+  return ok(relinkGroup(working, rightHalves));
+}
+
+/**
+ * 让一批片段**按原 `linkId` 分组、各自换一个新的**（**D55**）。
+ *
+ * 两个调用方：切分之后的右半段、克隆（粘贴 / 副本）出来的新片段。两处要的是同一件事
+ * ——"这些片段从此自成一组，别再和源头连着"。
+ *
+ * ## 不换的后果是**指数级**的，而且很难从现象反推
+ *
+ * `insertClone` 换片段 id 却不换 `linkId`（D41 那条只记了 id 和 `transitionIn`）。
+ * 于是副本和原片段共用一个 id，而 `linkedIds()` 按 id 相等收集**整组**——第二次 ⌘D
+ * 时选中的那一个会把原片段和它的声音一起拖进来，产出 4 个；第三次 8 个。实测连按三次
+ * 得到 **7 对**副本而不是 3 对。
+ *
+ * ## 必须按原 `linkId` 分组，不能整批一个新 id
+ *
+ * 一次粘贴可能落下好几对（用户多选了一组）。全用同一个新 id 会把不相干的两对连成一组，
+ * 此后拖其中一个会带走另一对——那是上面那个 bug 的镜像。
+ */
+export function relinkGroup(timeline: Timeline, clipIds: readonly ClipId[]): Timeline {
+  const targets = new Set(clipIds);
+  const fresh = new Map<string, string>();
+  const tracks = timeline.tracks.map((track) => ({
+    ...track,
+    clips: track.clips.map((clip) => {
+      if (!targets.has(clip.id) || clip.linkId === undefined) return clip;
+      let next = fresh.get(clip.linkId);
+      if (next === undefined) {
+        next = newLinkId();
+        fresh.set(clip.linkId, next);
+      }
+      return { ...clip, linkId: next };
+    }),
+  }));
+  return { ...timeline, tracks };
+}
+
 export function removeClip(timeline: Timeline, clipId: ClipId): EditResult {
   const found = findClip(timeline, clipId);
   if (!found) return reject(timeline, `找不到片段 ${clipId}`);
@@ -725,6 +813,103 @@ function tallyResult(
     };
   }
   return { ...ok(tally.timeline), done: tally.done, total };
+}
+
+/**
+ * 把一组片段扩展成"连同它们的音画链接伙伴"（**D55**）。
+ *
+ * 这是"编辑一个片段时还有谁跟着动"的**唯一**答案。放在这里而不是让每个批量函数各自
+ * 处理，是因为它们的失败语义已经分好了两类（D42），而链接是**在那之前**的一步：先决定
+ * 作用于哪些片段，再按各自的语义去做。散写的话必然漏一处，而漏掉的表现就是这一刀要
+ * 修的那个东西——音画错位，且不报错。
+ *
+ * 顺序：原来那些排在前面、伙伴接在后面，且**不去重顺序**（`uniqueIds` 保序）。粘贴的
+ * 锚点是 `Math.min` 不是 `entries[0]`（D42），所以顺序在下游不承重；但稳定的顺序让
+ * 读数可复现。
+ */
+export function linkedIds(timeline: Timeline, clipIds: readonly ClipId[]): readonly ClipId[] {
+  const ids = uniqueIds(clipIds);
+  const wanted = new Set<string>();
+  for (const id of ids) {
+    const found = findClip(timeline, id);
+    if (found?.clip.linkId !== undefined) wanted.add(found.clip.linkId);
+  }
+  if (wanted.size === 0) return ids;
+
+  const seen = new Set<ClipId>(ids);
+  const out: ClipId[] = [...ids];
+  for (const track of timeline.tracks) {
+    for (const clip of track.clips) {
+      if (clip.linkId !== undefined && wanted.has(clip.linkId) && !seen.has(clip.id)) {
+        seen.add(clip.id);
+        out.push(clip.id);
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * 一批**新产出**的片段里，哪些该被选中（**D55**）。
+ *
+ * 编辑操作作用于"扩展后"的集合（`linkedIds`），但**选中集合不该跟着扩展**：用户复制的
+ * 是"这一段"，粘出来的也该是"这一段"，而不是"画面 + 声音两个片段"。两个都选中的后果
+ * 很具体——`soleSelectedClipId()` 返回 null，于是检查器只报计数、**属性一个都看不见**
+ * （D42 那条纪律），⌘D 一下就再也调不了刚复制出来的那段的亮度。
+ *
+ * 判据是"扔掉那些在同一批里有画面伙伴的音频片段"。纯音频素材没有伙伴，全部保留；
+ * 用户本来就多选了一组的话，那一组的画面片段也都保留。
+ *
+ * `addSource` 里原来那句"只选第一个"是这条判据的特例，现在三家共用一处——散写的话
+ * 加第四个产出片段的操作时必然漏掉，而漏掉的表现就是上面那句"属性看不见"。
+ */
+export function primarySelection(
+  timeline: Timeline,
+  clipIds: readonly ClipId[],
+): readonly ClipId[] {
+  const videoLinks = new Set<string>();
+  for (const id of clipIds) {
+    const found = findClip(timeline, id);
+    if (found?.track.kind === "video" && found.clip.linkId !== undefined) {
+      videoLinks.add(found.clip.linkId);
+    }
+  }
+  if (videoLinks.size === 0) return clipIds;
+  return clipIds.filter((id) => {
+    const found = findClip(timeline, id);
+    if (found === undefined) return false;
+    if (found.track.kind === "video") return true;
+    return found.clip.linkId === undefined || !videoLinks.has(found.clip.linkId);
+  });
+}
+
+/**
+ * 解除音画链接：把这些片段（连同它们的伙伴）的 `linkId` 整个删掉。
+ *
+ * **必须连伙伴一起解**：只清一边会留下一个"指着一个没人认领的 id"的片段，而那时
+ * `linkedIds()` 对它返回自己、对另一边也返回自己——看起来像解开了，直到用户再导入
+ * 一个素材恰好撞上同一个 id（不会发生，UUID），或者更实际地：撤销之后只回来一半。
+ *
+ * 做 J-cut / L-cut（声音先进、画面后进）就必须能解开，所以这不是可选项。**没有"重新
+ * 链接"**：那要回答"这两个真的是一对吗"，而唯一知道答案的是当初那次导入。
+ */
+export function unlinkClips(timeline: Timeline, clipIds: readonly ClipId[]): BatchResult {
+  const ids = linkedIds(timeline, clipIds);
+  const targets = ids.filter((id) => findClip(timeline, id)?.clip.linkId !== undefined);
+  if (targets.length === 0) {
+    return { ...reject(timeline, "选中的片段没有音画链接"), done: 0, total: ids.length };
+  }
+  const tally = perClip(timeline, targets, (working, id) => {
+    const found = findClip(working, id);
+    if (!found) return reject(working, `找不到片段 ${id}`);
+    if (found.track.locked) return reject(working, `${found.track.label ?? found.track.id} 已锁定`);
+    // `replaceClip` 的第二个参数是**轨道 id**，不是片段 id——两者都是 string 别名，
+    // 传错了 typecheck 一声不吭，而 `ok()` 照样报成功（写这一行时就踩了，单测抓到）。
+    // 清除可选字段走 `setOptional`：`exactOptionalPropertyTypes` 下
+    // "字段存在但值是 undefined"是另一种类型
+    return ok(replaceClip(working, found.track.id, setOptional(found.clip, "linkId", undefined)));
+  });
+  return tallyResult(timeline, tally, targets.length, "解除链接");
 }
 
 /**
@@ -2155,7 +2340,8 @@ export function pasteClips(
     working = result.timeline;
     if (result.clipId) clipIds.push(result.clipId);
   }
-  return { ...ok(working), clipIds };
+  // 克隆出来的片段要自成一组，不能和源头共用 `linkId`（见 `relinkGroup`）
+  return { ...ok(relinkGroup(working, clipIds)), clipIds };
 }
 
 /**
@@ -2199,7 +2385,7 @@ export function duplicateClips(timeline: Timeline, clipIds: readonly ClipId[]): 
     working = result.timeline;
     if (result.clipId) clipIdsOut.push(result.clipId);
   }
-  return { ...ok(working), clipIds: clipIdsOut };
+  return { ...ok(relinkGroup(working, clipIdsOut)), clipIds: clipIdsOut };
 }
 
 // ---------------------------------------------------------------------------
@@ -2342,12 +2528,21 @@ export function addSource(timeline: Timeline, options: AddSourceOptions): AddSou
 
   const placing = { timelineIn, timelineOut: timelineIn + lengthFrames, name: source.name };
 
+  /**
+   * 音画链接 id：**只在两个片段都会产出时才给**（D55）。
+   *
+   * 没有音轨的画面素材、纯音频素材都只产出一个片段，给它一个 `linkId` 就是造一个
+   * 永远配不到对的孤儿——`linkedIds()` 对它没有效果，但数据里多一个说不清的字段。
+   */
+  const linkId = source.kind === "av" && source.hasAudio ? newLinkId() : undefined;
+
   /** 画面片段和音频片段共用同一份占位与 `sourceIn`，只是落在不同种类的轨上。 */
   const clipFor = (suffix: string): MediaClip => ({
     id: `${source.id}${suffix}`,
     kind: "media",
     sourceId: source.id,
     ...placing,
+    ...(linkId === undefined ? {} : { linkId }),
     sourceIn: 0,
   });
 

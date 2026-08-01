@@ -46,6 +46,17 @@ export function newClipId(prefix: string): string {
   return `${prefix}-${uuid()}`;
 }
 
+/**
+ * 音画链接 id（**D55**）。
+ *
+ * 同一次导入产出的画面片段和音频片段共用一个，于是"这两个是一对"这件事在数据里
+ * 有据可依——而不是靠 `${sourceId}-v` / `-a` 那套命名去猜。猜会在**第一次切分之后**
+ * 就断掉：切出来的新片段走 `newClipId()`，名字里再没有那层关系。
+ */
+export function newLinkId(): string {
+  return `lnk-${uuid()}`;
+}
+
 function uuid(): string {
   // `randomUUID` 只在安全上下文里有，而 WebCodecs / OPFS 也都要求安全上下文，
   // 所以走到这里时它必然存在。仍然留一条退路：撞 id 的代价是导入被拒，

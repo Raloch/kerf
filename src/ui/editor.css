@@ -328,7 +328,9 @@
   gap: 10px;
   padding: 8px 14px;
   border-bottom: 1px solid var(--line);
-  background: color-mix(in oklab, var(--accent) 14%, var(--panel));
+  /* `--accent` 全仓库没有定义（未定义变量会让整条 color-mix 失效）。实际用到的只有
+     下面 `.warn` 那个变体，所以这条从没露出来过——补一个回退值免得下次有人用它 */
+  background: color-mix(in oklab, var(--warn, #7fa3b8) 14%, var(--panel));
   font-size: 12px;
 }
 .ed .ed-recover > span {
@@ -1183,6 +1185,18 @@
   z-index: 3;
   box-shadow: 0 0 0 3px var(--kerf-glow);
 }
+/*
+ * 音画链接的伙伴：**没被选中，但会跟着一起动**（D55）。
+ *
+ * 比选中弱一档——虚线、无光晕、同色。要弱是因为它不是选中：检查器显示的是选中那个
+ * 的属性，两者画成一样会让"我改的是哪一个"变得含糊。但也必须看得见，否则一拖两个
+ * 跟着走是个惊讶（选中集合刻意不扩展，见 `primarySelection`）。
+ */
+.ed .clip.linked:not([aria-selected="true"]) {
+  outline: 1.5px dashed var(--kerf);
+  outline-offset: -1px;
+  z-index: 2;
+}
 .ed .clip:focus-visible {
   outline: 2px solid var(--kerf);
   outline-offset: -1px;
@@ -1433,7 +1447,10 @@
  * 一档就够——它只活到下一次编辑。
  */
 .ed-foot .notice {
-  color: var(--accent);
+  /* `--warn` 那个冷蓝：它刻意不和强调色 `--kerf` 抢注意力，正合这条提示的分量。
+     **别用 `var(--accent)`**——全仓库都没有定义它，未定义的变量会静默回退成继承色，
+     于是这条提示和普通状态栏文字长得一模一样（写这一行时就踩了）。 */
+  color: var(--warn);
 }
 .ed .caps {
   display: flex;
