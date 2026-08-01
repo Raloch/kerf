@@ -78,6 +78,8 @@ import {
   setTransition,
   splitClipAt,
   trimClip,
+  nextClip,
+  junctionAt,
 } from "./operations";
 
 // ---- 测试夹具 ----
@@ -3632,5 +3634,310 @@ describe("入点 / 出点标记（D50）", () => {
       expect("markIn" in shorter.timeline).toBe(false);
       expect("markOut" in shorter.timeline).toBe(false);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 裁切的三种模式（D56）
+// ---------------------------------------------------------------------------
+
+/**
+ * 一对音画链接的片段，两条轨上各跟一个后继。
+ *
+ * ```
+ * V1: av[0,100)            tail[150,230)
+ * A1: aa[0,100)  music[100,180)
+ * ```
+ *
+ * 两条轨的后继**刻意不在同一个位置**：这样"伙伴那边放不下"能单独构造出来
+ * （画面还有 50 帧空间、声音一帧都没有），而那是"全体或拒绝"唯一测得到的地方。
+ */
+function linkedTimeline(): Timeline {
+  const av: MediaClip = { ...clip("av", 0, 100), linkId: "L1" };
+  const aa: MediaClip = { ...clip("aa", 0, 100), linkId: "L1" };
+  return timeline([
+    { id: "V1", kind: "video", clips: [av, clip("tail", 150, 230)] },
+    { id: "A1", kind: "audio", clips: [aa, clip("music", 100, 180)] },
+  ]);
+}
+
+/** 两对链接片段，各自紧邻——卷动要有交界才谈得上。 */
+function linkedPairTimeline(): Timeline {
+  const av: MediaClip = { ...clip("av", 0, 100), linkId: "L1" };
+  const aa: MediaClip = { ...clip("aa", 0, 100), linkId: "L1" };
+  const bv: MediaClip = { ...clip("bv", 100, 200, 300), linkId: "L2" };
+  const ba: MediaClip = { ...clip("ba", 100, 200, 300), linkId: "L2" };
+  return timeline([
+    { id: "V1", kind: "video", clips: [av, bv] },
+    { id: "A1", kind: "audio", clips: [aa, ba] },
+  ]);
+}
+
+/** 片段的占位区间，写断言时比逐字段读好认。 */
+function span(t: Timeline, id: string): [number, number] {
+  const found = findClip(t, id);
+  if (!found) throw new Error(`找不到片段 ${id}`);
+  return [found.clip.timelineIn, found.clip.timelineOut];
+}
+
+describe("裁切连音画伙伴一起（D56 补 D55 漏掉的那一条）", () => {
+  it("裁画面的出点，声音那一段跟着裁", () => {
+    const r = trimClip(linkedTimeline(), "av", "out", -20);
+    expect(r.changed).toBe(true);
+    expect(span(r.timeline, "av")).toEqual([0, 80]);
+    // 不跟着裁的表现是尾巴上多出 20 帧有声无画，而且不报错——D55 要修的正是这个
+    expect(span(r.timeline, "aa")).toEqual([0, 80]);
+  });
+
+  it("裁入点时两边的 sourceIn 一起推进", () => {
+    const r = trimClip(linkedTimeline(), "av", "in", 30);
+    expect(media(findClip(r.timeline, "av")?.clip).sourceIn).toBe(30);
+    expect(media(findClip(r.timeline, "aa")?.clip).sourceIn).toBe(30);
+    expect(span(r.timeline, "aa")).toEqual([30, 100]);
+  });
+
+  it("拖的是画面而声音放不下时，整次拒绝并说清是哪一边", () => {
+    const before = linkedTimeline();
+    // 画面那边到 150 才有邻居，声音那边 100 就撞上了
+    const r = trimClip(before, "av", "out", 30);
+    expect(r.changed).toBe(false);
+    expect(r.reason).toContain("声音那一段");
+    expect(r.reason).toContain("music");
+    expect(r.timeline).toBe(before); // 画面也没动
+  });
+
+  it("反过来拖声音时，措辞说的是画面", () => {
+    // 把两条轨的邻居**对调**：画面那边 100 就挡住，声音那边到 150 才有
+    let t = moveClip(linkedTimeline(), "tail", -50).timeline;
+    t = moveClip(t, "music", 50).timeline;
+    expect(span(t, "tail")).toEqual([100, 180]);
+    expect(span(t, "music")).toEqual([150, 230]);
+    const r = trimClip(t, "aa", "out", 10);
+    expect(r.changed).toBe(false);
+    // 写死"声音"的话这句话指着用户刚拖的那个片段，读起来像软件出错了
+    expect(r.reason).toContain("画面那一段");
+  });
+
+  it("两边同时撞上时，报的是用户拖的那个自己的原因", () => {
+    /*
+      两边一起挡住是常态——音画伙伴后面往往跟着同一组素材的下一段。那时"先遇到
+      哪一个"取决于轨道在数组里的顺序，跟用户拖的是哪个毫无关系；不排序的话拖声音
+      拖不动会报"画面那一段"，用户去看一个自己没碰过的片段。
+    */
+    const t = moveClip(linkedTimeline(), "tail", -50).timeline; // 两条轨的邻居都在 100
+    expect(span(t, "tail")).toEqual([100, 180]);
+    expect(span(t, "music")).toEqual([100, 180]);
+
+    const draggedAudio = trimClip(t, "aa", "out", 10);
+    expect(draggedAudio.reason).toContain("music"); // 声音自己撞上的那个
+    expect(draggedAudio.reason).not.toContain("那一段");
+
+    const draggedVideo = trimClip(t, "av", "out", 10);
+    expect(draggedVideo.reason).toContain("tail");
+    expect(draggedVideo.reason).not.toContain("那一段");
+  });
+
+  it("没有链接的片段只裁自己", () => {
+    const r = trimClip(twoClipTimeline(), "a", "out", -20);
+    expect(span(r.timeline, "a")).toEqual([0, 80]);
+    expect(span(r.timeline, "m")).toEqual([0, 200]); // A1 上那条没有 linkId
+  });
+});
+
+describe("波纹裁切（D56）", () => {
+  it("出点裁短，后面的片段跟着往前收", () => {
+    const r = trimClip(twoClipTimeline(), "a", "out", -20, "ripple");
+    expect(r.changed).toBe(true);
+    expect(span(r.timeline, "a")).toEqual([0, 80]);
+    expect(span(r.timeline, "b")).toEqual([80, 180]);
+    // **只作用在这一条轨上**（同 `rippleDeleteClip`）：A1 上那条没有链接的音乐纹丝
+    // 不动，所以总长仍是 200。跨轨波纹会让"我只裁了一个片段，为什么配乐也挪了"
+    expect(span(r.timeline, "m")).toEqual([0, 200]);
+    expect(r.timeline.durationFrames).toBe(200);
+  });
+
+  it("出点拉长，后面的往后让", () => {
+    const r = trimClip(twoClipTimeline(), "a", "out", 30, "ripple");
+    expect(span(r.timeline, "a")).toEqual([0, 130]);
+    expect(span(r.timeline, "b")).toEqual([130, 230]);
+  });
+
+  it("判据是**原**出点：拉长到盖过后继时它仍然被算进去", () => {
+    // 普通裁切在这里会报重叠（a 的新出点 130 伸进 b）
+    expect(trimClip(twoClipTimeline(), "a", "out", 30).changed).toBe(false);
+    // 波纹裁切下 b 跟着走，所以合法。若判据写成"裁完的出点"，b 的入点 100 < 130
+    // 就不满足条件、不会被挪，结果是一个重叠的时间轴
+    const r = trimClip(twoClipTimeline(), "a", "out", 30, "ripple");
+    expect(r.changed).toBe(true);
+    expect(span(r.timeline, "b")[0]).toBe(130);
+  });
+
+  it("裁入点时片段自己回到原位，长度变短，后面的跟着收", () => {
+    const r = trimClip(twoClipTimeline(), "a", "in", 20, "ripple");
+    // 普通裁入点会让 a 变成 [20,100)、头上留一个 20 帧的空档
+    expect(span(r.timeline, "a")).toEqual([0, 80]);
+    expect(media(findClip(r.timeline, "a")?.clip).sourceIn).toBe(20); // 内容确实少用了开头
+    expect(span(r.timeline, "b")).toEqual([80, 180]);
+  });
+
+  it("入点往左拉长时整条往后让", () => {
+    const t = timeline([
+      { id: "V1", kind: "video", clips: [clip("a", 50, 150, 20), clip("b", 150, 250)] },
+    ]);
+    const r = trimClip(t, "a", "in", -20, "ripple");
+    expect(span(r.timeline, "a")).toEqual([50, 170]);
+    expect(media(findClip(r.timeline, "a")?.clip).sourceIn).toBe(0);
+    expect(span(r.timeline, "b")).toEqual([170, 270]);
+  });
+
+  it("空档原样保留——波纹收的是自己那一段，不是替用户整理轨道", () => {
+    const t = timeline([
+      { id: "V1", kind: "video", clips: [clip("a", 0, 100), clip("c", 150, 200)] },
+    ]);
+    const r = trimClip(t, "a", "out", -20, "ripple");
+    expect(span(r.timeline, "a")).toEqual([0, 80]);
+    expect(span(r.timeline, "c")).toEqual([130, 180]); // 空档仍是 50 帧
+  });
+
+  it("两条轨各自收自己的后继", () => {
+    const r = trimClip(linkedTimeline(), "av", "out", -20, "ripple");
+    expect(r.changed).toBe(true);
+    expect(span(r.timeline, "av")).toEqual([0, 80]);
+    expect(span(r.timeline, "tail")).toEqual([130, 210]);
+    expect(span(r.timeline, "aa")).toEqual([0, 80]);
+    expect(span(r.timeline, "music")).toEqual([80, 160]);
+  });
+
+  it("跟着移的片段不动关键帧——平移没有改变它起点指向的内容", () => {
+    const withKf = setKeyframe(twoClipTimeline(), "b", "opacity", 10, 0.5).timeline;
+    const r = trimClip(withKf, "a", "out", -20, "ripple");
+    expect(findClip(r.timeline, "b")?.clip.keyframes?.opacity?.[0]?.frame).toBe(10);
+  });
+
+  it("被裁的那个片段照常平移关键帧（裁入点改变了起点指向的内容）", () => {
+    const withKf = setKeyframe(twoClipTimeline(), "a", "opacity", 30, 0.5).timeline;
+    const r = trimClip(withKf, "a", "in", 20, "ripple");
+    expect(findClip(r.timeline, "a")?.clip.keyframes?.opacity?.[0]?.frame).toBe(10);
+  });
+
+  it("源片不够长时照样拒绝，后面的片段一个都不动", () => {
+    const t = timeline([{ id: "V1", kind: "video", clips: [clip("a", 0, 50, 950), clip("b", 50, 100)] }], 1000);
+    const r = trimClip(t, "a", "out", 10, "ripple");
+    expect(r.changed).toBe(false);
+    expect(r.reason).toContain("源片末尾");
+    expect(span(r.timeline, "b")).toEqual([50, 100]);
+  });
+});
+
+/**
+ * 一条交界，**两个方向都卷得动**：入场片段的 `sourceIn` 留了 300 帧余量。
+ *
+ * `twoClipTimeline()` 的入场片段 `sourceIn` 是 0，往左卷需要它变负——那是一次
+ * 合法的拒绝，不是"卷动坏了"。这个区别写第一版用例时踩过：拿那个夹具去验
+ * "两个方向都行"，红的是夹具。
+ */
+function rollableTimeline(): Timeline {
+  return timeline([
+    { id: "V1", kind: "video", clips: [clip("a", 0, 100), clip("b", 100, 200, 300)] },
+  ]);
+}
+
+describe("卷动交界（D56）", () => {
+  it("一边长一边短，总长不变", () => {
+    const before = rollableTimeline();
+    const r = trimClip(before, "a", "out", 20, "roll");
+    expect(r.changed).toBe(true);
+    expect(span(r.timeline, "a")).toEqual([0, 120]);
+    expect(span(r.timeline, "b")).toEqual([120, 200]);
+    expect(r.timeline.durationFrames).toBe(before.durationFrames);
+  });
+
+  it("入场片段的 sourceIn 跟着走——卷过去的那几帧要换成新内容", () => {
+    const r = trimClip(rollableTimeline(), "a", "out", 20, "roll");
+    expect(media(findClip(r.timeline, "b")?.clip).sourceIn).toBe(320);
+  });
+
+  it("往正方向卷动也要能成功", () => {
+    /*
+      这一条钉的是 `applyEdgeEdits` 存在的理由。出场片段的出点先挪到 120 时，
+      入场片段还站在 [100,200)——那个**中间状态必然重叠**，逐个提交的写法会被
+      自己的下一步挡住，表现是"往左卷动好好的、往右永远失败"。
+    */
+    expect(trimClip(rollableTimeline(), "a", "out", 20, "roll").changed).toBe(true);
+    expect(trimClip(rollableTimeline(), "a", "out", -20, "roll").changed).toBe(true);
+  });
+
+  it("从出点侧和从入点侧拖的是同一条交界", () => {
+    const fromOut = trimClip(rollableTimeline(), "a", "out", 20, "roll");
+    const fromIn = trimClip(rollableTimeline(), "b", "in", 20, "roll");
+    expect(fromIn.changed).toBe(true);
+    expect(span(fromIn.timeline, "a")).toEqual(span(fromOut.timeline, "a"));
+    expect(span(fromIn.timeline, "b")).toEqual(span(fromOut.timeline, "b"));
+  });
+
+  it("没有紧邻的邻居就没有交界可卷", () => {
+    const r = trimClip(rollableTimeline(), "b", "out", 20, "roll");
+    expect(r.changed).toBe(false);
+    expect(r.reason).toContain("没有交界可卷");
+  });
+
+  it("中间有空档不算交界", () => {
+    const t = timeline([
+      { id: "V1", kind: "video", clips: [clip("a", 0, 100), clip("c", 150, 200)] },
+    ]);
+    const r = trimClip(t, "a", "out", 20, "roll");
+    expect(r.changed).toBe(false);
+    expect(r.reason).toContain("没有交界可卷");
+  });
+
+  it("入场那一侧到了源片开头，整次拒绝", () => {
+    // `twoClipTimeline` 的 b 从源片第 0 帧开始，往左卷要它变成 -20
+    const r = trimClip(twoClipTimeline(), "a", "out", -20, "roll");
+    expect(r.changed).toBe(false);
+    expect(r.reason).toContain("源片开头");
+    expect(span(r.timeline, "a")).toEqual([0, 100]); // 出场那一侧也没动
+  });
+
+  it("出场那一侧到了源片末尾，同样整次拒绝", () => {
+    const t = timeline(
+      [{ id: "V1", kind: "video", clips: [clip("a", 0, 100, 900), clip("b", 100, 200, 300)] }],
+      1000,
+    );
+    const r = trimClip(t, "a", "out", 20, "roll");
+    expect(r.changed).toBe(false);
+    expect(r.reason).toContain("源片末尾");
+    expect(span(r.timeline, "b")).toEqual([100, 200]); // 入场那一侧也没动
+  });
+
+  it("连音画伙伴的同一个交界一起卷", () => {
+    const r = trimClip(linkedPairTimeline(), "av", "out", 25, "roll");
+    expect(r.changed).toBe(true);
+    expect(span(r.timeline, "av")).toEqual([0, 125]);
+    expect(span(r.timeline, "bv")).toEqual([125, 200]);
+    expect(span(r.timeline, "aa")).toEqual([0, 125]);
+    expect(span(r.timeline, "ba")).toEqual([125, 200]);
+    expect(media(findClip(r.timeline, "ba")?.clip).sourceIn).toBe(325);
+  });
+});
+
+describe("nextClip / junctionAt", () => {
+  it("只认紧邻，中间有空档就没有下一个", () => {
+    const t = timeline([
+      { id: "V1", kind: "video", clips: [clip("a", 0, 100), clip("c", 150, 200)] },
+    ]);
+    const track = t.tracks[0]!;
+    expect(nextClip(track, track.clips[0]!)).toBeNull();
+    expect(junctionAt(track, "a", "out")).toBeNull();
+  });
+
+  it("两侧指向同一个交界", () => {
+    const t = twoClipTimeline();
+    const track = t.tracks[0]!;
+    const fromOut = junctionAt(track, "a", "out");
+    const fromIn = junctionAt(track, "b", "in");
+    expect(fromOut?.from.id).toBe("a");
+    expect(fromOut?.to.id).toBe("b");
+    expect(fromIn?.from.id).toBe("a");
+    expect(fromIn?.to.id).toBe("b");
   });
 });

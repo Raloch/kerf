@@ -93,7 +93,9 @@ import {
   type TrackFlag,
   type TransformPatch,
   type ClipboardEntry,
+  sideLabel,
   type TrimEdge,
+  type TrimMode,
 } from "./operations";
 
 /**
@@ -155,8 +157,16 @@ export interface TimelineState {
    * 清除时机**只有 `apply()` 一处**（成功编辑就清），所以它不会一直挂在状态栏上。
    */
   lastNotice: string | null;
-  /** 拖拽过程中的即时提示（落点非法的原因）。拖拽结束清空，不进撤销栈。 */
-  dragHint: string | null;
+  /**
+   * 拖拽过程中的即时读数。拖拽结束清空，不进撤销栈。
+   *
+   * **带 `bad` 而不是一律红字**：这一行既要说"这里放不下"，也要说"松手会移到第 60
+   * 帧""按 ⇧ 可以让后面跟着走"，而后两句是中性的。原来是个裸字符串、渲染成 `.reject`，
+   * 于是**关键帧拖拽那句「移到第 N 帧」全程红着**——一次完全正常的操作看起来像出了错
+   * （同 D54 那条 `lastNotice` / `lastRejection` 的分工，也同 `.notice` 用了未定义
+   * 变量那个坑：显眼度是选出来的，不能默认继承）。
+   */
+  dragHint: DragHint | null;
   /**
    * 剪贴板里的那一组片段（空数组 = 没有可粘的）。**不进撤销栈**（复制没有改动任何
    * 东西），**不进快照**（它引用的素材下次打开时可能已经不在，见 `ClipboardEntry`），
@@ -214,7 +224,11 @@ export interface TimelineState {
   moveClips: (clipIds: readonly ClipId[], deltaFrames: number, clampToBounds?: boolean) => void;
   /** 拖拽落点：先算磁吸再移动，中间态按 clipId 合并成一步撤销。 */
   dragClipTo: (clipId: ClipId, desiredIn: number, toTrack?: TrackId) => void;
-  trimClip: (clipId: ClipId, edge: TrimEdge, deltaFrames: number) => void;
+  /**
+   * 拖边缘。`mode` 决定"还有谁跟着变"（见 `TrimMode`），缺省是只动这一个片段
+   * （和它的音画伙伴——那一条在纯函数里，界面探路和真正提交才不会分叉）。
+   */
+  trimClip: (clipId: ClipId, edge: TrimEdge, deltaFrames: number, mode?: TrimMode) => void;
   splitAtPlayhead: () => void;
   removeSelected: (ripple?: boolean) => void;
   /**
@@ -360,9 +374,15 @@ export interface TimelineState {
   selectAll: () => void;
   toggleSnap: () => void;
   setZoom: (zoom: number) => void;
-  setDragHint: (hint: string | null) => void;
+  setDragHint: (hint: DragHint | null) => void;
   undo: () => void;
   redo: () => void;
+}
+
+/** 拖拽读数。`bad` 决定它在状态栏上是红字还是中性色——见 `TimelineState.dragHint`。 */
+export interface DragHint {
+  readonly text: string;
+  readonly bad: boolean;
 }
 
 /** 单调递增的时间源。用 performance.now() 让合并窗口按真实时间算。 */
@@ -429,7 +449,9 @@ export const useTimeline = create<TimelineState>((set, get) => {
       // 失败——跨轨拖拽就是这种情形（delta 恒为 0，只换轨）
       const step = moveClip(working, id, delta);
       if (!step.changed && step.reason !== undefined) {
-        set({ lastRejection: `声音那一段放不下：${step.reason}` });
+        // 措辞问 `sideLabel`，别写死"声音"——用户拖的可能就是音频片段，那时被挡住的
+        // 是画面，而一句"声音那一段放不下"指着他刚拖的那个，读起来像软件出错了
+        set({ lastRejection: `${sideLabel(timeline, id)}那一段放不下：${step.reason}` });
         return;
       }
       if (step.changed) working = step.timeline;
@@ -593,11 +615,13 @@ export const useTimeline = create<TimelineState>((set, get) => {
       moveWithPartners(clipId, delta, toTrack === undefined ? {} : { toTrack });
     },
 
-    trimClip(clipId, edge, deltaFrames) {
+    trimClip(clipId, edge, deltaFrames, mode = "normal") {
       apply(
-        trimClip(get().timeline(), clipId, edge, deltaFrames),
-        edge === "in" ? "裁切入点" : "裁切出点",
-        `trim:${edge}:${clipId}`,
+        trimClip(get().timeline(), clipId, edge, deltaFrames, mode),
+        trimLabel(edge, mode),
+        // **合并键带模式**：普通裁切和波纹裁切改变的东西不是一回事（后者还挪了后继
+        // 片段），合成一条撤销会让 ⌘Z 一下把两次都撤掉。卷动同理
+        `trim:${mode}:${edge}:${clipId}`,
       );
     },
 
@@ -934,6 +958,17 @@ export const useTimeline = create<TimelineState>((set, get) => {
     },
   };
 });
+
+/**
+ * 撤销栈里那条编辑叫什么。
+ *
+ * 三种模式要分开说：用户按 ⌘Z 之前看到的是这行字，而"裁切出点"和"波纹裁切出点"
+ * 撤销回去的东西差着后面一整排片段。
+ */
+function trimLabel(edge: TrimEdge, mode: TrimMode): string {
+  if (mode === "roll") return "卷动交界";
+  return `${mode === "ripple" ? "波纹裁切" : "裁切"}${edge === "in" ? "入点" : "出点"}`;
+}
 
 /**
  * 开发期把 store 挂到全局，供浏览器控制台和自动化实测脚本驱动**真实**实例。

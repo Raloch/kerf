@@ -435,6 +435,21 @@ export function moveClips(
 export type TrimEdge = "in" | "out";
 
 /**
+ * 拖边缘的三种模式。**手势是同一个，区别只在"除了这个片段还有谁跟着变"**。
+ *
+ * - `normal`：只有这个片段（和它的音画伙伴）。留下空档或撞上邻居。
+ * - `ripple`：同一轨道上**后面的片段跟着平移**，不留空档。粗剪最高频的动作——
+ *   "这段太长了剪掉两秒、后面全跟上"，没有它就得裁一次再框选后面全部拖一次。
+ * - `roll`：**交界另一侧此消彼长，总长不变**。调两段之间的切点用的，是唯一
+ *   不改变整条片长的裁切。
+ *
+ * 做成一个参数而不是三个函数，是为了让**界面只探一次**：拖拽中的幽灵由
+ * `trimClip()` 的返回值反推（见 `use-clip-drag.ts`），三个入口就要在那里
+ * 分三路，而分岔的每一路都可能和真正提交的那一路漂开。
+ */
+export type TrimMode = "normal" | "ripple" | "roll";
+
+/**
  * 把关键帧偏移整体平移 `delta` 帧。
  *
  * 关键帧的 `frame` 是**相对片段起点**的偏移（PLAN.md 的 D10），所以片段起点
@@ -461,7 +476,7 @@ function shiftKeyframes(channels: KeyframeChannels, delta: number): KeyframeChan
 }
 
 /**
- * 拖动片段边缘裁切。
+ * 裁切之后**这一个片段**长什么样：只算它自己，不看邻居、不碰轨道。
  *
  * 关键约束：入点裁切会同步改 `sourceIn`——把左边缘往右拖 10 帧，
  * 意味着少用源片开头的 10 帧，而不是让画面内容跟着平移。
@@ -472,30 +487,31 @@ function shiftKeyframes(channels: KeyframeChannels, delta: number): KeyframeChan
  * 拉不到帧而静默少帧，所以在编辑层就必须夹住。
  *
  * **文字片段两头都不受源片限制**：画面是现场生成的，想拉多长有多长。
- * 它唯一的下限仍是"至少 1 帧"和不撞邻居。
+ * 它唯一的下限仍是"至少 1 帧"和不撞邻居（后者由调用方判，见下）。
+ *
+ * ## 为什么把"重叠"留给调用方
+ *
+ * 波纹和卷动都要**先把好几个片段一起挪完再判重叠**：卷动把出场片段的出点往右挪
+ * 时，入场片段还站在原地，那个中间状态必然重叠——**而最终状态完全合法**。逐个
+ * 提交的写法会被自己的下一步挡住，表现是"往右卷动永远失败、往左却好好的"。
+ *
+ * 返回 `string` 表示拒绝原因，不抛异常：措辞归调用方。同一句"已经到源片末尾"，
+ * 作用在音画伙伴身上时要先说清是哪一边，否则用户看到的是一句针对自己没碰过的
+ * 片段的拒绝。
  */
-export function trimClip(
+function trimmedClip(
   timeline: Timeline,
-  clipId: ClipId,
+  clip: Clip,
   edge: TrimEdge,
   deltaFrames: number,
-): EditResult {
-  if (!Number.isInteger(deltaFrames)) return reject(timeline, "裁切量必须是整数帧");
-  if (deltaFrames === 0) return reject(timeline, "裁切量为 0");
-
-  const found = findClip(timeline, clipId);
-  if (!found) return reject(timeline, `找不到片段 ${clipId}`);
-  if (found.track.locked) return reject(timeline, "轨道已锁定");
-
-  const { clip, track } = found;
-
-  let next: Clip;
+): Clip | string {
   if (edge === "in") {
     const newIn = clip.timelineIn + deltaFrames;
-    if (newIn < 0) return reject(timeline, "片段不能延伸到时间轴起点之前");
+    if (newIn < 0) return "片段不能延伸到时间轴起点之前";
     // "源片开头"和"至少 1 帧"互斥，所以先后顺序不影响提示语：前者只可能在
     // deltaFrames 为负时触发，那时 newIn 一定还小于 timelineOut
-    if (newIn >= clip.timelineOut) return reject(timeline, "片段至少要保留 1 帧");
+    if (newIn >= clip.timelineOut) return "片段至少要保留 1 帧";
+    let next: Clip;
     if (clip.kind === "media" && isFrozen(clip)) {
       // **定格片段裁入点不推 `sourceIn`**（D48）：定住的是"那一帧"，而裁左边缘改的是
       // 这一帧要停多久。推了的表现是"把定格片段的头往右拖一下，定住的画面就换了一张"
@@ -506,41 +522,278 @@ export function trimClip(
       // `scaleBySpeed` 一处发生（1.5× 下一帧对不上整数源片帧，量化误差 < 0.5 帧、
       // 看不出来；散着取整两次才会变成"裁一帧、画面动两帧"）
       const newSourceIn = clip.sourceIn + scaleBySpeed(deltaFrames, clipSpeed(clip));
-      if (newSourceIn < 0) return reject(timeline, "已经到源片开头，没有更多素材");
+      if (newSourceIn < 0) return "已经到源片开头，没有更多素材";
       next = { ...clip, timelineIn: newIn, sourceIn: newSourceIn };
     } else {
       next = { ...clip, timelineIn: newIn };
     }
     // 起点动了，关键帧偏移要跟着动，否则动画从内容上滑走。出点裁切不需要
-    if (clip.keyframes) next = { ...next, keyframes: shiftKeyframes(clip.keyframes, deltaFrames) };
-  } else {
-    const newOut = clip.timelineOut + deltaFrames;
-    if (newOut <= clip.timelineIn) return reject(timeline, "片段至少要保留 1 帧");
-    if (clip.kind === "media") {
-      const source = timeline.sources.find((s) => s.id === clip.sourceId);
-      // 纯音频素材的帧数按项目帧率派生——**这就是裁切必须和 `sourceIn` 同栅格的地方**，
-      // 见 `AudioOnlySource` 的文件头
-      const sourceLimit = source
-        ? sourceDurationFrames(source, timeline.fps)
-        : Number.MAX_SAFE_INTEGER;
-      // 变速片段消耗的源片帧数不等于占位帧数（`clipSourceFrames`，原速下逐值相同）。
-      // 漏乘的表现是 2× 下能把出点拉到源片之外，而那几帧解不出来 =
-      // **那一层画面静默消失**（同 D37 记的那个形态）
-      const usedSourceFrames =
-        clip.sourceIn + clipSourceFrames({ ...clip, timelineOut: newOut });
-      if (usedSourceFrames > sourceLimit) return reject(timeline, "已经到源片末尾，没有更多素材");
-    }
-    next = { ...clip, timelineOut: newOut };
+    return clip.keyframes
+      ? { ...next, keyframes: shiftKeyframes(clip.keyframes, deltaFrames) }
+      : next;
   }
 
-  const hits = collisionsIn(track, next);
-  if (hits.length > 0) return reject(timeline, `与「${hits[0]!.name ?? hits[0]!.id}」重叠`);
+  const newOut = clip.timelineOut + deltaFrames;
+  if (newOut <= clip.timelineIn) return "片段至少要保留 1 帧";
+  if (clip.kind === "media") {
+    const source = timeline.sources.find((s) => s.id === clip.sourceId);
+    // 纯音频素材的帧数按项目帧率派生——**这就是裁切必须和 `sourceIn` 同栅格的地方**，
+    // 见 `AudioOnlySource` 的文件头
+    const sourceLimit = source
+      ? sourceDurationFrames(source, timeline.fps)
+      : Number.MAX_SAFE_INTEGER;
+    // 变速片段消耗的源片帧数不等于占位帧数（`clipSourceFrames`，原速下逐值相同）。
+    // 漏乘的表现是 2× 下能把出点拉到源片之外，而那几帧解不出来 =
+    // **那一层画面静默消失**（同 D37 记的那个形态）
+    const usedSourceFrames = clip.sourceIn + clipSourceFrames({ ...clip, timelineOut: newOut });
+    if (usedSourceFrames > sourceLimit) return "已经到源片末尾，没有更多素材";
+  }
+  return { ...clip, timelineOut: newOut };
+}
 
-  return ok(
-    mapTrack(timeline, track.id, (t) =>
-      withClips(t, t.clips.map((c) => (c.id === clipId ? next : c))),
-    ),
-  );
+/**
+ * 在时间轴上平移一个片段。
+ *
+ * **不动关键帧**——偏移是相对片段起点的，而平移没有改变"起点指向哪一刻内容"
+ * （见 `shiftKeyframes` 的文件头）。波纹裁切里跟着移的那些片段走的就是这条路。
+ */
+function shiftClip(clip: Clip, delta: number): Clip {
+  return delta === 0
+    ? clip
+    : { ...clip, timelineIn: clip.timelineIn + delta, timelineOut: clip.timelineOut + delta };
+}
+
+/**
+ * 这个片段属于画面还是声音。**只用来措辞**。
+ *
+ * 音画伙伴被挡住时不说清是哪一边，用户看到的是一句"与「X」重叠"，而他手里拖的
+ * 那个片段和 X 在屏幕上离得远远的——那条拒绝读起来像软件出错了。
+ */
+export function sideLabel(timeline: Timeline, clipId: ClipId): string {
+  return findClip(timeline, clipId)?.track.kind === "audio" ? "声音" : "画面";
+}
+
+/** 一条要挪的边缘。卷动时同一批里两种 `edge` 都有。 */
+interface EdgeEdit {
+  readonly clipId: ClipId;
+  readonly edge: TrimEdge;
+}
+
+/**
+ * 一次挪若干条边缘，**最后统一判重叠**，全体或拒绝。
+ *
+ * 分两步的理由见 `trimmedClip` 的文件头。全体或拒绝的理由同 D42 的移动那一类：
+ * 卷动做成了一半（出场片段短了、入场片段没跟上）留下的是一个空档，而音画链接做成
+ * 一半就是错位——**都不是"部分成功"，是用户没要的新状态**。
+ *
+ * `actedId` 是用户真正拖的那个片段：只有它的失败原因原样报出，别人的要先冠上
+ * "画面 / 声音那一段"（见 `sideLabel`）。
+ */
+function applyEdgeEdits(
+  timeline: Timeline,
+  edits: readonly EdgeEdit[],
+  deltaFrames: number,
+  actedId: ClipId,
+): EditResult {
+  const blame = (clipId: ClipId, why: string): string =>
+    clipId === actedId ? why : `${sideLabel(timeline, clipId)}那一段：${why}`;
+
+  const byTrack = new Map<TrackId, Map<ClipId, Clip>>();
+  for (const edit of edits) {
+    const found = findClip(timeline, edit.clipId);
+    if (!found) return reject(timeline, `找不到片段 ${edit.clipId}`);
+    if (found.track.locked) return reject(timeline, blame(edit.clipId, "轨道已锁定"));
+    const trimmed = trimmedClip(timeline, found.clip, edit.edge, deltaFrames);
+    if (typeof trimmed === "string") return reject(timeline, blame(edit.clipId, trimmed));
+    const slot = byTrack.get(found.track.id) ?? new Map<ClipId, Clip>();
+    slot.set(trimmed.id, trimmed);
+    byTrack.set(found.track.id, slot);
+  }
+
+  const tracks = timeline.tracks.map((t) => {
+    const changes = byTrack.get(t.id);
+    return changes ? withClips(t, t.clips.map((c) => changes.get(c.id) ?? c)) : t;
+  });
+
+  /*
+    重叠只在最终状态上判（见 `trimmedClip` 的文件头）。
+
+    **用户拖的那个片段自己的原因优先**：两边同时撞上是常态（音画伙伴后面往往跟着
+    同一组素材的下一段），而"先遇到哪一个"取决于轨道在数组里的顺序——那跟用户拖的
+    是画面还是声音毫无关系。不排序的话，拖声音拖不动时报的是"画面那一段"，用户会
+    去看一个自己没碰过的片段。
+  */
+  const hits: { readonly clipId: ClipId; readonly why: string }[] = [];
+  for (const track of tracks) {
+    const changes = byTrack.get(track.id);
+    if (!changes) continue;
+    for (const clip of changes.values()) {
+      const bumped = collisionsIn(track, clip);
+      if (bumped.length > 0) {
+        hits.push({ clipId: clip.id, why: `与「${bumped[0]!.name ?? bumped[0]!.id}」重叠` });
+      }
+    }
+  }
+  const first = hits.find((h) => h.clipId === actedId) ?? hits[0];
+  if (first) return reject(timeline, blame(first.clipId, first.why));
+  return ok(replaceTracks(timeline, tracks));
+}
+
+/**
+ * 波纹裁切**在一条轨道上**：裁完之后，这条轨上排在它后面的片段一起平移，不留空档。
+ *
+ * 判据是**原来的出点**，不是裁完的：出点往右拖 10 帧时，"后面的片段"要在挪之前
+ * 就定下来，否则新出点已经盖过第一个后继，它会被漏掉——表现是"拉长一点点没事，
+ * 拉长超过一帧间距就把后面那个片段吃了"。
+ *
+ * 裁入点时**这个片段自己也要跟着回去**：普通裁入点会让左边缘右移、留下一个空档，
+ * 而波纹的语义是"少用开头这一段，整条往前收"——于是位置回到原处、长度短了 Δ。
+ *
+ * **不会产生重叠，这是结构性的**：所有挪动的片段位移相同（间距保持），而挪完之后
+ * 被裁片段的出点恰好等于第一个后继的新入点。所以这里不判——判了也永远不红。
+ */
+function rippleTrimOnTrack(
+  timeline: Timeline,
+  clipId: ClipId,
+  edge: TrimEdge,
+  deltaFrames: number,
+): EditResult {
+  const found = findClip(timeline, clipId);
+  if (!found) return reject(timeline, `找不到片段 ${clipId}`);
+  if (found.track.locked) return reject(timeline, "轨道已锁定");
+
+  const { clip, track } = found;
+  const trimmed = trimmedClip(timeline, clip, edge, deltaFrames);
+  if (typeof trimmed === "string") return reject(timeline, trimmed);
+
+  const shift = edge === "in" ? -deltaFrames : deltaFrames;
+  const boundary = clip.timelineOut;
+  const moved = edge === "in" ? shiftClip(trimmed, shift) : trimmed;
+  const rest = track.clips
+    .filter((c) => c.id !== clipId)
+    .map((c) => (c.timelineIn >= boundary ? shiftClip(c, shift) : c));
+
+  return ok(mapTrack(timeline, track.id, (t) => withClips(t, [...rest, moved])));
+}
+
+/**
+ * 拖动片段边缘裁切。**这是裁切的唯一入口，三种模式都从这里进**（见 `TrimMode`）。
+ *
+ * ## 音画链接在这一层，不在 store 里
+ *
+ * `linkedIds()` 必须在**纯函数**里过一遍，因为拖拽中的幽灵也拿这个函数探路
+ * （`use-clip-drag.ts`）。放进 store 的话，界面会画出"只有画面这一段变了"而松手
+ * 之后声音也跟着变了——那正是 D42 说的"界面说了一件不会发生的事"。
+ *
+ * D55 落地时**漏了这一条**：联动名单写的是移动 / 删除 / 切分 / 复制 / 副本，裁切
+ * 既不在名单里也不属于"属性编辑"那个例外，是从名单里掉出去的。后果就是 D55 要修
+ * 的那个东西本身——把画面的右边缘往左剪掉两秒，声音纹丝不动，尾巴上多出两秒有声
+ * 无画，**不报错**。
+ *
+ * 要单独裁一边（J-cut / L-cut）走 `unlinkClips()`，那正是它存在的理由。刻意**不给
+ * 一个"这次不联动"的临时修饰键**：临时解开之后两段还挂着同一个 `linkId`，下一次
+ * 拖动又会把它们扯回同一个偏移上，用户得反复对抗。
+ */
+export function trimClip(
+  timeline: Timeline,
+  clipId: ClipId,
+  edge: TrimEdge,
+  deltaFrames: number,
+  mode: TrimMode = "normal",
+): EditResult {
+  if (!Number.isInteger(deltaFrames)) return reject(timeline, "裁切量必须是整数帧");
+  if (deltaFrames === 0) return reject(timeline, "裁切量为 0");
+  if (mode === "roll") return rollJunction(timeline, clipId, edge, deltaFrames);
+
+  const ids = linkedIds(timeline, [clipId]);
+  if (mode === "normal") {
+    return applyEdgeEdits(
+      timeline,
+      ids.map((id) => ({ clipId: id, edge })),
+      deltaFrames,
+      clipId,
+    );
+  }
+
+  // 波纹：每条轨道各自收拾自己的后继，互不影响，所以逐条做就行（不像卷动那样
+  // 存在一个必然重叠的中间状态）。失败时返回**原**时间轴——全体或拒绝
+  let working = timeline;
+  for (const id of ids) {
+    const step = rippleTrimOnTrack(working, id, edge, deltaFrames);
+    if (!step.changed) {
+      const why = step.reason ?? "放不下";
+      return reject(timeline, id === clipId ? why : `${sideLabel(timeline, id)}那一段：${why}`);
+    }
+    working = step.timeline;
+  }
+  return ok(working);
+}
+
+/** 紧跟在这个片段之后的片段；中间有空档或它是最后一个时返回 null。 */
+export function nextClip(track: Track, clip: Clip): Clip | null {
+  return track.clips.find((c) => c.id !== clip.id && c.timelineIn === clip.timelineOut) ?? null;
+}
+
+/**
+ * 拖的这条边属于哪个交界。两侧必须**紧邻**（同 `previousClip`，转场也是这个判据）
+ * ——中间有空档时没有交界可卷，那时该做的是把片段挪过去。
+ *
+ * 出点那一侧和入点那一侧指向**同一个**交界：拖 A 的右边缘和拖 B 的左边缘，
+ * 卷动的是同一条线。这正是它和裁切的区别，也是它要单独一个模式的理由。
+ */
+export function junctionAt(
+  track: Track,
+  clipId: ClipId,
+  edge: TrimEdge,
+): { readonly from: Clip; readonly to: Clip } | null {
+  const clip = track.clips.find((c) => c.id === clipId);
+  if (!clip) return null;
+  if (edge === "out") {
+    const to = nextClip(track, clip);
+    return to ? { from: clip, to } : null;
+  }
+  const from = previousClip(track, clip);
+  return from ? { from, to: clip } : null;
+}
+
+/**
+ * 卷动交界：出场片段的出点和入场片段的入点朝**同一个方向**挪同样多，总长不变。
+ *
+ * 两侧各自连音画伙伴一起（`linkedIds`），而且**不需要为"伙伴那边也构成一个交界"
+ * 单独写一条判据**——出场侧一律收出点、入场侧一律收入点，伙伴恰好也紧邻时那两条
+ * 边合起来就是另一条轨上的同一次卷动；不紧邻时它们各自是一次普通裁切，而那正是
+ * "跟着画面走"的正确含义。少一条判据就少一处会漂的地方。
+ *
+ * 一律走 `applyEdgeEdits`，因为中间状态必然重叠——理由见 `trimmedClip` 的文件头。
+ */
+export function rollJunction(
+  timeline: Timeline,
+  clipId: ClipId,
+  edge: TrimEdge,
+  deltaFrames: number,
+): EditResult {
+  if (!Number.isInteger(deltaFrames)) return reject(timeline, "卷动量必须是整数帧");
+  if (deltaFrames === 0) return reject(timeline, "卷动量为 0");
+
+  const found = findClip(timeline, clipId);
+  if (!found) return reject(timeline, `找不到片段 ${clipId}`);
+
+  const junction = junctionAt(found.track, clipId, edge);
+  if (!junction) {
+    return reject(
+      timeline,
+      edge === "out" ? "右边没有紧邻的片段，没有交界可卷" : "左边没有紧邻的片段，没有交界可卷",
+    );
+  }
+
+  const edits: EdgeEdit[] = [
+    ...linkedIds(timeline, [junction.from.id]).map((id) => ({
+      clipId: id,
+      edge: "out" as TrimEdge,
+    })),
+    ...linkedIds(timeline, [junction.to.id]).map((id) => ({ clipId: id, edge: "in" as TrimEdge })),
+  ];
+  return applyEdgeEdits(timeline, edits, deltaFrames, clipId);
 }
 
 // ---------------------------------------------------------------------------

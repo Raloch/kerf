@@ -769,7 +769,7 @@ export function Editor({
         <span className="sel">
           {/* 拖拽提示优先：它是正在进行的操作的实时反馈 */}
           {dragHint ? (
-            <span className="reject">{dragHint}</span>
+            <span className={dragHint.bad ? "reject" : "notice"}>{dragHint.text}</span>
           ) : error ? (
             <span className="reject">{error}</span>
           ) : lastRejection ? (

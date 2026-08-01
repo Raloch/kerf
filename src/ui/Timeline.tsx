@@ -837,8 +837,8 @@ function KeyframeLanes({
       setDrag(next);
       setDragHint(
         next.valid
-          ? `移到第 ${next.to} 帧`
-          : `第 ${next.to} 帧已经有一个关键帧了`,
+          ? { text: `移到第 ${next.to} 帧`, bad: false }
+          : { text: `第 ${next.to} 帧已经有一个关键帧了`, bad: true },
       );
     };
 
@@ -1191,15 +1191,19 @@ function ClipView({
         </span>
       )}
 
-      {/* 裁切手柄。窄片段也要留出可抓区域，否则短片段无法裁切 */}
+      {/* 裁切手柄。窄片段也要留出可抓区域，否则短片段无法裁切。
+          ⇧ / ⌘ 那两句同样写在拖动时的状态栏读数里（`trimReadout`）——tooltip 是
+          补充，不是唯一出口，hover 才看得见的解释等于没解释 */}
       <span
         className="grip l"
-        title={clip.kind === "media" ? "裁切入点（拖动同时改变引用源片的起点）" : "裁切入点"}
+        title={`${
+          clip.kind === "media" ? "裁切入点（拖动同时改变引用源片的起点）" : "裁切入点"
+        }\n⇧ 波纹：后面的片段跟着往前收\n⌘ 卷动：左边那段此消彼长，总长不变`}
         onPointerDown={(e) => drag.onHandlePointerDown(e, clip, trackId, "in")}
       />
       <span
         className="grip r"
-        title="裁切出点"
+        title={"裁切出点\n⇧ 波纹：后面的片段跟着动\n⌘ 卷动：右边那段此消彼长，总长不变"}
         onPointerDown={(e) => drag.onHandlePointerDown(e, clip, trackId, "out")}
       />
     </div>

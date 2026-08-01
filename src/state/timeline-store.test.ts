@@ -1240,3 +1240,100 @@ describe("入点 / 出点标记的 store 接线（D50）", () => {
     expect(s().lastRejection).toBeNull();
   });
 });
+
+describe("裁切三种模式的 store 接线（D56）", () => {
+  beforeEach(reset);
+
+  /** 导入一个带音轨的素材（产出链接的一对），再在画面轨上接一个副本当后继。 */
+  function twoOnV1(): void {
+    const s = useTimeline.getState();
+    s.addSource(source(300));
+    // 导入落点是主画面轨的末尾（D54），所以第二次导入天然接在第一个后面
+    s.addSource(source(300, { id: "src2", name: "second.mp4" }));
+  }
+
+  it("撤销标签按模式分开说", () => {
+    const s = () => useTimeline.getState();
+    twoOnV1();
+    const first = s().timeline().tracks.find((t) => t.id === "V1")!.clips[0]!;
+    s().trimClip(first.id, "out", -20);
+    expect(s().undoLabel()).toBe("裁切出点");
+    s().trimClip(first.id, "out", -20, "ripple");
+    expect(s().undoLabel()).toBe("波纹裁切出点");
+  });
+
+  it("合并键带模式：普通裁切和波纹裁切不合成一条撤销", () => {
+    const s = () => useTimeline.getState();
+    twoOnV1();
+    const first = s().timeline().tracks.find((t) => t.id === "V1")!.clips[0]!;
+    const base = s().history.past.length;
+    s().trimClip(first.id, "out", -10);
+    s().trimClip(first.id, "out", -10); // 同模式同边，合并
+    expect(s().history.past.length).toBe(base + 1);
+    s().trimClip(first.id, "out", -10, "ripple"); // 换模式，另起一条
+    expect(s().history.past.length).toBe(base + 2);
+    // 合并了的话 ⌘Z 一下会把波纹那次和之前的普通裁切一起撤掉，而它们动的东西
+    // 差着后面一整排片段
+  });
+
+  it("波纹裁切走 store 时后继真的跟着动，且一次撤销回得来", () => {
+    const s = () => useTimeline.getState();
+    twoOnV1();
+    const v1 = () => s().timeline().tracks.find((t) => t.id === "V1")!;
+    const [first, second] = [v1().clips[0]!, v1().clips[1]!];
+    const secondIn = second.timelineIn;
+    s().trimClip(first.id, "out", -30, "ripple");
+    expect(findClip(s().timeline(), second.id)?.clip.timelineIn).toBe(secondIn - 30);
+    // 声音那一边也跟着（音画链接 + 各自轨道的后继）
+    const audioPartner = s()
+      .timeline()
+      .tracks.find((t) => t.id === "A1")!.clips[0]!;
+    expect(audioPartner.timelineOut).toBe(first.timelineOut - 30);
+    s().undo();
+    expect(findClip(s().timeline(), second.id)?.clip.timelineIn).toBe(secondIn);
+  });
+
+  it("伙伴被挡住时报的是「声音 / 画面那一段」，措辞跟着被挡的那一边走", () => {
+    const s = () => useTimeline.getState();
+    s().addSource(source(300));
+    const a1 = s().timeline().tracks.find((t) => t.id === "A1")!;
+    const audioClip = a1.clips[0]!;
+    // 在声音那条轨上紧跟着放一段配乐，把画面片段的出点堵死
+    s().addSource(music());
+    const videoClip = s().timeline().tracks.find((t) => t.id === "V1")!.clips[0]!;
+    // 配乐落播放头（D54），播放头在 0，所以它压在 A2 上而不是 A1——先确认前提
+    expect(
+      s()
+        .timeline()
+        .tracks.find((t) => t.id === "A1")!
+        .clips.map((c) => c.id),
+    ).toEqual([audioClip.id]);
+    // 直接把画面拉到超过素材长度，报的是自己的原因，不冠"声音那一段"
+    s().trimClip(videoClip.id, "out", 500);
+    expect(s().lastRejection).toContain("源片末尾");
+    expect(s().lastRejection).not.toContain("那一段");
+  });
+
+  it("画面这边有空间而声音那边没有时，拒绝里点名是声音挡的", () => {
+    const s = () => useTimeline.getState();
+    const clipsOn = (id: string) => s().timeline().tracks.find((t) => t.id === id)!.clips;
+
+    s().addSource(source(600));
+    const av1 = clipsOn("V1")[0]!;
+    s().trimClip(av1.id, "out", -200); // 两边都收到 [0,400)，给出点留出余量
+
+    s().addSource(source(600, { id: "src2", name: "second.mp4" }));
+    const av2 = clipsOn("V1")[1]!;
+    // 解开第二对再把画面往后挪 100——这正是 J-cut 的形态：声音先进、画面后进
+    s().select(av2.id);
+    s().unlinkSelected();
+    s().moveClip(av2.id, 100);
+    expect(clipsOn("V1")[1]!.timelineIn).toBe(500);
+    expect(clipsOn("A1")[1]!.timelineIn).toBe(400); // 声音留在原处
+
+    // 画面到 500 才有邻居，声音 400 就撞上了
+    s().trimClip(av1.id, "out", 50);
+    expect(s().lastRejection).toContain("声音那一段");
+    expect(clipsOn("V1")[0]!.timelineOut).toBe(400); // 全体或拒绝：画面也没动
+  });
+});

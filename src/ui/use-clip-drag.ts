@@ -21,8 +21,9 @@ import {
   snapTargets,
   trimClip,
   type TrimEdge,
+  type TrimMode,
 } from "../state/operations";
-import { useTimeline } from "../state/timeline-store";
+import { useTimeline, type DragHint } from "../state/timeline-store";
 
 /**
  * 小于这个像素位移视为点击，不启动拖拽——否则点选片段会被当成微小拖动。
@@ -77,9 +78,24 @@ interface TrimSession {
   readonly originOut: number;
   readonly startX: number;
   readonly startY: number;
+  /**
+   * 普通 / 波纹 / 卷动，**在按下那一刻定死**。
+   *
+   * 不跟着修饰键实时变，因为松手也是一个事件：先松开 ⇧ 再松开鼠标的话，落下的
+   * 就成了另一种编辑，而用户全程看到的都是波纹的落点。这一点和 ⌥ 关磁吸刻意不同
+   * ——那个读实时的代价只是吸不吸，而这个决定的是"后面十个片段动不动"。
+   */
+  readonly mode: TrimMode;
 }
 
 type Session = MoveSession | TrimSession;
+
+/** 一次 pointermove 算出来的东西。`delta` 只有裁切那条路用（见 `computeTrim`）。 */
+interface Computed {
+  readonly ghosts: readonly Ghost[];
+  readonly snap: number | null;
+  readonly delta?: number;
+}
 
 export interface ClipDragApi {
   /** 拖拽中的落点，**一个或多个**（整组拖拽时每个片段一个）。空数组 = 没在拖。 */
@@ -123,9 +139,10 @@ export function useClipDrag(pxPerFrame: number): ClipDragApi {
 
   /** 只在提示变化时写 store，避免每次 pointermove 都触发全局订阅者重渲染。 */
   const publishHint = useCallback(
-    (next: string | null) => {
-      if (hint.current === next) return;
-      hint.current = next;
+    (next: DragHint | null) => {
+      const key = next === null ? null : `${next.bad ? "!" : ""}${next.text}`;
+      if (hint.current === key) return;
+      hint.current = key;
       setDragHint(next);
     },
     [setDragHint],
@@ -147,7 +164,7 @@ export function useClipDrag(pxPerFrame: number): ClipDragApi {
   }, []);
 
   const computeMove = useCallback(
-    (s: MoveSession, event: PointerEvent): { ghosts: readonly Ghost[]; snap: number | null } => {
+    (s: MoveSession, event: PointerEvent): Computed => {
       const group = s.followers.length > 0;
       const rawDelta = (event.clientX - s.startX) / pxPerFrame;
       let desiredIn = Math.max(0, Math.round(s.originIn + rawDelta));
@@ -216,7 +233,7 @@ export function useClipDrag(pxPerFrame: number): ClipDragApi {
   );
 
   const computeTrim = useCallback(
-    (s: TrimSession, event: PointerEvent): { ghosts: readonly Ghost[]; snap: number | null } => {
+    (s: TrimSession, event: PointerEvent): Computed => {
       const rawDelta = (event.clientX - s.startX) / pxPerFrame;
       let delta = Math.round(rawDelta);
       let snap: number | null = null;
@@ -231,11 +248,20 @@ export function useClipDrag(pxPerFrame: number): ClipDragApi {
         }
       }
 
-      const probe = trimClip(timeline, s.clipId, s.edge, delta);
-      // 幽灵按裁切后的边界画，即使非法也让用户看到自己拖到了哪
+      const probe = trimClip(timeline, s.clipId, s.edge, delta, s.mode);
+
+      /*
+        合法时**从结果里反推幽灵**，不手算。
+
+        这一次拖拽可能改动好几个片段：音画伙伴在另一条轨上、波纹把后面一整排往前
+        收、卷动动的是交界另一侧。手算一遍就是第二个真值来源，漏掉一类的表现是
+        "松手之后多动了几个我没看见的片段"——而差分不可能和被测对象漂开。
+      */
+      if (probe.changed) return { ghosts: diffGhosts(timeline, probe.timeline), snap, delta };
+
+      // 非法时结果里什么都没有，仍要让用户看到自己拖到了哪
       const inFrame = s.edge === "in" ? s.originIn + delta : s.originIn;
       const outFrame = s.edge === "in" ? s.originOut : s.originOut + delta;
-
       return {
         ghosts: [
           {
@@ -244,11 +270,13 @@ export function useClipDrag(pxPerFrame: number): ClipDragApi {
             trackId: s.trackId,
             inFrame,
             lengthFrames: Math.max(1, outFrame - inFrame),
-            valid: probe.changed && delta !== 0,
-            reason: probe.reason,
+            valid: false,
+            // 位移为 0 不是失败（`EditResult` 的第三态），报出来会在状态栏一直闪红字
+            reason: delta === 0 ? undefined : probe.reason,
           },
         ],
         snap,
+        delta,
       };
     },
     [pxPerFrame, playhead, snapEnabled, timeline],
@@ -280,7 +308,14 @@ export function useClipDrag(pxPerFrame: number): ClipDragApi {
         // 整组共用一个合法性，所以看第一个就够；写成"有没有任何一个非法"是一样的结果，
         // 但那种写法会让人以为这里允许部分合法
         const first = result.ghosts[0];
-        publishHint(!first || first.valid ? null : first.reason ?? "这里放不下");
+        const bad = first !== undefined && !first.valid;
+        publishHint(
+          bad
+            ? { text: first.reason ?? "这里放不下", bad: true }
+            : s.kind === "trim"
+              ? { text: trimReadout(s, result), bad: false }
+              : null,
+        );
       };
 
       const onUp = (e: PointerEvent) => {
@@ -311,11 +346,10 @@ export function useClipDrag(pxPerFrame: number): ClipDragApi {
                 move(s.clipId, delta, { toTrack: ghost.trackId, clampToBounds: false });
               }
             } else {
-              const delta =
-                s.edge === "in"
-                  ? ghost.inFrame - s.originIn
-                  : ghost.inFrame + ghost.lengthFrames - s.originOut;
-              trim(s.clipId, s.edge, delta);
+              // 位移由 `computeTrim` 直接给出，**不从幽灵反推**：合法时幽灵是从结果
+              // 差分出来的，第一个未必是用户拖的那个片段（波纹里可能是后继、卷动里
+              // 可能是交界另一侧），按它反推出来的帧数会指向另一条边
+              trim(s.clipId, s.edge, result.delta ?? 0, s.mode);
             }
           }
         }
@@ -379,7 +413,8 @@ export function useClipDrag(pxPerFrame: number): ClipDragApi {
   const onHandlePointerDown = useCallback(
     (event: ReactPointerEvent<HTMLElement>, clip: Clip, trackId: TrackId, edge: TrimEdge) => {
       // 裁切永远只作用于一个片段（多选裁切要么按各自长度按比例缩、要么全裁同一个量，
-      // 两种都不是明显正确的），所以按住边缘就把选中收缩成它自己——那是看得见的降级
+      // 两种都不是明显正确的），所以按住边缘就把选中收缩成它自己——那是看得见的降级。
+      // **音画伙伴不在此列**：那是"还有谁跟着变"，由纯函数回答，不走选中（D55）
       select(clip.id);
       begin(event, {
         kind: "trim",
@@ -390,6 +425,7 @@ export function useClipDrag(pxPerFrame: number): ClipDragApi {
         originOut: clip.timelineOut,
         startX: event.clientX,
         startY: event.clientY,
+        mode: trimModeOf(event),
       });
     },
     [begin, select],
@@ -402,6 +438,75 @@ export function useClipDrag(pxPerFrame: number): ClipDragApi {
     onClipPointerDown,
     onHandlePointerDown,
   };
+}
+
+/**
+ * 按下边缘手柄时按修饰键选模式。
+ *
+ * **⇧ = 波纹**，因为这个仓库里 ⇧ 已经表示波纹了（⇧⌫ 是波纹删除，右键菜单里写着）
+ * ——同一个字母表，用户学一次。**⌘ = 卷动**：⌘ 在片段上是"加减选择"，但手柄上
+ * 没有选择语义（按下就收缩成这一个），所以那个键在这里是空的。
+ *
+ * **⌥ 不能用**：它已经是"临时关掉磁吸"（PLAN.md 的 D2 承诺过），而裁切正是最需要
+ * 磁吸的操作之一。
+ *
+ * 两个键一起按时**卷动优先**——它是三者里唯一不改变总片长的，误判成波纹会把后面
+ * 一整排片段挪走，反过来只是少挪几个。
+ */
+function trimModeOf(event: { readonly shiftKey: boolean; readonly metaKey: boolean; readonly ctrlKey: boolean }): TrimMode {
+  if (event.metaKey || event.ctrlKey) return "roll";
+  return event.shiftKey ? "ripple" : "normal";
+}
+
+/**
+ * 裁切拖动中状态栏那一行。
+ *
+ * 普通裁切时**把另外两种模式说出来**，这是它们唯一能被发现的时机：⇧ 和 ⌘ 按在
+ * 手柄上，界面上没有任何东西提示它们存在，而写进 `title` 等于没写（hover 才看得见
+ * 的解释同 D3 / D44）。用户正拖着边缘的这一刻恰好就是他想要波纹的那一刻。
+ *
+ * 波纹和卷动时不再重复那句话，改成报"这次会动几个片段"——那是它们和普通裁切的
+ * 全部区别，而幽灵已经画出来了，这行字只是把数字说准。
+ */
+function trimReadout(session: TrimSession, result: Computed): string {
+  const delta = result.delta ?? 0;
+  const signed = `${delta > 0 ? "+" : ""}${delta}f`;
+  if (session.mode === "roll") return `卷动交界 ${signed}（总长不变）`;
+  if (session.mode === "ripple") {
+    return `波纹裁切 ${signed} · 跟着动 ${Math.max(0, result.ghosts.length - 1)} 个片段`;
+  }
+  return `裁切 ${signed} · ⇧ 波纹 · ⌘ 卷动`;
+}
+
+/**
+ * 差分两份时间轴，给每个位置或长度变了的片段一个幽灵。
+ *
+ * 这是"拖拽中会发生什么"的**唯一**答案（见 `computeTrim`）。判据是占位而不是整个
+ * 片段：裁入点会同时改 `sourceIn`，按深比较的话每个被裁的片段都会多报一次，而
+ * 幽灵画的是矩形、位置没变就没什么可画。
+ */
+function diffGhosts(before: Timeline, after: Timeline): Ghost[] {
+  const was = new Map<string, Clip>();
+  for (const track of before.tracks) for (const clip of track.clips) was.set(clip.id, clip);
+
+  const ghosts: Ghost[] = [];
+  for (const track of after.tracks) {
+    for (const clip of track.clips) {
+      const old = was.get(clip.id);
+      if (old && old.timelineIn === clip.timelineIn && old.timelineOut === clip.timelineOut) {
+        continue;
+      }
+      ghosts.push({
+        kind: "trim",
+        clipId: clip.id,
+        trackId: track.id,
+        inFrame: clip.timelineIn,
+        lengthFrames: clipDuration(clip),
+        valid: true,
+      });
+    }
+  }
+  return ghosts;
 }
 
 /** 整组拖拽要记住每个同伴的原位置和长度。找不到就跳过（选中集合可能刚被撤销掉一部分）。 */
