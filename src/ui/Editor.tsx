@@ -80,6 +80,7 @@ export function Editor({
   const playhead = useTimeline((s) => s.playhead);
   const selectedClipIds = useTimeline((s) => s.selectedClipIds);
   const lastRejection = useTimeline((s) => s.lastRejection);
+  const lastNotice = useTimeline((s) => s.lastNotice);
   const dragHint = useTimeline((s) => s.dragHint);
   const addSource = useTimeline((s) => s.addSource);
   const renameProject = useTimeline((s) => s.renameProject);
@@ -773,6 +774,9 @@ export function Editor({
             <span className="reject">{error}</span>
           ) : lastRejection ? (
             <span className="reject">{lastRejection}</span>
+          ) : lastNotice ? (
+            /* 中性提示排在拒绝**之后**：出错时那句更要紧，而两者不会同时存在 */
+            <span className="notice">{lastNotice}</span>
           ) : busy ? (
             busy
           ) : selected ? (

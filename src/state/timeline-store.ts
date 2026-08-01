@@ -141,6 +141,17 @@ export interface TimelineState {
   zoom: number;
   /** 最近一次被拒绝的操作原因，供 UI 提示；成功操作会清空。 */
   lastRejection: string | null;
+  /**
+   * 上一次编辑里**软件替用户多做的那一步**，中性语气，不是错误。
+   *
+   * 和 `lastRejection` 是一对而不是同一个：拒绝是"你要的事没做成"（状态栏红字），
+   * 这个是"你要的事做成了，另外还发生了一件你没要求、但在界面上看得见的事"——
+   * 目前唯一的来源是导入时自动新建了一条轨道。走红字会让一次正常的导入看起来
+   * 像出了错；不说则是让轨道数悄悄增长（同 D19 那条"看得见的降级要标注"）。
+   *
+   * 清除时机**只有 `apply()` 一处**（成功编辑就清），所以它不会一直挂在状态栏上。
+   */
+  lastNotice: string | null;
   /** 拖拽过程中的即时提示（落点非法的原因）。拖拽结束清空，不进撤销栈。 */
   dragHint: string | null;
   /**
@@ -169,7 +180,10 @@ export interface TimelineState {
   /**
    * 把素材加进项目并在时间轴上放好片段。**追加，不覆盖**——见 `addSource()`。
    *
-   * `timelineIn` 不传则放在播放头。放不下会走 `lastRejection` 提示，不静默换位置。
+   * `timelineIn` **通常不要传**：落点由 `importPlacement()` 按素材种类决定（带画面的
+   * 追加到主画面轨末尾、纯音频落在播放头）。传了就是强制，绕过那条判据。
+   * 都放不下时会新建一条轨道并把这件事报到 `lastRejection` 上——那不是拒绝，是
+   * "软件替你做了一步"，但同样得说出来。
    */
   addSource: (source: MediaSource, timelineIn?: number) => void;
   /**
@@ -358,6 +372,7 @@ export const useTimeline = create<TimelineState>((set, get) => {
     set((state) => ({
       history: commit(state.history, result.timeline, { label, coalesceKey, at: now() }),
       lastRejection: null,
+      lastNotice: null,
     }));
   }
 
@@ -407,6 +422,7 @@ export const useTimeline = create<TimelineState>((set, get) => {
     snapEnabled: true, // 默认开，见 PLAN.md 决策 D2
     zoom: 42,
     lastRejection: null,
+    lastNotice: null,
     dragHint: null,
 
     timeline: () => current(get().history),
@@ -421,8 +437,14 @@ export const useTimeline = create<TimelineState>((set, get) => {
 
     addSource(source, timelineIn) {
       const state = get();
-      const at = timelineIn ?? state.playhead;
-      const result = addSource(state.timeline(), { source, timelineIn: at });
+      // 落点的判据在 `importPlacement()` 里，不在这儿——store 只把播放头递进去。
+      // `timelineIn` 给了才是强制落点（`exactOptionalPropertyTypes` 下不能写
+      // `timelineIn: undefined`，那是另一种类型）
+      const result = addSource(state.timeline(), {
+        source,
+        playhead: state.playhead,
+        ...(timelineIn === undefined ? {} : { timelineIn }),
+      });
       if (!result.changed) {
         set({ lastRejection: result.reason ?? null });
         return;
@@ -439,6 +461,13 @@ export const useTimeline = create<TimelineState>((set, get) => {
         // 把它拨回 0 等于让"在播放头处插入"这件事自己失效
         selectedClipIds: result.clipIds?.[0] ? [result.clipIds[0]] : [],
         lastRejection: null,
+        // 自动新建的轨道要说出来（见 `lastNotice`）。这里直接写进同一次 set，
+        // 不像 `applyBatch` 那样分两步——那条纪律针对的是 `apply()` 会把消息擦掉，
+        // 而这一支根本没走 `apply()`
+        lastNotice:
+          result.addedTrackId === undefined
+            ? null
+            : `放不下，已新建轨道 ${result.addedTrackId}（撤销会一起去掉）`,
       }));
     },
 
@@ -838,6 +867,10 @@ export const useTimeline = create<TimelineState>((set, get) => {
         return {
           history,
           lastRejection: null,
+          // 撤销 / 重做**也要**清 `lastNotice`：它描述的是"上一次编辑里多做的那一步"，
+          // 撤销之后那句话就是假的——实测过，⌘Z 收走了刚建的 A3，状态栏还挂着
+          // 「已新建轨道 A3」。这两个动作不走 `apply()`，所以那一处清不到它们
+          lastNotice: null,
           // 撤销后选中的片段可能已不存在，清掉悬空引用（逐个过滤，不整体清空）
           selectedClipIds: liveSelection(timeline, state.selectedClipIds),
           playhead: Math.min(state.playhead, timeline.durationFrames),
@@ -852,6 +885,7 @@ export const useTimeline = create<TimelineState>((set, get) => {
         return {
           history,
           lastRejection: null,
+          lastNotice: null, // 同 undo：那句话描述的是上一次编辑，重做换了一次就不成立了
           selectedClipIds: liveSelection(timeline, state.selectedClipIds),
           playhead: Math.min(state.playhead, timeline.durationFrames),
         };

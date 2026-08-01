@@ -1427,6 +1427,14 @@
 .ed-foot .reject {
   color: var(--bad);
 }
+/*
+ * 「软件替你多做了一步」。刻意**不用 --bad**：那是"出事了"的颜色，而这句话描述的是
+ * 一次成功的编辑（见 store 里的 `lastNotice`）。用强调色 + 正常字重，比默认文字显眼
+ * 一档就够——它只活到下一次编辑。
+ */
+.ed-foot .notice {
+  color: var(--accent);
+}
 .ed .caps {
   display: flex;
   gap: 10px;

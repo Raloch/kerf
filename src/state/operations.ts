@@ -2216,13 +2216,71 @@ export const IMAGE_DEFAULT_SECONDS = 5;
 
 export interface AddSourceOptions {
   readonly source: MediaSource;
-  /** 片段放在哪一帧起。通常是播放头。 */
-  readonly timelineIn: number;
+  /**
+   * 播放头所在帧。**纯音频素材**（配乐 / 旁白）落在这里。
+   *
+   * 带画面的素材不看它——它们追加到主画面轨末尾，理由见 `importPlacement()`。
+   */
+  readonly playhead?: number;
+  /**
+   * 强制落点，**通常不要给**。给了就绕过 `importPlacement()` 那条判据。
+   *
+   * 留着它是为了两类调用方：单测和自检要摆出确定的时间轴（那时"落在哪"是前提
+   * 不是被测对象），以及将来"从素材库拖进时间轴"——那时落点由指针位置给出。
+   */
+  readonly timelineIn?: number;
 }
 
 export interface AddSourceResult extends EditResult {
   /** 新建出来的片段 id，画面在前。UI 用它选中新片段。 */
   readonly clipIds?: readonly ClipId[];
+  /**
+   * 为了放下它而**新建的轨道** id（`placeOnFirstFittingTrack` 的最后一步）。
+   *
+   * 要报出来：轨道数悄悄增长是"软件替我做了一件我没要求的事"，而它在时间轴上
+   * 看得见、却没人说过为什么多了一条（同 D19 那条"看得见的降级要标注"）。
+   * 这不走 `reason`——`apply()` 在 `changed:true` 时根本不看它（D42 踩过）。
+   */
+  readonly addedTrackId?: string;
+}
+
+/**
+ * 导入一个素材时，它的片段从第几帧开始。
+ *
+ * ## 带画面的素材追加到主画面轨末尾，而不是落在播放头
+ *
+ * 原来的落点是播放头，而播放头**在导入这个动作里几乎总是 0**（用户刚打开项目、
+ * 或者刚看完开头）。于是第二个素材盖在第一个上面、第三个被挤进「字幕 / 标题」轨、
+ * 第四个直接报"所有轨都放不下"**连素材库都进不去**——一次真实工作流实测（五个
+ * 素材）里，前三个落错轨、后两个导不进来，而我手动拖了四次才排成用户一开始就
+ * 想要的样子。**那四次拖拽是这条判据欠下的债。**
+ *
+ * "接着上一个"是粗剪的常态，也是唯一一个不需要用户先做别的事就成立的落点。
+ *
+ * ## 纯音频落在播放头，这个分岔有内容
+ *
+ * 配乐要盖住整片（播放头在 0 时正是如此），旁白要落在它解说的那一段上——两者的
+ * 位置都是**用户决定的**，而画面素材的位置几乎总是"接着上一个"。所以这不是
+ * "两种规则不一致"，是两类素材的意图本来就不同。
+ *
+ * ## "末尾"取那条轨自己的末尾，不取整条时间轴的
+ *
+ * 拿时间轴末尾会让一段长配乐把后续所有画面素材推到音乐结束之后去（实测那条 30 秒
+ * 配乐把 24 秒的片子拉长到 30 秒）。也不找中间的空档填——用户按的是"导入"，
+ * 期望是"加在后面"，往空洞里塞是另一件事（那是波纹插入，得单独设计）。
+ */
+export function importPlacement(
+  timeline: Timeline,
+  source: MediaSource,
+  playhead: number,
+): number {
+  if (source.kind === "audio") return playhead;
+  // 主画面轨 = 最下面那条（`placeOnFirstFittingTrack` 自下而上找的第一条）。
+  // 数组顺序就是 z 序、最上层在前，所以"最下面"是最后一条画面轨
+  const videoTracks = timeline.tracks.filter((t) => t.kind === "video");
+  const main = videoTracks[videoTracks.length - 1];
+  if (!main) return playhead;
+  return main.clips.reduce((end, clip) => Math.max(end, clip.timelineOut), 0);
 }
 
 /**
@@ -2245,7 +2303,8 @@ export interface AddSourceResult extends EditResult {
  * 就整体拒绝，不允许"画面放下了、声音挪到了别处"——那是音画错位而不是失败。
  */
 export function addSource(timeline: Timeline, options: AddSourceOptions): AddSourceResult {
-  const { source, timelineIn } = options;
+  const { source } = options;
+  const timelineIn = options.timelineIn ?? importPlacement(timeline, source, options.playhead ?? 0);
   if (!Number.isInteger(timelineIn) || timelineIn < 0) {
     return reject(timeline, "起点必须是非负整数帧");
   }
@@ -2310,13 +2369,15 @@ export function addSource(timeline: Timeline, options: AddSourceOptions): AddSou
 
   let next = withSource;
   const clipIds: ClipId[] = [];
+  let addedTrackId: string | undefined;
   for (const { clip, kind } of plan) {
     const placed = placeOnFirstFittingTrack(next, clip, kind);
     if (!placed.changed) return reject(timeline, placed.reason ?? "放不下");
     next = placed.timeline;
     clipIds.push(clip.id);
+    if (placed.addedTrackId !== undefined) addedTrackId = placed.addedTrackId;
   }
-  return { ...ok(next), clipIds };
+  return { ...ok(next), clipIds, ...(addedTrackId === undefined ? {} : { addedTrackId }) };
 }
 
 /**
@@ -2333,37 +2394,55 @@ export function renameProject(timeline: Timeline, rawName: string): EditResult {
   return ok({ ...timeline, name, namedByUser: true });
 }
 
+interface PlaceResult extends EditResult {
+  /** 为了放下这个片段而新建的轨道 id。没新建就没有这个字段。 */
+  readonly addedTrackId?: string;
+}
+
 /**
- * 在指定种类的轨道里挑第一条放得下的，把片段放进去。
+ * 在指定种类的轨道里挑第一条放得下的，把片段放进去；**都放不下就新建一条**。
  *
  * **画面轨的候选顺序是自下而上**（V1 → V2 → T1），和 `addTextClip` 相反：素材该
  * 落在「主视频」轨上，而文字该落在最上面的「字幕 / 标题」轨上。两者共用一个顺序
  * 的话，导入的第二个视频会跑到字幕轨顶上去。
+ *
+ * ## 为什么放不下时新建轨道，而不是拒绝
+ *
+ * 拒绝的实际形态是**素材连库都进不去**（`addSource` 整体回滚），而用户看到的只有
+ * 一句"所有音频轨在这个位置都放不下：与「某某」重叠"——**那句话没有出路**：
+ * 用户得自己想到"先去新建一条音频轨"。实测里加一段背景音乐就撞上了这个（配乐和
+ * 台标两个素材都导不进来），而 `addTrack` 从 D47 起就是现成的。
+ *
+ * 新建出来的轨道 id 要**报给调用方**（`addedTrackId`），理由见 `AddSourceResult`。
+ * 它跟着这一次导入进同一条撤销——⌘Z 一下，片段和那条新轨道一起消失。
+ *
+ * **锁定的轨道仍然只是跳过，不是新建的理由之一**：判据是"放得下吗"，而锁定的轨道
+ * 放不下。所以全锁的时候同样会新建一条——那是对的，用户锁轨的意思是"别动这几条"，
+ * 不是"别导入"。
  */
 function placeOnFirstFittingTrack(
   timeline: Timeline,
   clip: Clip,
   kind: TrackKind,
-): EditResult {
+): PlaceResult {
   const candidates = timeline.tracks.filter((t) => t.kind === kind);
   const ordered = kind === "video" ? [...candidates].reverse() : candidates;
-  if (ordered.length === 0) return reject(timeline, kind === "video" ? "没有画面轨" : "没有音频轨");
 
-  let lastReason = "";
   for (const track of ordered) {
-    if (track.locked) {
-      lastReason = `${track.label ?? track.id} 已锁定`;
-      continue;
-    }
-    const hits = collisionsIn(track, clip);
-    if (hits.length > 0) {
-      lastReason = `与「${hits[0]!.name ?? hits[0]!.id}」重叠`;
-      continue;
-    }
+    if (track.locked) continue;
+    if (collisionsIn(track, clip).length > 0) continue;
     return ok(mapTrack(timeline, track.id, (t) => withClips(t, [...t.clips, clip])));
   }
-  const what = kind === "video" ? "画面轨" : "音频轨";
-  return reject(timeline, `所有${what}在这个位置都放不下：${lastReason}`);
+
+  const created = addTrack(timeline, kind);
+  if (!created.changed || created.trackId === undefined) {
+    const what = kind === "video" ? "画面轨" : "音频轨";
+    return reject(timeline, `放不下，而且新建不了${what}：${created.reason ?? "未知原因"}`);
+  }
+  return {
+    ...ok(mapTrack(created.timeline, created.trackId, (t) => withClips(t, [...t.clips, clip]))),
+    addedTrackId: created.trackId,
+  };
 }
 
 /**

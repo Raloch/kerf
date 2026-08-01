@@ -89,14 +89,30 @@ describe("导入素材", () => {
     expect(a2[0]!.timelineIn).toBe(120);
   });
 
-  it("放不下时走 lastRejection 提示，不静默丢掉", () => {
+  it("音频轨占满时自动补一条，并走中性提示而不是红字", () => {
     useTimeline.getState().addSource(source(300));
     // 播放头停在视频片段中间：两条音频轨里 A1 被占、A2 空着，所以这次能放下；
     // 把 A2 也占满才拒绝
     const s0 = useTimeline.getState();
     s0.addSource(music("m1"), 0);
     useTimeline.getState().addSource(music("m2"), 0);
-    expect(useTimeline.getState().lastRejection).toContain("音频轨");
+    // 放不下不再是拒绝，而是自动补一条轨道——那件事要报出来，但**走中性提示
+    // 不走红字**：一次成功的导入不该看起来像出了错（见 store 的 `lastNotice`）
+    expect(useTimeline.getState().lastRejection).toBeNull();
+    expect(useTimeline.getState().lastNotice).toContain("A3");
+  });
+
+  it("撤销之后那条提示要消失——A3 已经不在了，留着就是一句假话", () => {
+    useTimeline.getState().addSource(source(300));
+    useTimeline.getState().addSource(music("m1"), 0);
+    useTimeline.getState().addSource(music("m2"), 0);
+    expect(useTimeline.getState().lastNotice).toContain("A3");
+    useTimeline.getState().undo();
+    // `undo()` / `redo()` 不走 `apply()`，所以那一处的清理够不到它们（浏览器实测抓到）
+    expect(useTimeline.getState().timeline().tracks.map((t) => t.id)).not.toContain("A3");
+    expect(useTimeline.getState().lastNotice).toBeNull();
+    useTimeline.getState().redo();
+    expect(useTimeline.getState().lastNotice).toBeNull();
   });
 });
 

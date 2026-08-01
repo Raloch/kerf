@@ -25,6 +25,7 @@ import {
   addFont,
   addLut,
   addSource,
+  importPlacement,
   addTrack,
   freezeClipAt,
   unfreezeClip,
@@ -1585,6 +1586,84 @@ describe("导入素材", () => {
 
   const trackClips = (tl: Timeline, id: string) => tl.tracks.find((t) => t.id === id)!.clips;
 
+  // ---- 落点：importPlacement（D54）----
+  //
+  // 这一组钉的是"导入的东西落在第几帧"。旧判据是播放头，而**播放头在导入这个动作里
+  // 几乎总是 0**，于是第二个素材盖在第一个上面、第三个被挤进字幕轨、第四个直接
+  // 导不进来。一次五素材的真实工作流实测里，前三个落错轨、后两个连素材库都没进。
+
+  it("第二个画面素材接在第一个后面，而不是盖在它上面", () => {
+    const first = addSource(emptyLayout(), { source: video("v1") });
+    // 播放头留在 0（缺省），旧行为会把它放在 [0,300) 和第一个完全重叠、被挤到 V2
+    const second = addSource(first.timeline, { source: video("v2"), playhead: 0 });
+    expect(second.changed).toBe(true);
+    expect(trackClips(second.timeline, "V1").map((c) => c.timelineIn)).toEqual([0, 300]);
+    // 都在主视频轨上——没有跑到叠加轨或字幕轨去
+    expect(trackClips(second.timeline, "V2")).toHaveLength(0);
+    expect(trackClips(second.timeline, "T1")).toHaveLength(0);
+    // 声音跟着画面同起点
+    expect(trackClips(second.timeline, "A1").map((c) => c.timelineIn)).toEqual([0, 300]);
+  });
+
+  it("第三个也接得上，不会被挤进「字幕 / 标题」轨", () => {
+    let tl = emptyLayout();
+    for (const id of ["v1", "v2", "v3"]) {
+      const r = addSource(tl, { source: video(id), playhead: 0 });
+      expect(r.changed).toBe(true);
+      tl = r.timeline;
+    }
+    expect(trackClips(tl, "V1").map((c) => c.timelineIn)).toEqual([0, 300, 600]);
+    expect(trackClips(tl, "T1")).toHaveLength(0);
+  });
+
+  it("纯音频落在播放头，不追加到末尾——配乐要盖住整片，旁白要落在它解说的那段上", () => {
+    const withVideo = addSource(emptyLayout(), { source: video("v1") });
+    const scored = addSource(withVideo.timeline, { source: music("m1"), playhead: 0 });
+    expect(scored.changed).toBe(true);
+    // A1 被画面素材的声音占着，所以落 A2——但**起点是播放头 0**，不是 A 轨末尾 300
+    expect(trackClips(scored.timeline, "A2")[0]!.timelineIn).toBe(0);
+  });
+
+  it("播放头不在 0 时，纯音频落在播放头（旁白）", () => {
+    const r = addSource(emptyLayout(), { source: music("m1"), playhead: 120 });
+    expect(trackClips(r.timeline, "A1")[0]!.timelineIn).toBe(120);
+  });
+
+  it("末尾取主画面轨自己的，不取整条时间轴的——长配乐不该把后续画面推到音乐之后", () => {
+    const withVideo = addSource(emptyLayout(), { source: video("v1") });        // V1 [0,300)
+    // 一段比画面长得多的配乐（900 帧）落在 A2
+    const long = music("m1", { durationMicros: 30_000_000 });
+    const scored = addSource(withVideo.timeline, { source: long, playhead: 0 });
+    expect(scored.timeline.durationFrames).toBeGreaterThan(300);
+    const next = addSource(scored.timeline, { source: video("v2"), playhead: 0 });
+    // 接在**画面**末尾 300，不是时间轴末尾 900
+    expect(trackClips(next.timeline, "V1").map((c) => c.timelineIn)).toEqual([0, 300]);
+  });
+
+  it("主画面轨中间有空档时仍然接到末尾，不往空洞里塞", () => {
+    const tl = emptyLayout();
+    const gapped: Timeline = {
+      ...tl,
+      tracks: tl.tracks.map((t) => (t.id === "V1" ? { ...t, clips: [clip("old", 400, 500)] } : t)),
+      sources: [source("src", 1000)],
+    };
+    // 0–400 空着，但"导入"的期望是"加在后面"——往空洞里塞是波纹插入，另一件事
+    const r = addSource(gapped, { source: video("v1"), playhead: 0 });
+    expect(trackClips(r.timeline, "V1").map((c) => c.timelineIn)).toEqual([400, 500]);
+  });
+
+  it("给了 timelineIn 就是强制落点，绕过这条判据", () => {
+    const first = addSource(emptyLayout(), { source: video("v1") });
+    const forced = addSource(first.timeline, { source: video("v2"), timelineIn: 1000 });
+    expect(trackClips(forced.timeline, "V1").map((c) => c.timelineIn)).toEqual([0, 1000]);
+  });
+
+  it("importPlacement 本身：空时间轴上带画面的素材落 0", () => {
+    expect(importPlacement(emptyLayout(), video("v1"), 90)).toBe(0);
+    // 而纯音频在同一条空时间轴上落播放头
+    expect(importPlacement(emptyLayout(), music("m1"), 90)).toBe(90);
+  });
+
   it("带音轨的画面素材同时铺到 V1 和 A1，两个片段起点相同", () => {
     const r = addSource(emptyLayout(), { source: video("v1"), timelineIn: 0 });
     expect(r.changed).toBe(true);
@@ -1655,7 +1734,7 @@ describe("导入素材", () => {
     expect(r.timeline.width).toBe(1920);
   });
 
-  it("音频放不下时整体拒绝，不允许「画面放下了、声音挪到别处」", () => {
+  it("音频轨全占满时新建一条，而不是把整次导入拒掉", () => {
     const tl = emptyLayout();
     const blocked: Timeline = {
       ...tl,
@@ -1665,11 +1744,33 @@ describe("导入素材", () => {
       sources: [source("src", 1000)],
     };
     const r = addSource(blocked, { source: video("v1"), timelineIn: 0 });
-    expect(r.changed).toBe(false);
-    expect(r.reason).toContain("音频轨");
-    // 画面片段和素材都不能留下——半成品比失败更坏
-    expect(trackClips(r.timeline, "V1")).toHaveLength(0);
-    expect(r.timeline.sources.map((s) => s.id)).toEqual(["src"]);
+    // 旧行为是整体拒绝，而那的实际形态是**素材连库都进不去**，且那句
+    // "所有音频轨在这个位置都放不下"没有出路（实测里加一段配乐就撞上了）
+    expect(r.changed).toBe(true);
+    expect(r.addedTrackId).toBe("A3");
+    expect(trackClips(r.timeline, "V1")).toHaveLength(1);
+    expect(trackClips(r.timeline, "A3")).toHaveLength(1);
+    // 核心不变量没变：两个片段仍然同起点，不允许"画面放下了、声音挪到别处"
+    expect(trackClips(r.timeline, "V1")[0]!.timelineIn).toBe(
+      trackClips(r.timeline, "A3")[0]!.timelineIn,
+    );
+  });
+
+  it("新建出来的轨道跟着这一次导入，是同一条撤销", () => {
+    const tl = emptyLayout();
+    const blocked: Timeline = {
+      ...tl,
+      tracks: tl.tracks.map((t) =>
+        t.kind === "audio" ? { ...t, clips: [clip(`${t.id}-old`, 0, 400)] } : t,
+      ),
+      sources: [source("src", 1000)],
+    };
+    const before = blocked.tracks.length;
+    const r = addSource(blocked, { source: video("v1"), timelineIn: 0 });
+    expect(r.timeline.tracks).toHaveLength(before + 1);
+    // 撤销栈存的是整份 Timeline，所以"轨道跟着一起回滚"是结构性的——这里钉的是
+    // 它确实在**同一个** result 里，而不是分两次编辑（那样要按两下 ⌘Z）
+    expect(r.changed).toBe(true);
   });
 
   const photo = (id: string, over: Partial<ImageSource> = {}): ImageSource => ({
@@ -3239,8 +3340,12 @@ describe("轨道增删", () => {
       source: source("src2", 100),
       timelineIn: 0,
     });
-    expect(readd.changed).toBe(false);
-    expect(readd.reason).toContain("没有画面轨");
+    // 一条画面轨都不剩时**自动补一条**（D54）。D47 立"不设下限"这个取舍时，配套
+    // 说法是"删空之后导入会带原因拒绝、出路是旁边的新建轨道"——那条出路现在由
+    // 软件自己走完了。**新建文字仍然拒绝**：`addTextClip` 有自己的候选循环
+    // （顺序相反、还支持指定轨道），没有共用这里的放置函数
+    expect(readd.changed).toBe(true);
+    expect(readd.addedTrackId).toBe("V1");
   });
 });
 
