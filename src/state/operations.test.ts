@@ -84,6 +84,9 @@ import {
   nextClip,
   junctionAt,
   slipClip,
+  defaultExportName,
+  slipRoomOf,
+  stripExtension,
 } from "./operations";
 
 // ---- 测试夹具 ----
@@ -2007,6 +2010,19 @@ describe("源片帧率 ≠ 项目帧率（混帧率项目）", () => {
     expect(slipClip(fast.timeline, c.id, 126).reason).toContain("源片末尾");
   });
 
+  it("滑移余量能单独问出来，而且**和 `slipClip` 是同一个答案**", () => {
+    // 界面靠它说"为什么拖不动"（`use-clip-drag` 的 `slipReadout`）。分开算一遍就是
+    // 第二个真值来源，漂了的表现是"读数说还能滑、实际一动不动"
+    const { tl, clip: c } = imported(av("slow", FPS.pal25, 375));
+    expect(slipRoomOf(tl, c.id)).toMatchObject({ back: 0, forward: 0 });
+    const cut = trimClip(tl, c.id, "out", -150).timeline;
+    const room = slipRoomOf(cut, c.id)!;
+    expect(room).toMatchObject({ back: 0, forward: 125 });
+    // 同一个数：余量的边界上能滑，再多一帧就拒绝
+    expect(slipClip(cut, c.id, room.forward).changed).toBe(true);
+    expect(slipClip(cut, c.id, room.forward + 1).reason).toContain("源片末尾");
+  });
+
   it("纯音频素材不受影响——它的栅格本来就是项目帧率", () => {
     // 这条是反向护栏：`gridsFor` 对纯音频返回项目帧率，所以换算是恒等。
     // 写死成"总是按 source.fps 换算"会在这里编译不过（音频素材没有 fps）
@@ -2143,12 +2159,21 @@ describe("项目名（D37）", () => {
     sources: [],
   });
 
-  it("导入第一个素材时自动用素材名", () => {
+  it("导入第一个素材时自动用素材名，**去掉扩展名**", () => {
     const r = addSource(emptyLayout(), { source: source("v1", 300), timelineIn: 0 });
     expect(r.changed).toBe(true);
-    expect(r.timeline.name).toBe("v1.mp4");
+    // 带着 `.mp4` 的话，项目在首页卡片和顶栏上读起来像一个文件；而导出的默认
+    // 文件名又是从项目名派生的，于是成片和源片同名（见 `defaultName`）
+    expect(r.timeline.name).toBe("v1");
     // 自动取名不算"用户给的"
     expect(r.timeline.namedByUser).toBeUndefined();
+  });
+
+  it("名字里的点号不是扩展名时不切", () => {
+    // 只切"最后一段且不超过 8 个字符"，否则 `2026.08.01 婚礼` 会被截成 `2026`
+    const dated = { ...source("v1", 300), id: "d1", name: "2026.08.01 婚礼粗剪" };
+    const r = addSource(emptyLayout(), { source: dated, timelineIn: 0 });
+    expect(r.timeline.name).toBe("2026.08.01 婚礼粗剪");
   });
 
   it("自动取名只做一次：第二个素材不改名", () => {
@@ -2158,7 +2183,42 @@ describe("项目名（D37）", () => {
       timelineIn: 400,
     });
     expect(second.changed).toBe(true);
-    expect(second.timeline.name).toBe("v1.mp4");
+    expect(second.timeline.name).toBe("v1");
+  });
+
+  it("`stripExtension` 只切像扩展名的那一段", () => {
+    expect(stripExtension("采访-主机位.mp4")).toBe("采访-主机位");
+    expect(stripExtension("bgm.MP3")).toBe("bgm");
+    expect(stripExtension("logo.webp")).toBe("logo");
+    // 没有扩展名：原样返回，不许返回空串（空名字在首页卡片上是一片空白）
+    expect(stripExtension("婚礼粗剪")).toBe("婚礼粗剪");
+    expect(stripExtension(".gitignore")).toBe(".gitignore");
+    // 点号不是分隔符的两种：带空格、以及长得不像扩展名
+    expect(stripExtension("2026.08.01 婚礼粗剪")).toBe("2026.08.01 婚礼粗剪");
+    expect(stripExtension("v1.第二版本备份")).toBe("v1.第二版本备份");
+    // 只切最后一段
+    expect(stripExtension("2026.08.01.mp4")).toBe("2026.08.01");
+  });
+
+  it("**导出名不许和任何一个素材同名**", () => {
+    // 同名的危险在 picker 那条路上：存回素材所在的目录 → 系统问"要替换吗" → 源文件没了，
+    // 而 IndexedDB 里还攥着那个 File 引用，下次打开走指认页
+    const r = addSource(emptyLayout(), { source: source("v1", 300), timelineIn: 0 });
+    expect(r.timeline.name).toBe("v1"); // 项目名 = 素材名去扩展名
+    expect(defaultExportName(r.timeline)).toBe("v1-导出");
+  });
+
+  it("导出名跟着**项目名**走，不跟第一个素材走", () => {
+    const r = addSource(emptyLayout(), { source: source("v1", 300), timelineIn: 0 });
+    const named = renameProject(r.timeline, "婚礼粗剪").timeline;
+    // 不重名就不加后缀——加了反而是噪声
+    expect(defaultExportName(named)).toBe("婚礼粗剪");
+    // 删掉素材也不影响（原来读 sources[0] 会退回 "kerf-export"）
+    expect(defaultExportName({ ...named, sources: [] })).toBe("婚礼粗剪");
+  });
+
+  it("没有项目名也没有素材时给一个兜底名，不给空串", () => {
+    expect(defaultExportName(emptyLayout())).toBe("kerf-export");
   });
 
   it("用户重命名过之后，导入素材不再自动改名", () => {

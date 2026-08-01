@@ -28,7 +28,7 @@ import { trackTransitionWindows } from "../edl/transition";
 import { linkedIds, findClip, TRANSITION_LABELS } from "../state/operations";
 import { framesToTimecode, secondsToFrameCount } from "../time/timebase";
 import { toNumber } from "../time/rational";
-import { useTimeline } from "../state/timeline-store";
+import { useTimeline, ZOOM_MAX, ZOOM_MIN } from "../state/timeline-store";
 import { ghostsForTrack, useClipDrag, type ClipDragApi, type Ghost } from "./use-clip-drag";
 import { useMarquee } from "./use-marquee";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
@@ -72,9 +72,13 @@ const ENVELOPE_REF_COLOR = "rgba(255, 255, 255, 0.18)";
  */
 const KF_DRAG_THRESHOLD_PX = 3;
 
-/** 缩放滑块的取值范围（每帧像素数 × 100）。 */
-const ZOOM_MIN = 8;
-const ZOOM_MAX = 200;
+/**
+ * 「缩放到适配」在右边留出的余量（像素）。
+ *
+ * 刚好铺满会让最后一个片段的右边缘贴着可视区边界，看起来像"还有内容被切掉了"；
+ * 留一点白之后"这就是全部"才读得出来。
+ */
+const FIT_MARGIN_PX = 24;
 
 /** 新建文字片段的默认时长（秒）。够读完一句话，又不至于压住下一句。 */
 const TEXT_CLIP_SECONDS = 3;
@@ -191,6 +195,43 @@ export function TimelinePanel() {
 
   // 时间轴至少铺满可视宽度，否则空项目时标尺是一条短线
   const contentWidth = Math.max(1, timeline.durationFrames) * pxPerFrame;
+
+  /**
+   * 缩放到刚好装下整条时间轴。
+   *
+   * 默认缩放下一条 43 秒的片子只占轨道宽的 3.4%（实测 52px / 1548px），而想看全貌就得
+   * 手拖滑块试——粗剪时"退一步看整体"是每隔几分钟就要做一次的动作。
+   *
+   * **可视宽度从 DOM 现量，不从常量推**：轨道头宽度是 CSS 变量（`--head-w`）、面板宽度
+   * 跟着窗口变，抄一份到 JS 里就是第二个真值来源，而漂了的表现是"适配完还差一截"或者
+   * "适配完最后一个片段被切掉"。同 D44 那条"量出来的尺寸与它现在在哪无关"。
+   */
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const headRef = useRef<HTMLDivElement>(null);
+  const zoomToFit = useCallback(() => {
+    const scroll = scrollRef.current;
+    const head = headRef.current;
+    if (!scroll || !head || timeline.durationFrames <= 0) return;
+    const avail = scroll.clientWidth - head.offsetWidth - FIT_MARGIN_PX;
+    if (avail <= 0) return;
+    setZoom((avail / timeline.durationFrames) * 100);
+    scroll.scrollLeft = 0;
+  }, [setZoom, timeline.durationFrames]);
+
+  // ⇧Z 缩放到适配（Resolve / FCP 都是这个键）。**不带 ⌘**——⌘⇧Z 是重做
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const el = e.target as HTMLElement | null;
+      if (el && /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) return;
+      if (e.metaKey || e.ctrlKey || e.altKey || !e.shiftKey) return;
+      // 判 `e.code`：⇧Z 在有些布局下 `key` 是 "Z"、有些是 "z"，而 code 恒定
+      if (e.code !== "KeyZ") return;
+      e.preventDefault();
+      zoomToFit();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [zoomToFit]);
 
   const scrubTo = useCallback(
     (clientX: number) => {
@@ -407,12 +448,30 @@ export function TimelinePanel() {
             onChange={(e) => setZoom(Number(e.target.value))}
           />
         </label>
+        {/*
+          「适配」放在滑块**旁边**而不是只给快捷键：⇧Z 没人猜得到，而这是粗剪时每隔
+          几分钟就要按一次的动作（同 D56 那条"写进 title 等于没写"）。空项目时禁掉
+          并说明——那时"适配"没有对象，而灰着不解释就是黑箱（D3）
+        */}
+        <button
+          type="button"
+          className="ib sm"
+          onClick={zoomToFit}
+          disabled={timeline.durationFrames <= 0}
+          title={
+            timeline.durationFrames > 0
+              ? "缩放到刚好装下整条时间轴（⇧Z）"
+              : "时间轴还是空的，没有可适配的内容"
+          }
+        >
+          适配
+        </button>
       </div>
 
-      <div className="tl-scroll">
+      <div className="tl-scroll" ref={scrollRef}>
         <div className="tl-inner" style={{ width: `calc(var(--head-w) + ${contentWidth}px)` }}>
           <div className="ruler">
-            <div className="rh">
+            <div className="rh" ref={headRef}>
               <span>时间码</span>
             </div>
             <div

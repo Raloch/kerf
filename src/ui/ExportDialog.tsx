@@ -45,6 +45,7 @@ import {
 import { loadSample, predict, sampleFromExport, saveSample } from "../export/throughput";
 import { clipsUsingEffects, markedRange, type RenderRange, type Timeline } from "../edl/types";
 import { observedCapabilities } from "../compose/backend";
+import { defaultExportName } from "../state/operations";
 import { formatDuration, frameToSeconds } from "../time/timebase";
 import { formatFps } from "../time/rational";
 import { IconCheck, IconDownload, IconFolder, IconNo, IconWarn, IconX } from "./icons";
@@ -80,7 +81,7 @@ export function ExportDialog({ timeline, caps, selectedRange, onClose }: ExportD
   const [scope, setScope] = useState<ExportScope>(() =>
     markedRange(timeline) ? "marked" : "all",
   );
-  const [baseName, setBaseName] = useState(() => defaultName(timeline));
+  const [baseName, setBaseName] = useState(() => defaultExportName(timeline));
   const [phase, setPhase] = useState<Phase>({ kind: "settings" });
   const handleRef = useRef<ExportHandle | null>(null);
   /**
@@ -991,7 +992,3 @@ function CapRow({
   );
 }
 
-function defaultName(timeline: Timeline): string {
-  const first = timeline.sources[0]?.name ?? "kerf-export";
-  return first.replace(/\.[^.]+$/, "");
-}

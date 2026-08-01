@@ -318,9 +318,45 @@ export function Editor({
       } catch (e) {
         setBusy(null);
         setError(e instanceof Error ? e.message : String(e));
+        throw e;
       }
     },
     [addSource],
+  );
+
+  /**
+   * 一次导入若干个文件。
+   *
+   * **必须串行**：落点由 `importPlacement()` 按"主画面轨自己的末尾"算（D54），而它读的
+   * 是**当前**时间轴——并发导入五个的话五个都算出同一个落点，然后互相挤，正是 D54 那一轮
+   * 实测里要消灭的形态。`addSource` 是同步的 store 动作，所以 `await` 完探针就够了。
+   *
+   * **一个失败不影响其余**：五个素材里有一个编码不认，不该把另外四个也拦下（同 D42 那条
+   * "部分成功是不是一个用户没要的新状态"——这里显然不是，导进来几个就是几个）。失败的
+   * 点名报出来，不能只说"有文件导入失败"。
+   */
+  const importFiles = useCallback(
+    async (files: readonly File[]) => {
+      const failed: string[] = [];
+      for (const [i, file] of files.entries()) {
+        // 多个文件时把进度写出来：探针要解码首帧，五个 4K 素材能跑好几秒，
+        // 而"读取素材…"一动不动看起来像卡住了
+        if (files.length > 1) setBusy(`读取素材 ${i + 1}/${files.length}：${file.name}`);
+        try {
+          await importFile(file);
+        } catch {
+          // 原因已由 importFile 写进 setError，这里只记下是哪个文件
+          failed.push(file.name);
+        }
+      }
+      setBusy(null);
+      if (failed.length > 0) {
+        setError(`这 ${failed.length} 个没能导入：${failed.join("、")}`);
+      } else if (files.length > 1) {
+        setError(null);
+      }
+    },
+    [importFile],
   );
 
   // 编辑相关快捷键。空格（播放/暂停）由 Preview 自己接，它持有播放状态
@@ -734,9 +770,12 @@ export function Editor({
                 // 音频也收：配乐和旁白是纯音频文件，而混流、波形、音量包络、
                 // 交叉淡化早就都能用了，此前缺的只有这个入口（见 `probeFile`）
                 accept="video/*,audio/*,image/*"
+                // 一次能选多个：真实工作流的第一步就是"把这条片子的素材都放进来"，
+                // 而没有它就要点五次（实测过）。落点仍然一个一个算，见 `importFiles`
+                multiple
                 onChange={(e) => {
-                  const file = e.target.files?.[0];
-                  if (file) void importFile(file);
+                  const files = [...(e.target.files ?? [])];
+                  if (files.length > 0) void importFiles(files);
                   e.target.value = ""; // 允许重复导入同一文件
                 }}
               />

@@ -100,6 +100,19 @@ import {
 } from "./operations";
 
 /**
+ * 时间轴缩放的取值范围（每帧像素数 × 100）。
+ *
+ * **只有这一份**：`setZoom` 的夹紧和缩放滑块的 `min`/`max` 必须是同一对数。原来滑块是
+ * `[8, 200]` 而 store 夹在 `[4, 400]`，两者不一致的表现是滑块拖到头了而实际还能更远
+ * ——「缩放到适配」算出 260 时滑块会停在 200 那一格上，看起来像它没生效。
+ *
+ * 下限选 2 是让「缩放到适配」真的适配得下：1400px 可视宽度上，2 能装下 70000 帧
+ * （@30fps 约 39 分钟）。再低下去滑块前半程就全是无法辨认的密度了。
+ */
+export const ZOOM_MIN = 2;
+export const ZOOM_MAX = 400;
+
+/**
  * 空项目：没有素材时的初始时间轴。默认 5 轨，见 PLAN.md 决策 D1。
  *
  * T1 的 `kind` 是 `"video"`，这是对的而不是笔误：轨道只分画面/声音两条通道，
@@ -961,8 +974,9 @@ export const useTimeline = create<TimelineState>((set, get) => {
     },
 
     setZoom(zoom) {
-      // 夹住范围：0 会让所有片段宽度归零，过大则一帧几十像素、滚动条失控
-      set({ zoom: Math.max(4, Math.min(400, Math.round(zoom))) });
+      // 夹住范围：0 会让所有片段宽度归零（而 `pxPerFrame` 还是除数，`scrubTo` 会算出
+      // Infinity），过大则一帧几十像素、滚动条失控
+      set({ zoom: Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, Math.round(zoom))) });
     },
 
     undo() {

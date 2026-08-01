@@ -18,6 +18,8 @@ import {
   moveClip,
   moveClips,
   findClip,
+  sideLabel,
+  slipRoomOf,
   snapDrag,
   snapFrame,
   snapTargets,
@@ -118,6 +120,13 @@ interface Computed {
   readonly ghosts: readonly Ghost[];
   readonly snap: number | null;
   readonly delta?: number;
+  /**
+   * 读数后面再追一句。目前只有滑移用：**夹紧发生在纯函数里，而"读数不再变"这个信号
+   * 太弱**——用满源片的片段从按下那一刻起读数就是 `0f`，一次也没变过，读起来是"这个
+   * 手势坏了"而不是"到头了"。所以到头要**说出来**（同 D40 那条：软件知道自己夹了一下
+   * 就得说出来）。
+   */
+  readonly note?: string;
 }
 
 export interface ClipDragApi {
@@ -338,9 +347,32 @@ export function useClipDrag(pxPerFrame: number): ClipDragApi {
         读的是 `getState()` 不是组件里那份 `timeline`：后者来自 React 闭包、比 store
         慢一拍，而 zustand 的 set 是同步的，这一句读到的就是刚写进去的值。
       */
-      const after = findClip(useTimeline.getState().timeline(), s.clipId)?.clip;
+      const settled = useTimeline.getState().timeline();
+      const after = findClip(settled, s.clipId)?.clip;
       const now = after?.kind === "media" ? after.sourceIn : s.originSourceIn;
-      return { ghosts: [], snap: null, delta: now - s.originSourceIn };
+      /*
+        到头了要**说出来**，不能只靠"读数不再变"。
+
+        D57 把后者当成了信号，而它太弱：一个用满源片的片段从按下那一刻起读数就是
+        `0f`，一次也没变过——用户看到的是"拖了没反应"，和手势坏了长得一模一样。
+        实测在真实工作流里撞到过（副机位余量为 0，拖了半天不知道为什么）。
+
+        判据是**意图和结果不一致**（`target !== now`），方向由两者的大小关系给，
+        卡住的是谁问 `slipRoomOf()`——**不在这里自己算一遍**，那就是第二个真值来源，
+        漂了的表现是"读数说是声音挡的，实际是画面"（同 D57 那条"卡住的是谁要记下来"）。
+      */
+      let note: string | undefined;
+      if (target !== now) {
+        const room = slipRoomOf(settled, s.clipId);
+        if (room) {
+          const atBack = target < now;
+          const blocker = atBack ? room.backBlocker : room.forwardBlocker;
+          // 伙伴挡住时要点名是哪一边：用户拖的是画面，而先到头的可能是声音
+          const who = blocker === s.clipId ? "" : `${sideLabel(settled, blocker)}那一段`;
+          note = `${who}已到源片${atBack ? "开头" : "末尾"}`;
+        }
+      }
+      return { ghosts: [], snap: null, delta: now - s.originSourceIn, ...(note ? { note } : {}) };
     },
     [pxPerFrame, slipTo],
   );
@@ -581,9 +613,11 @@ function trimReadout(session: TrimSession, result: Computed): string {
  */
 function slipReadout(session: SlipSession, result: Computed): string {
   const delta = result.delta ?? 0;
-  return `滑移 ${delta > 0 ? "+" : ""}${delta}f · 源片起点 ${session.originSourceIn} → ${
+  const head = `滑移 ${delta > 0 ? "+" : ""}${delta}f · 源片起点 ${session.originSourceIn} → ${
     session.originSourceIn + delta
   }`;
+  // 到头那一句见 `Computed.note`：只在拖过头时出现，正常拖动时这行字不变长
+  return result.note ? `${head} · ${result.note}` : head;
 }
 
 /**

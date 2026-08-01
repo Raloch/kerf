@@ -776,74 +776,24 @@ export function slipClip(
 ): EditResult {
   if (!Number.isInteger(sourceDeltaFrames)) return reject(timeline, "滑移量必须是整数帧");
 
-  const ids = linkedIds(timeline, [clipId]);
+  const targets = slipTargets(timeline, clipId);
+  if (typeof targets === "string") return reject(timeline, targets);
+  const room = roomOf(targets, clipId);
   const blame = (id: ClipId, why: string): string =>
     id === clipId ? why : `${sideLabel(timeline, id)}那一段：${why}`;
 
-  // 先各自算一遍能不能滑，再决定实际滑多少——夹紧必须**取整组的交集**，
-  // 各自夹各自的会让画面滑了 60 帧而声音只滑了 40，那就是音画错位
-  const targets: {
-    readonly trackId: TrackId;
-    readonly clip: MediaClip;
-    /** 上界，单位是**源片帧**（滑移量本来就是源片帧，见文件头）。 */
-    readonly limit: number;
-    /** 这个片段一共吃掉多少源片帧，已按 `gridsFor` 换算过。 */
-    readonly used: number;
-  }[] = [];
-  for (const id of ids) {
-    const found = findClip(timeline, id);
-    if (!found) return reject(timeline, `找不到片段 ${id}`);
-    if (found.track.locked) return reject(timeline, blame(id, "轨道已锁定"));
-    const { clip } = found;
-    if (clip.kind === "text") return reject(timeline, blame(id, "文字片段没有源片可滑移"));
-    if (clip.kind === "image") return reject(timeline, blame(id, "图片没有「源片的哪一刻」"));
-    const source = timeline.sources.find((s) => s.id === clip.sourceId);
-    const limit = source ? sourceDurationFrames(source, timeline.fps) : Number.MAX_SAFE_INTEGER;
-    const used = source
-      ? clipSourceFrames(clip, gridsFor(source, timeline.fps))
-      : clipDuration(clip);
-    targets.push({ trackId: found.track.id, clip, limit, used });
-  }
-
-  /*
-    夹紧必须**取整组的交集**，不能各自夹各自的。
-
-    伙伴共用同一个源片，但它们的 `sourceIn` 可以已经不同（比如只裁过一边的入点）。
-    各自夹到各自的边界，会让画面滑了 60 帧而声音只滑了 40——那就是音画错位，
-    而且是拖到头之后才出现，最难被发现的那一种。
-  */
-  let lowRoom = Infinity; // 还能往前滑多少（源片帧）
-  let highRoom = Infinity; // 还能往后滑多少
-  // **卡住的是谁要记下来**：交集只给出一个数字，而拒绝里必须说清是画面还是声音——
-  // 折成一个 min 之后那个信息就没了，表现是拖画面拖不动而拒绝指着画面（实际是
-  // 声音那一段先到头）。第一版就是这么写的，被单测抓住
-  let lowBlocker = clipId;
-  let highBlocker = clipId;
-  for (const t of targets) {
-    const low = t.clip.sourceIn;
-    const high = t.limit - t.clip.sourceIn - t.used;
-    if (low < lowRoom) {
-      lowRoom = low;
-      lowBlocker = t.clip.id;
-    }
-    if (high < highRoom) {
-      highRoom = high;
-      highBlocker = t.clip.id;
-    }
-  }
-
   if (options.clampToBounds !== true) {
-    if (sourceDeltaFrames < -lowRoom) {
-      return reject(timeline, blame(lowBlocker, "已经到源片开头，没有更多素材"));
+    if (sourceDeltaFrames < -room.back) {
+      return reject(timeline, blame(room.backBlocker, "已经到源片开头，没有更多素材"));
     }
-    if (sourceDeltaFrames > highRoom) {
-      return reject(timeline, blame(highBlocker, "已经到源片末尾，没有更多素材"));
+    if (sourceDeltaFrames > room.forward) {
+      return reject(timeline, blame(room.forwardBlocker, "已经到源片末尾，没有更多素材"));
     }
   }
 
   const delta =
     options.clampToBounds === true
-      ? Math.max(-lowRoom, Math.min(highRoom, sourceDeltaFrames))
+      ? Math.max(-room.back, Math.min(room.forward, sourceDeltaFrames))
       : sourceDeltaFrames;
   let working = timeline;
   for (const t of targets) {
@@ -854,6 +804,92 @@ export function slipClip(
   // 滑到头之后继续拖会一直发同一个值——那不是失败，是"值没变"（`EditResult` 第三态），
   // 报出来会让状态栏一直闪红字
   return moved ? ok(working) : unchanged(timeline);
+}
+
+/** 滑移要动的一个片段，连同它自己那两个边界。 */
+interface SlipTarget {
+  readonly trackId: TrackId;
+  readonly clip: MediaClip;
+  /** 源片上界，单位是**源片帧**（滑移量本来就是源片帧，见 `slipClip` 的文件头）。 */
+  readonly limit: number;
+  /** 这个片段一共吃掉多少源片帧，已按 `gridsFor` 换算过（D58）。 */
+  readonly used: number;
+}
+
+/** 这一次滑移要动哪些片段。返回 `string` = 拒绝原因（已经冠好"画面/声音那一段"）。 */
+function slipTargets(timeline: Timeline, clipId: ClipId): SlipTarget[] | string {
+  const blame = (id: ClipId, why: string): string =>
+    id === clipId ? why : `${sideLabel(timeline, id)}那一段：${why}`;
+  const targets: SlipTarget[] = [];
+  for (const id of linkedIds(timeline, [clipId])) {
+    const found = findClip(timeline, id);
+    if (!found) return `找不到片段 ${id}`;
+    if (found.track.locked) return blame(id, "轨道已锁定");
+    const { clip } = found;
+    if (clip.kind === "text") return blame(id, "文字片段没有源片可滑移");
+    if (clip.kind === "image") return blame(id, "图片没有「源片的哪一刻」");
+    const source = timeline.sources.find((s) => s.id === clip.sourceId);
+    const limit = source ? sourceDurationFrames(source, timeline.fps) : Number.MAX_SAFE_INTEGER;
+    const used = source
+      ? clipSourceFrames(clip, gridsFor(source, timeline.fps))
+      : clipDuration(clip);
+    targets.push({ trackId: found.track.id, clip, limit, used });
+  }
+  return targets;
+}
+
+/**
+ * 滑移余量：两个方向各还能滑多少源片帧，以及各自**是谁先到头的**。
+ *
+ * 界面拿它说"为什么拖不动"（见 `use-clip-drag` 的 `slipReadout`）。做成导出的查询而不是
+ * 让界面自己算一遍：那就是第二个真值来源，而漂了的表现是"读数说还能滑、实际一动不动"。
+ */
+export interface SlipRoom {
+  /** 还能往前滑多少（源片帧，非负）。 */
+  readonly back: number;
+  /** 还能往后滑多少（源片帧，非负）。 */
+  readonly forward: number;
+  /** 往前拖到头时，先撞上的是哪个片段（可能是音画伙伴）。 */
+  readonly backBlocker: ClipId;
+  /** 往后拖到头时同理。 */
+  readonly forwardBlocker: ClipId;
+}
+
+/**
+ * 夹紧必须**取整组的交集**，不能各自夹各自的。
+ *
+ * 伙伴共用同一个源片，但它们的 `sourceIn` 可以已经不同（比如只裁过一边的入点）。
+ * 各自夹到各自的边界，会让画面滑了 60 帧而声音只滑了 40——那就是音画错位，而且是
+ * 拖到头之后才出现，最难被发现的那一种。
+ *
+ * **卡住的是谁要记下来**：交集只给出一个数字，而拒绝和读数里必须说清是画面还是声音
+ * ——折成一个 `min` 之后那个信息就没了，表现是拖画面拖不动而拒绝指着画面（实际是声音
+ * 那一段先到头）。第一版就是折成一个数字写的，被单测抓住。
+ */
+function roomOf(targets: readonly SlipTarget[], clipId: ClipId): SlipRoom {
+  let back = Infinity;
+  let forward = Infinity;
+  let backBlocker = clipId;
+  let forwardBlocker = clipId;
+  for (const t of targets) {
+    const low = t.clip.sourceIn;
+    const high = t.limit - t.clip.sourceIn - t.used;
+    if (low < back) {
+      back = low;
+      backBlocker = t.clip.id;
+    }
+    if (high < forward) {
+      forward = high;
+      forwardBlocker = t.clip.id;
+    }
+  }
+  return { back, forward, backBlocker, forwardBlocker };
+}
+
+/** 这个片段还能滑多少。滑不动（文字 / 图片 / 轨道锁定 / 找不到）时返回 null。 */
+export function slipRoomOf(timeline: Timeline, clipId: ClipId): SlipRoom | null {
+  const targets = slipTargets(timeline, clipId);
+  return typeof targets === "string" ? null : roomOf(targets, clipId);
 }
 
 /** 紧跟在这个片段之后的片段；中间有空档或它是最后一个时返回 null。 */
@@ -2849,6 +2885,45 @@ export interface AddSourceResult extends EditResult {
  * 配乐把 24 秒的片子拉长到 30 秒）。也不找中间的空档填——用户按的是"导入"，
  * 期望是"加在后面"，往空洞里塞是另一件事（那是波纹插入，得单独设计）。
  */
+/**
+ * 去掉文件名末尾的扩展名。**项目名和导出名共用这一个**。
+ *
+ * 项目自动取名原来直接用素材文件名，于是项目叫「采访-主机位.mp4」——一个**项目**
+ * 带着 `.mp4` 后缀，在首页卡片和顶栏上都读起来像一个文件。而导出面板的默认文件名
+ * 又是从项目名派生的，于是成片跟着叫同一个名字（见 `defaultName`）。
+ *
+ * 只切最后一段，且**要求它是 1–8 个字母数字**：`2026.08.01 婚礼粗剪` 里的点号不是
+ * 扩展名分隔符，宽松一点（比如"不含点和斜杠"）会把它截成 `2026.08`——单测抓到过。
+ * 没有扩展名时原样返回；`.gitignore` 这种全是扩展名的名字同样原样返回。
+ */
+export function stripExtension(name: string): string {
+  return name.replace(/(?!^)\.[A-Za-z0-9]{1,8}$/, "") || name;
+}
+
+/**
+ * 导出文件名的默认值（不含扩展名）。
+ *
+ * **跟着项目名走，不跟第一个素材走**：用户给项目改了名之后导出该跟着改，而原来读
+ * `sources[0].name` 意味着重命名毫无影响，何况那个素材可能早就被删掉了。
+ *
+ * **不能和任何一个素材同名。** 项目名默认就是第一个素材的名字（去掉扩展名），于是
+ * `采访-主机位.mp4` 会导出成 `采访-主机位.mp4`——picker 那条路上用户很容易存回素材
+ * 所在的目录，系统问一句"要替换吗"、点了是，**源文件就没了**；而 Kerf 的 IndexedDB
+ * 里还攥着那个 `File` 引用，下次打开走 D37 的指认页。下载那条路会自动改成
+ * `xxx (1).mp4` 不至于丢东西，但两条路不该有一条是危险的。
+ *
+ * 重名时加后缀而不是加序号：`-导出` 说得清它是什么，`-2` 说不清。用户当然可以在面板
+ * 里改回去——那是他自己按的，和软件替他填一个危险的默认值是两回事。
+ *
+ * 比的是**去掉扩展名之后**的素材名，不含容器后缀：用户能在面板里把 mp4 换成 webm，
+ * 按当前扩展名判会让这个默认值跟着容器忽隐忽现。
+ */
+export function defaultExportName(timeline: Timeline): string {
+  const base = stripExtension(timeline.name ?? timeline.sources[0]?.name ?? "kerf-export");
+  const taken = new Set(timeline.sources.map((s) => stripExtension(s.name)));
+  return taken.has(base) ? `${base}-导出` : base;
+}
+
 export function importPlacement(
   timeline: Timeline,
   source: MediaSource,
@@ -2901,7 +2976,7 @@ export function addSource(timeline: Timeline, options: AddSourceOptions): AddSou
   // `namedByUser` 在 `name` 已存在时必然挡不上什么，但作为判据显式写出来——
   // "用户重命名过之后不再自动"靠的是标志，不是猜（D37）
   if (conformed.name === undefined && conformed.namedByUser !== true) {
-    conformed = { ...conformed, name: source.name };
+    conformed = { ...conformed, name: stripExtension(source.name) };
   }
   /**
    * 片段初始有多长，单位是**时间轴帧**。
