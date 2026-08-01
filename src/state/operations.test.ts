@@ -80,6 +80,7 @@ import {
   trimClip,
   nextClip,
   junctionAt,
+  slipClip,
 } from "./operations";
 
 // ---- 测试夹具 ----
@@ -3917,6 +3918,138 @@ describe("卷动交界（D56）", () => {
     expect(span(r.timeline, "aa")).toEqual([0, 125]);
     expect(span(r.timeline, "ba")).toEqual([125, 200]);
     expect(media(findClip(r.timeline, "ba")?.clip).sourceIn).toBe(325);
+  });
+});
+
+describe("滑移（D57）", () => {
+  /** 一个片段用源片 100..400（两头各留 100 帧余量），源片 500 帧。 */
+  function slippable(): Timeline {
+    return timeline([{ id: "V1", kind: "video", clips: [clip("a", 0, 300, 100)] }], 500);
+  }
+
+  it("占位一帧不动，只换 sourceIn", () => {
+    const r = slipClip(slippable(), "a", 60);
+    expect(r.changed).toBe(true);
+    expect(span(r.timeline, "a")).toEqual([0, 300]); // 位置和长度都没动
+    expect(media(findClip(r.timeline, "a")?.clip).sourceIn).toBe(160);
+    expect(r.timeline.durationFrames).toBe(300);
+  });
+
+  it("往前滑到源片开头就拒绝，不夹紧", () => {
+    const r = slipClip(slippable(), "a", -101);
+    expect(r.changed).toBe(false);
+    expect(r.reason).toContain("源片开头");
+    expect(media(r.timeline.tracks[0]!.clips[0]!).sourceIn).toBe(100); // 一帧都没动
+    expect(slipClip(slippable(), "a", -100).changed).toBe(true); // 正好到头是允许的
+  });
+
+  it("往后滑到源片末尾就拒绝", () => {
+    // 用了 100..400，源片 500，所以最多再往后 100
+    expect(slipClip(slippable(), "a", 100).changed).toBe(true);
+    const r = slipClip(slippable(), "a", 101);
+    expect(r.changed).toBe(false);
+    expect(r.reason).toContain("源片末尾");
+  });
+
+  it("拖拽时夹紧，而夹到头之后继续拖是「值没变」不是失败", () => {
+    const clamped = slipClip(slippable(), "a", 999, { clampToBounds: true });
+    expect(clamped.changed).toBe(true);
+    expect(media(findClip(clamped.timeline, "a")?.clip).sourceIn).toBe(200); // 100 + 100
+
+    // 已经贴着上界了，再往后拖一次——`changed:false` 且**不给 reason**，
+    // 否则状态栏会在整个拖拽后半程一直闪红字（`EditResult` 第三态）
+    const again = slipClip(clamped.timeline, "a", 50, { clampToBounds: true });
+    expect(again.changed).toBe(false);
+    expect(again.reason).toBeUndefined();
+  });
+
+  it("关键帧不动——偏移相对片段起点，而滑移不动起点", () => {
+    const withKf = setKeyframe(slippable(), "a", "opacity", 40, 0.5).timeline;
+    const r = slipClip(withKf, "a", 60);
+    expect(findClip(r.timeline, "a")?.clip.keyframes?.opacity?.[0]?.frame).toBe(40);
+  });
+
+  it("音画伙伴一起滑", () => {
+    const av: MediaClip = { ...clip("av", 0, 200, 100), linkId: "L1" };
+    const aa: MediaClip = { ...clip("aa", 0, 200, 100), linkId: "L1" };
+    const t = timeline(
+      [
+        { id: "V1", kind: "video", clips: [av] },
+        { id: "A1", kind: "audio", clips: [aa] },
+      ],
+      500,
+    );
+    const r = slipClip(t, "av", 50);
+    expect(media(findClip(r.timeline, "av")?.clip).sourceIn).toBe(150);
+    expect(media(findClip(r.timeline, "aa")?.clip).sourceIn).toBe(150);
+  });
+
+  it("夹紧取整组的交集，不许各夹各的", () => {
+    /*
+      伙伴共用源片但 `sourceIn` 已经不同（只裁过一边的入点）。各自夹各自的会让画面
+      滑了 100 而声音只滑了 20——音画错位，且只在拖到头之后才出现。
+    */
+    const av: MediaClip = { ...clip("av", 0, 200, 100), linkId: "L1" };
+    const aa: MediaClip = { ...clip("aa", 0, 200, 20), linkId: "L1" };
+    const t = timeline(
+      [
+        { id: "V1", kind: "video", clips: [av] },
+        { id: "A1", kind: "audio", clips: [aa] },
+      ],
+      500,
+    );
+    const r = slipClip(t, "av", -999, { clampToBounds: true });
+    // 交集是 min(100, 20) = 20
+    expect(media(findClip(r.timeline, "av")?.clip).sourceIn).toBe(80);
+    expect(media(findClip(r.timeline, "aa")?.clip).sourceIn).toBe(0);
+  });
+
+  it("伙伴到源片末尾时整次拒绝，并说清是哪一边", () => {
+    const av: MediaClip = { ...clip("av", 0, 200, 100), linkId: "L1" };
+    const aa: MediaClip = { ...clip("aa", 0, 200, 290), linkId: "L1" }; // 只剩 10 帧余量
+    const t = timeline(
+      [
+        { id: "V1", kind: "video", clips: [av] },
+        { id: "A1", kind: "audio", clips: [aa] },
+      ],
+      500,
+    );
+    const r = slipClip(t, "av", 50);
+    expect(r.changed).toBe(false);
+    expect(r.reason).toContain("声音那一段");
+    expect(r.reason).toContain("源片末尾");
+  });
+
+  it("文字和图片滑不动，拒绝而不是静默无效", () => {
+    const t = timeline([{ id: "T1", kind: "video", clips: [textClip("x", 0, 100)] }]);
+    const r = slipClip(t, "x", 10);
+    expect(r.changed).toBe(false);
+    expect(r.reason).toContain("文字片段没有源片");
+  });
+
+  it("锁定的轨道拒绝", () => {
+    const t = setTrackFlag(slippable(), "V1", "locked", true).timeline;
+    expect(slipClip(t, "a", 10).reason).toContain("轨道已锁定");
+  });
+
+  it("变速片段的上界按消耗的源片帧算，不是按占位", () => {
+    const fast: MediaClip = { ...clip("a", 0, 300, 100), speed: { num: 2, den: 1 } };
+    const t = timeline([{ id: "V1", kind: "video", clips: [fast] }], 800);
+    // 末帧落在 sourceIn + (L−1)×speed，所以是 599 而不是 600（见 `clipSourceFrames`）
+    expect(clipSourceFrames(fast)).toBe(599);
+    // 余量 = 800 − 100 − 599 = 101。按占位算（300）会算出 400，多放 299 帧
+    expect(slipClip(t, "a", 101).changed).toBe(true);
+    expect(slipClip(t, "a", 102).reason).toContain("源片末尾");
+  });
+
+  it("定格片段可以滑——那正好是「换一张定住的画面」", () => {
+    const frozen: MediaClip = { ...clip("a", 0, 300, 100), freeze: true };
+    const t = timeline([{ id: "V1", kind: "video", clips: [frozen] }], 500);
+    const r = slipClip(t, "a", 60);
+    expect(media(findClip(r.timeline, "a")?.clip).sourceIn).toBe(160);
+    // 定格只消耗 1 帧，所以上界收到"最后一帧"而不是"最后 300 帧"
+    expect(slipClip(t, "a", 399).changed).toBe(true);
+    expect(slipClip(t, "a", 400).reason).toContain("源片末尾");
   });
 });
 

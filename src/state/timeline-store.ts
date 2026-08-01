@@ -94,6 +94,7 @@ import {
   type TransformPatch,
   type ClipboardEntry,
   sideLabel,
+  slipClip,
   type TrimEdge,
   type TrimMode,
 } from "./operations";
@@ -229,6 +230,24 @@ export interface TimelineState {
    * （和它的音画伙伴——那一条在纯函数里，界面探路和真正提交才不会分叉）。
    */
   trimClip: (clipId: ClipId, edge: TrimEdge, deltaFrames: number, mode?: TrimMode) => void;
+  /**
+   * 滑移：占位不动，换掉用的是源片哪一段（**D57**）。`sourceDeltaFrames` 的单位是
+   * **源片帧**（见 `slipClip`）。
+   *
+   * `clampToBounds` 给拖拽用。滑移**没有位置幽灵可画**——占位一帧不动，画一个
+   * 和原片段完全重合的矩形只会让人以为卡住了——所以它是这个仓库里唯一**边拖边提交**
+   * 的片段编辑，缩略图和预览就是它的反馈。合并键让整条拖拽只进一条撤销。
+   */
+  slipClip: (clipId: ClipId, sourceDeltaFrames: number, clampToBounds?: boolean) => void;
+  /**
+   * 拖拽用的滑移：给**绝对目标**（源片第几帧），差值由 store 自己算（**D57**）。
+   *
+   * 和 `slipClip` 收增量是一对，同 `dragClipTo` / `moveClip`。收增量的版本在
+   * 边拖边提交时**会重复施加**：调用方要先知道"现在是多少"才能算差值，而它手里那份
+   * 时间轴来自 React 闭包、比 store 慢一拍——浏览器实测过，读数说「150 → 50」而实际
+   * 落到 0，再往回拖一次说「0 → 100」而实际到 300。同 D50 那条"在 store 里读播放头"。
+   */
+  slipClipTo: (clipId: ClipId, targetSourceIn: number) => void;
   splitAtPlayhead: () => void;
   removeSelected: (ripple?: boolean) => void;
   /**
@@ -622,6 +641,27 @@ export const useTimeline = create<TimelineState>((set, get) => {
         // **合并键带模式**：普通裁切和波纹裁切改变的东西不是一回事（后者还挪了后继
         // 片段），合成一条撤销会让 ⌘Z 一下把两次都撤掉。卷动同理
         `trim:${mode}:${edge}:${clipId}`,
+      );
+    },
+
+    slipClip(clipId, sourceDeltaFrames, clampToBounds = false) {
+      apply(
+        slipClip(get().timeline(), clipId, sourceDeltaFrames, { clampToBounds }),
+        "滑移片段",
+        `slip:${clipId}`,
+      );
+    },
+
+    slipClipTo(clipId, targetSourceIn) {
+      const timeline = get().timeline();
+      const found = findClip(timeline, clipId);
+      // 差值在这里算，不让调用方算——理由见接口那段注释
+      const now = found?.clip.kind === "media" ? found.clip.sourceIn : null;
+      if (now === null) return;
+      apply(
+        slipClip(timeline, clipId, targetSourceIn - now, { clampToBounds: true }),
+        "滑移片段",
+        `slip:${clipId}`,
       );
     },
 

@@ -585,18 +585,37 @@ function SourceSection({
   readonly clip: MediaClip;
   readonly timeline: Timeline;
 }) {
+  const slip = useTimeline((s) => s.slipClip);
   return (
     <>
       <div className="grp-title">源片引用</div>
       <div className="fields">
+        {/* 改这个数就是滑移：占位一帧不动，只换用的是源片哪一段（**D57**）。
+            做成可编辑而不是只读，是因为 ⇧ 拖片段那个手势**在界面上看不见**——
+            这一行是它唯一能被发现的地方，顺带也是精确输入的入口（"从第 210 帧开始"
+            用拖的量不出来）。写入走 `slipClip`，所以音画伙伴和源片边界的判据
+            和拖拽那条路是同一份 */}
         <div className="f">
           <label>源起始帧</label>
-          <span className="val">{clip.sourceIn}</span>
+          <NumberField
+            value={clip.sourceIn}
+            min={0}
+            max={Number.MAX_SAFE_INTEGER}
+            step={1}
+            digits={0}
+            suffix="f"
+            title="滑移：只换用源片的哪一段，占位不动"
+            onCommit={(next) => slip(clip.id, Math.round(next) - clip.sourceIn)}
+          />
         </div>
         <div className="f">
           <label>源时间码</label>
           <span className="val">{framesToTimecode(clip.sourceIn, timeline.fps)}</span>
         </div>
+        <p className="hint">
+          改它 = 滑移：片段在时间轴上的位置和长度都不动，只换用源片的哪一段。
+          在片段上按住 ⇧ 横向拖也是这个。
+        </p>
       </div>
     </>
   );

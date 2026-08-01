@@ -729,6 +729,117 @@ export function trimClip(
   return ok(working);
 }
 
+/**
+ * 滑移：**占位一帧不动，换掉用的是源片哪一段**。
+ *
+ * 这是这一族里唯一**没有替代做法**的操作——波纹裁切能由裁切 + 整组平移凑出来，
+ * 卷动能由两次裁切凑出来，滑动能由两次波纹裁切凑出来，而"这个镜头挑得对、但我想
+ * 用它晚两秒的那一段"在别的操作里**根本表达不出来**：裁一刀会改长度，挪一下会改
+ * 位置，两者都不是用户要的。
+ *
+ * ## 三条边界
+ *
+ * **关键帧不动。** 偏移是相对片段起点的（D10），而滑移不动片段起点——这一条是
+ * 机械的，不需要再讲道理。对比裁入点：那里起点真的挪了，所以要平移。顺带也符合
+ * 直觉：第 2 秒的淡入应该留在第 2 秒，而不是跟着素材跑掉。
+ *
+ * **两端一起判，而且是"全体或拒绝"。** 往前滑到 `sourceIn < 0`、往后滑到用超源片
+ * 末尾，两种都拒绝。夹到边界上是错的：那会让"滑到头了"表现成"还在动但越来越慢"，
+ * 而用户看不出自己已经到底了（同 D46 / D50 那条"拒绝而不夹紧"）。**但拖拽是例外**，
+ * 见 `clampToBounds`。
+ *
+ * **图片和文字滑不动。** 图片有 `sourceId` 却没有"源片的哪一刻"（D36），文字连
+ * 源片都没有；两者都拒绝而不是静默无效（D19 那类最坏的一档）。**定格片段可以滑**
+ * ——那正好就是"换一张定住的画面"，而 `clipSourceFrames` 对它返回 1，上界自然收成
+ * "最后一帧"。
+ *
+ * ## 单位是**源片帧**，不是时间轴帧
+ *
+ * 别处的编辑都收时间轴帧（那是用户在屏幕上量的东西），这里刻意不是：滑移改的就是
+ * `sourceIn`，而它的单位本来就是源片帧。收时间轴帧的话要在这里乘一次速度，**而伙伴
+ * 的速度未必和被拖的那个相同**（改速度不联动，见 D55）——两边各乘各的会让它们滑到
+ * 源片的不同位置上，看起来同步、内容错开。收源片帧则整组共用一个数，这一类漂不出来。
+ * 像素 → 源片帧那一步的换算归调用方（`use-clip-drag` 里乘被拖那个片段的速度）。
+ */
+export function slipClip(
+  timeline: Timeline,
+  clipId: ClipId,
+  sourceDeltaFrames: number,
+  options: { readonly clampToBounds?: boolean } = {},
+): EditResult {
+  if (!Number.isInteger(sourceDeltaFrames)) return reject(timeline, "滑移量必须是整数帧");
+
+  const ids = linkedIds(timeline, [clipId]);
+  const blame = (id: ClipId, why: string): string =>
+    id === clipId ? why : `${sideLabel(timeline, id)}那一段：${why}`;
+
+  // 先各自算一遍能不能滑，再决定实际滑多少——夹紧必须**取整组的交集**，
+  // 各自夹各自的会让画面滑了 60 帧而声音只滑了 40，那就是音画错位
+  const targets: { readonly trackId: TrackId; readonly clip: MediaClip; readonly limit: number }[] =
+    [];
+  for (const id of ids) {
+    const found = findClip(timeline, id);
+    if (!found) return reject(timeline, `找不到片段 ${id}`);
+    if (found.track.locked) return reject(timeline, blame(id, "轨道已锁定"));
+    const { clip } = found;
+    if (clip.kind === "text") return reject(timeline, blame(id, "文字片段没有源片可滑移"));
+    if (clip.kind === "image") return reject(timeline, blame(id, "图片没有「源片的哪一刻」"));
+    const source = timeline.sources.find((s) => s.id === clip.sourceId);
+    const limit = source ? sourceDurationFrames(source, timeline.fps) : Number.MAX_SAFE_INTEGER;
+    targets.push({ trackId: found.track.id, clip, limit });
+  }
+
+  /*
+    夹紧必须**取整组的交集**，不能各自夹各自的。
+
+    伙伴共用同一个源片，但它们的 `sourceIn` 可以已经不同（比如只裁过一边的入点）。
+    各自夹到各自的边界，会让画面滑了 60 帧而声音只滑了 40——那就是音画错位，
+    而且是拖到头之后才出现，最难被发现的那一种。
+  */
+  let lowRoom = Infinity; // 还能往前滑多少（源片帧）
+  let highRoom = Infinity; // 还能往后滑多少
+  // **卡住的是谁要记下来**：交集只给出一个数字，而拒绝里必须说清是画面还是声音——
+  // 折成一个 min 之后那个信息就没了，表现是拖画面拖不动而拒绝指着画面（实际是
+  // 声音那一段先到头）。第一版就是这么写的，被单测抓住
+  let lowBlocker = clipId;
+  let highBlocker = clipId;
+  for (const t of targets) {
+    const low = t.clip.sourceIn;
+    const high = t.limit - t.clip.sourceIn - clipSourceFrames(t.clip);
+    if (low < lowRoom) {
+      lowRoom = low;
+      lowBlocker = t.clip.id;
+    }
+    if (high < highRoom) {
+      highRoom = high;
+      highBlocker = t.clip.id;
+    }
+  }
+
+  if (options.clampToBounds !== true) {
+    if (sourceDeltaFrames < -lowRoom) {
+      return reject(timeline, blame(lowBlocker, "已经到源片开头，没有更多素材"));
+    }
+    if (sourceDeltaFrames > highRoom) {
+      return reject(timeline, blame(highBlocker, "已经到源片末尾，没有更多素材"));
+    }
+  }
+
+  const delta =
+    options.clampToBounds === true
+      ? Math.max(-lowRoom, Math.min(highRoom, sourceDeltaFrames))
+      : sourceDeltaFrames;
+  let working = timeline;
+  for (const t of targets) {
+    if (delta === 0) break;
+    working = replaceClip(working, t.trackId, { ...t.clip, sourceIn: t.clip.sourceIn + delta });
+  }
+  const moved = delta !== 0;
+  // 滑到头之后继续拖会一直发同一个值——那不是失败，是"值没变"（`EditResult` 第三态），
+  // 报出来会让状态栏一直闪红字
+  return moved ? ok(working) : unchanged(timeline);
+}
+
 /** 紧跟在这个片段之后的片段；中间有空档或它是最后一个时返回 null。 */
 export function nextClip(track: Track, clip: Clip): Clip | null {
   return track.clips.find((c) => c.id !== clip.id && c.timelineIn === clip.timelineOut) ?? null;

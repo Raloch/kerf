@@ -12,10 +12,12 @@
 
 import { useCallback, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import type { Clip, Timeline, TrackId } from "../edl/types";
-import { clipDuration } from "../edl/types";
+import type { Rational } from "../time/rational";
+import { clipDuration, clipSpeed, scaleBySpeed } from "../edl/types";
 import {
   moveClip,
   moveClips,
+  findClip,
   snapDrag,
   snapFrame,
   snapTargets,
@@ -88,7 +90,28 @@ interface TrimSession {
   readonly mode: TrimMode;
 }
 
-type Session = MoveSession | TrimSession;
+/**
+ * 滑移（**D57**）：占位一帧不动，只换用的是源片哪一段。
+ *
+ * 它是三种 session 里唯一**边拖边提交**的——占位不变意味着没有位置幽灵可画，
+ * 画一个和原片段完全重合的矩形只会让人以为卡住了，所以反馈只能是真东西
+ * （缩略图重铺 + 预览换帧）。合并键 `slip:${clipId}` 让整条拖拽只进一条撤销。
+ *
+ * 因此这里存的是**起点的 `sourceIn`**：每次 pointermove 都从它算绝对目标，
+ * 而不是把增量一次次累加上去——累加会把每一步的取整和夹紧一起攒起来，
+ * 表现是"来回拖几次之后画面对不回原来那一帧"。
+ */
+interface SlipSession {
+  readonly kind: "slip";
+  readonly clipId: string;
+  readonly originSourceIn: number;
+  /** 时间轴帧 → 源片帧的倍率（变速片段不是 1）。按被拖的那个片段算，见 `slipClip`。 */
+  readonly speed: Rational;
+  readonly startX: number;
+  readonly startY: number;
+}
+
+type Session = MoveSession | TrimSession | SlipSession;
 
 /** 一次 pointermove 算出来的东西。`delta` 只有裁切那条路用（见 `computeTrim`）。 */
 interface Computed {
@@ -128,6 +151,7 @@ export function useClipDrag(pxPerFrame: number): ClipDragApi {
   const move = useTimeline((s) => s.moveClip);
   const moveGroup = useTimeline((s) => s.moveClips);
   const trim = useTimeline((s) => s.trimClip);
+  const slipTo = useTimeline((s) => s.slipClipTo);
 
   const setDragHint = useTimeline((s) => s.setDragHint);
 
@@ -282,6 +306,45 @@ export function useClipDrag(pxPerFrame: number): ClipDragApi {
     [pxPerFrame, playhead, snapEnabled, timeline],
   );
 
+  /**
+   * 滑移：边拖边提交，所以这里没有幽灵、只有一行读数。
+   *
+   * 拖**右**边 = 看到**更早**的内容：想象手指按在胶片上把它往右推，而窗口不动
+   * ——于是窗口里露出来的是更前面那一段。所以 `sourceIn` 随 dx 反向。
+   */
+  const computeSlip = useCallback(
+    (s: SlipSession, event: PointerEvent): Computed => {
+      const dxFrames = (event.clientX - s.startX) / pxPerFrame;
+      const target = s.originSourceIn - scaleBySpeed(Math.round(dxFrames), s.speed);
+      /*
+        给**绝对目标**，差值由 store 拿它自己那份时间轴算。
+
+        自己算差值（`target − 这里读到的 sourceIn`）会重复施加：`timeline` 来自
+        React 闭包，快速拖动时两次 pointermove 之间未必重渲染过，于是第二次读到的
+        还是上一次的值、差值又算了一遍。浏览器实测过——读数说「150 → 50」而实际
+        落到 0。同 D50 那条"在 store 里读播放头，不从调用方传进来"。
+      */
+      slipTo(s.clipId, target);
+
+      /*
+        读数要报**实际落到了哪**，不是意图。
+
+        夹紧发生在纯函数里，所以拖过头之后 `target` 会继续跑——第一版直接印它，
+        于是滑到源片开头之后状态栏写着「源片起点 150 → -350」，而那是一个永远不
+        存在的值。现在从 store **当场读回**实际结果：贴到边界之后这行字就不再变，
+        那本身就是"到头了"的信号（同 D40 那条"静默变调就是硬规则 10"——软件知道
+        自己夹了一下，就得说出来，而说错比不说更坏）。
+
+        读的是 `getState()` 不是组件里那份 `timeline`：后者来自 React 闭包、比 store
+        慢一拍，而 zustand 的 set 是同步的，这一句读到的就是刚写进去的值。
+      */
+      const after = findClip(useTimeline.getState().timeline(), s.clipId)?.clip;
+      const now = after?.kind === "media" ? after.sourceIn : s.originSourceIn;
+      return { ghosts: [], snap: null, delta: now - s.originSourceIn };
+    },
+    [pxPerFrame, slipTo],
+  );
+
   const begin = useCallback(
     (event: ReactPointerEvent<HTMLElement>, next: Session) => {
       // 只响应主键，右键留给后续的上下文菜单
@@ -302,7 +365,8 @@ export function useClipDrag(pxPerFrame: number): ClipDragApi {
           if (Math.hypot(dx, dy) < DRAG_THRESHOLD_PX) return;
           movedEnough.current = true;
         }
-        const result = s.kind === "move" ? computeMove(s, e) : computeTrim(s, e);
+        const result =
+          s.kind === "move" ? computeMove(s, e) : s.kind === "slip" ? computeSlip(s, e) : computeTrim(s, e);
         setGhosts(result.ghosts);
         setSnapLine(result.snap);
         // 整组共用一个合法性，所以看第一个就够；写成"有没有任何一个非法"是一样的结果，
@@ -314,7 +378,9 @@ export function useClipDrag(pxPerFrame: number): ClipDragApi {
             ? { text: first.reason ?? "这里放不下", bad: true }
             : s.kind === "trim"
               ? { text: trimReadout(s, result), bad: false }
-              : null,
+              : s.kind === "slip"
+                ? { text: slipReadout(s, result), bad: false }
+                : null,
         );
       };
 
@@ -333,7 +399,11 @@ export function useClipDrag(pxPerFrame: number): ClipDragApi {
         if (s && !movedEnough.current && s.kind === "move" && s.followers.length > 0) {
           select(s.clipId);
         }
-        if (s && movedEnough.current) {
+        // 滑移在拖动中就已经逐步提交了（合并成一条撤销），松手时**什么都不要再做**
+        // ——再补一次会按最后那个位置又提交一遍，而它和上一次的差通常是 0，
+        // 于是那一下走"值没变"什么也不发生；但如果最后一次 pointermove 被吃掉了，
+        // 它就会补上一条独立的撤销记录。让提交只发生在一个地方
+        if (s && movedEnough.current && s.kind !== "slip") {
           const result = s.kind === "move" ? computeMove(s, e) : computeTrim(s, e);
           const ghost = result.ghosts[0];
           if (ghost && ghost.valid) {
@@ -367,7 +437,7 @@ export function useClipDrag(pxPerFrame: number): ClipDragApi {
       target.addEventListener("pointerup", onUp);
       target.addEventListener("pointercancel", onCancel);
     },
-    [computeMove, computeTrim, move, moveGroup, publishHint, reset, select, trim],
+    [computeMove, computeSlip, computeTrim, move, moveGroup, publishHint, reset, select, trim],
   );
 
   const onClipPointerDown = useCallback(
@@ -377,6 +447,29 @@ export function useClipDrag(pxPerFrame: number): ClipDragApi {
       if (event.metaKey || event.ctrlKey) {
         event.stopPropagation();
         toggleSelect(clip.id);
+        return;
+      }
+
+      /*
+        ⇧ 按下 = 滑移（**D57**）：占位不动，只换用的是源片哪一段。
+
+        修饰键在片段身上只剩这一个空位（⌘ 是加减选择，⌥ 是临时关磁吸），所以它给了
+        **同族里唯一没有替代做法的那个**——波纹裁切能由裁切 + 整组平移凑出来、卷动能
+        由两次裁切凑出来、滑动能由两次波纹裁切凑出来，而滑移凑不出来。
+
+        代价是 ⇧ 在手柄上是波纹、在片段身上是滑移，**两处含义不同**。不假装有个统一
+        的记忆法：位置稀缺时按"有没有别的路"分配，比按对称性分配更值。
+      */
+      if (event.shiftKey && clip.kind === "media") {
+        select(clip.id);
+        begin(event, {
+          kind: "slip",
+          clipId: clip.id,
+          originSourceIn: clip.sourceIn,
+          speed: clipSpeed(clip),
+          startX: event.clientX,
+          startY: event.clientY,
+        });
         return;
       }
 
@@ -476,6 +569,21 @@ function trimReadout(session: TrimSession, result: Computed): string {
     return `波纹裁切 ${signed} · 跟着动 ${Math.max(0, result.ghosts.length - 1)} 个片段`;
   }
   return `裁切 ${signed} · ⇧ 波纹 · ⌘ 卷动`;
+}
+
+/**
+ * 滑移拖动中状态栏那一行。
+ *
+ * 它是这次拖拽**唯一**的文字反馈，所以要把两个数都印出来：滑了多少、以及现在用的是
+ * 源片第几帧。只报位移的话，用户滑到源片开头之后继续拖会看到数字还在涨（夹紧发生在
+ * 纯函数里），而画面早就不动了——两个读数摆在一起，"到头了"一眼可判（同那条"两个
+ * 操作数都要印在断言旁边"）。
+ */
+function slipReadout(session: SlipSession, result: Computed): string {
+  const delta = result.delta ?? 0;
+  return `滑移 ${delta > 0 ? "+" : ""}${delta}f · 源片起点 ${session.originSourceIn} → ${
+    session.originSourceIn + delta
+  }`;
 }
 
 /**
