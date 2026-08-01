@@ -74,6 +74,34 @@ export function frameToMicrosScaled(frame: number, fps: Rational, scale: Rationa
   return Math.round((num * MICROS_PER_SECOND) / den);
 }
 
+/**
+ * 同一段内容换一把尺子：`frames` 帧 @`from`，在 `to` 上**铺得满多少帧**（向下取整）。
+ *
+ * **两个栅格相同时不乘不除**，同 `scaleBySpeed` 的原速快路径。这不是性能：源片帧率
+ * 等于项目帧率是绝大多数真实项目、以及全部四个浏览器自检的形态，那条原路径保证它们
+ * 与加这层换算之前逐帧完全相同。
+ *
+ * 向下取整是因为它回答的是"铺得满多少"：多算一帧就是报出一个解不出内容的位置，
+ * 而那一帧的表现是**成片尾部那一层画面静默消失**（同 `sourceDurationFrames` 里那个
+ * `floor`）。反过来的问题要用 `regridFramesNeeded`，**两者不能互换**——那条不对称
+ * 和 `scaleBySpeed` / `unscaleBySpeed` 是同一条理由。
+ */
+export function regridFrames(frames: number, from: Rational, to: Rational): number {
+  if (from.num * to.den === to.num * from.den) return frames;
+  return Math.floor((frames * to.num * from.den) / (to.den * from.num));
+}
+
+/**
+ * 同上，但回答"**要用掉**多少帧"，所以向上取整。
+ *
+ * 用在"这个片段一共吃掉源片多少帧"这一类判据上（`clipSourceEnd`）。少算一帧就是
+ * 放行一个源片里根本不存在的帧，失败形态同上：那一层画面静默消失，不报错。
+ */
+export function regridFramesNeeded(frames: number, from: Rational, to: Rational): number {
+  if (from.num * to.den === to.num * from.den) return frames;
+  return Math.ceil((frames * to.num * from.den) / (to.den * from.num));
+}
+
 /** 微秒 → 帧号（就近取整）。 */
 export function microsToFrame(micros: number, fps: Rational): number {
   if (!Number.isFinite(micros)) throw new Error(`微秒必须是有限数：${micros}`);

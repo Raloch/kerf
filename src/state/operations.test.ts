@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { FPS } from "../time/rational";
+import { FPS, type Rational } from "../time/rational";
 import { clipDuration, clipSourceFrames, clipsUsingEffects, markedRange } from "../edl/types";
+
+/** 这个文件里的时间轴一律 29.97，源片栅格与它相同——`clipSourceFrames` 的缺省尺子。 */
+const SAME_GRID = { timelineFps: FPS.ndf2997, sourceFps: FPS.ndf2997 };
 import {
   layerLooks,
   sourceMicrosAt,
@@ -90,7 +93,9 @@ function source(id: string, durationFrames = 1000): MediaSource {
     id,
     kind: "av",
     name: `${id}.mp4`,
-    file: new File([], `${id}.mp4`),
+    // `lastModified` 固定：不给的话它取当时的毫秒数，而"两次构造同一份夹具应当
+    // 逐字段相等"那几条断言会在跨过毫秒边界时随机红一次（实测过一次）
+    file: new File([], `${id}.mp4`, { lastModified: 0 }),
     fps: FPS.ndf2997,
     width: 1920,
     height: 1080,
@@ -1578,7 +1583,7 @@ describe("导入素材", () => {
     id,
     kind: "audio",
     name: `${id}.mp3`,
-    file: new File([], `${id}.mp3`),
+    file: new File([], `${id}.mp3`, { lastModified: 0 }),
     hasAudio: true,
     audioCodec: "mp3",
     durationMicros: 10_000_000,
@@ -1861,6 +1866,168 @@ describe("导入素材", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// 源片帧率 ≠ 项目帧率
+// ---------------------------------------------------------------------------
+
+/*
+  这一组钉的是**两把尺子**：`sourceIn` 和 `sourceDurationFrames()` 量在源片自己的栅格上，
+  而片段占位量在项目帧率上。两者只在源片帧率恰好等于项目帧率时相等——那是绝大多数真实
+  项目、以及全部四个浏览器自检的形态，所以这个缺口从 M1 起一直看不出来，直到第一次
+  混帧率工作流实测。
+
+  两个方向都不报错，都是把成片解回来量出来的：
+  - 源片帧率**低于**项目帧率（25 → 30）：片段短 20%，**尾部那 2.5 秒永远够不到**
+    （拉出点被"已经到源片末尾"挡住），滑移余量也算成 0；
+  - 源片帧率**高于**项目帧率（60 → 30）：片段长一倍，而多出来那一半**是定格不是黑帧**
+    ——实测 10 秒素材铺成 20 秒，后 300 帧逐帧都是源片最后那一帧，导出报成功。
+
+  30fps 项目 + 25/60fps 素材是刻意挑的：三个数都整除，期望值可以手算，不需要问被测代码
+  （同 D46 那条"期望值必须手算，不许调 containRect"）。
+*/
+describe("源片帧率 ≠ 项目帧率（混帧率项目）", () => {
+  const av = (id: string, fps: Rational, durationFrames: number): AvSource => ({
+    id,
+    kind: "av",
+    name: `${id}.mp4`,
+    // `lastModified` 固定：不给的话它取当时的毫秒数，而"两次构造同一份夹具应当
+    // 逐字段相等"那几条断言会在跨过毫秒边界时随机红一次（实测过一次）
+    file: new File([], `${id}.mp4`, { lastModified: 0 }),
+    fps,
+    width: 1920,
+    height: 1080,
+    durationFrames,
+    hasAudio: false,
+    videoCodec: "avc",
+    audioCodec: null,
+  });
+
+  /**
+   * 一个已经定死 30fps 的项目。
+   *
+   * 必须先放一个 30fps 的素材：`addSource` 的帧率 conform **只在空项目上生效**，
+   * 直接导入 25fps 素材会把项目也变成 25fps，那时两把尺子又重合了、什么都测不到
+   * （同 D35 那个"被乘以零的因子"）。
+   */
+  const project = (): Timeline => {
+    const empty: Timeline = {
+      fps: FPS.ntsc30,
+      width: 1920,
+      height: 1080,
+      durationFrames: 0,
+      // 画面轨自下而上找落点，所以 V1 要排在数组**末尾**（同 `EMPTY_TIMELINE`）
+      tracks: [
+        { id: "V2", kind: "video", clips: [] },
+        { id: "V1", kind: "video", clips: [] },
+        { id: "A1", kind: "audio", clips: [] },
+      ],
+      sources: [],
+    };
+    const r = addSource(empty, { source: av("anchor", FPS.ntsc30, 30) });
+    expect(r.timeline.fps).toEqual(FPS.ntsc30);
+    return r.timeline;
+  };
+
+  /** 把素材导进 30fps 项目，按片段 id 取回它（落哪条轨是 `importPlacement` 的事）。 */
+  const imported = (source: AvSource): { tl: Timeline; clip: MediaClip } => {
+    const r = addSource(project(), { source });
+    expect(r.changed).toBe(true);
+    return { tl: r.timeline, clip: media(findClip(r.timeline, `${source.id}-v`)?.clip) };
+  };
+
+  it("**25fps 素材落在 30fps 项目上占 450 帧，不是 375**", () => {
+    // 375 帧 @25fps = 15 秒，在 30fps 上就该是 450 帧。按源片帧数当占位（旧行为）
+    // 只有 375 帧 = 12.5 秒，尾部 2.5 秒永远够不到
+    const { clip: c } = imported(av("slow", FPS.pal25, 375));
+    expect(clipDuration(c)).toBe(450);
+  });
+
+  it("**60fps 素材落在 30fps 项目上占 300 帧，不是 600**", () => {
+    // 600 帧 @60fps = 10 秒。按源片帧数当占位会铺成 20 秒，后半段的取帧位置全部越过
+    // 源片末尾——reader 只能向前，问不到就一直给最后一个 sample，于是**定格 10 秒**
+    // 而导出报成功（实测：后 300 帧逐帧都是同一个像素值）
+    const { clip: c } = imported(av("fast", FPS.ntsc60, 600));
+    expect(clipDuration(c)).toBe(300);
+  });
+
+  it("导入产生的片段**恰好用满源片，一帧不多不少**", () => {
+    // 这条把"落点长度"和"裁出点上界"两条判据钉在一起：它们各自算各自的，
+    // 不自洽的表现是片段一落地就已经越界（再也拉不长，或者本来就带着黑帧）
+    for (const [fps, frames] of [
+      [FPS.pal25, 375],
+      [FPS.ntsc60, 600],
+      [FPS.ndf23976, 240],
+      [FPS.film24, 97],
+    ] as const) {
+      const { tl, clip: c } = imported(av(`s-${fps.num}-${frames}`, fps, frames));
+      // 再拉一帧就该被挡住——说明它确实站在源片末尾上
+      expect(trimClip(tl, c.id, "out", 1).reason).toContain("源片末尾");
+      // 往回收一帧再拉回来是合法的（证明上一条不是"永远拉不动"）
+      const shorter = trimClip(tl, c.id, "out", -1);
+      expect(shorter.changed).toBe(true);
+      expect(trimClip(shorter.timeline, c.id, "out", 1).changed).toBe(true);
+    }
+  });
+
+  it("25fps 素材裁短之后**拉得回尾部那一段**", () => {
+    // 旧行为下这个片段只有 375 帧，而上界也是 375——于是"尾部 2.5 秒"根本不存在，
+    // 用户看到的是"这段素材就这么长"
+    const { tl, clip: c } = imported(av("slow", FPS.pal25, 375));
+    const cut = trimClip(tl, c.id, "out", -150); // 剪到 300 帧 = 10 秒
+    expect(clipDuration(media(findClip(cut.timeline, c.id)?.clip))).toBe(300);
+    const back = trimClip(cut.timeline, c.id, "out", 150);
+    expect(back.changed).toBe(true);
+    expect(clipDuration(media(findClip(back.timeline, c.id)?.clip))).toBe(450);
+  });
+
+  it("滑移余量按**源片帧**算，裁短之后才有余量", () => {
+    const { tl, clip: c } = imported(av("slow", FPS.pal25, 375));
+    // 用满源片时一帧都滑不动（两个方向都是）
+    expect(slipClip(tl, c.id, 1).reason).toContain("源片末尾");
+    expect(slipClip(tl, c.id, -1).reason).toContain("源片开头");
+    // 剪掉 150 个**时间轴**帧 = 125 个**源片**帧，余量就是 125 而不是 150
+    const cut = trimClip(tl, c.id, "out", -150).timeline;
+    expect(slipClip(cut, c.id, 125).changed).toBe(true);
+    expect(slipClip(cut, c.id, 126).reason).toContain("源片末尾");
+    expect(media(findClip(slipClip(cut, c.id, 125).timeline, c.id)?.clip).sourceIn).toBe(125);
+  });
+
+  it("变速与换栅格叠在一起：2× 的 25fps 片段", () => {
+    const { tl, clip: c } = imported(av("slow", FPS.pal25, 375));
+    // 先收到 300 帧，再 2× → 保内容所以占位减半到 150 帧
+    const cut = trimClip(tl, c.id, "out", -150).timeline;
+    const fast = setClipSpeed(cut, c.id, { num: 2, den: 1 });
+    expect(fast.changed).toBe(true);
+    const f = media(findClip(fast.timeline, c.id)?.clip);
+    expect(clipDuration(f)).toBe(150);
+    // 150 个时间轴帧 @2× 走过 (150-1)×2+1 = 299 个时间轴帧，换成源片帧是
+    // ceil(299×25/30) = 250。源片 375 → 余量 125，和原速那条一致（保内容）
+    expect(clipSourceFrames(f, { timelineFps: FPS.ntsc30, sourceFps: FPS.pal25 })).toBe(250);
+    expect(slipClip(fast.timeline, c.id, 125).changed).toBe(true);
+    expect(slipClip(fast.timeline, c.id, 126).reason).toContain("源片末尾");
+  });
+
+  it("纯音频素材不受影响——它的栅格本来就是项目帧率", () => {
+    // 这条是反向护栏：`gridsFor` 对纯音频返回项目帧率，所以换算是恒等。
+    // 写死成"总是按 source.fps 换算"会在这里编译不过（音频素材没有 fps）
+    const m: AudioOnlySource = {
+      id: "bgm",
+      kind: "audio",
+      name: "bgm.mp3",
+      file: new File([], "bgm.mp3", { lastModified: 0 }),
+      hasAudio: true,
+      audioCodec: "mp3",
+      durationMicros: 10_000_000,
+      sampleRate: 44_100,
+      channels: 2,
+    };
+    const r = addSource(project(), { source: m });
+    const c = media(r.timeline.tracks.find((t) => t.id === "A1")!.clips[0]);
+    expect(clipDuration(c)).toBe(300); // 10 秒 @30fps
+    expect(trimClip(r.timeline, c.id, "out", 1).reason).toContain("源片末尾");
+  });
+});
+
 describe("裁切纯音频片段", () => {
   const withMusic = (): Timeline => ({
     fps: FPS.ntsc30,
@@ -1873,7 +2040,7 @@ describe("裁切纯音频片段", () => {
         id: "src",
         kind: "audio",
         name: "m.mp3",
-        file: new File([], "m.mp3"),
+        file: new File([], "m.mp3", { lastModified: 0 }),
         hasAudio: true,
         audioCodec: "mp3",
         // 5 秒，30fps 下正好 150 帧
@@ -1910,7 +2077,7 @@ describe("裁切图片片段", () => {
         id: "src",
         kind: "image",
         name: "p.png",
-        file: new File([], "p.png"),
+        file: new File([], "p.png", { lastModified: 0 }),
         hasAudio: false,
         audioCodec: null,
         width: 1200,
@@ -2057,7 +2224,7 @@ describe("setClipSpeed：保内容、改长度", () => {
     expect(c.timelineOut).toBe(50);
     expect(c.speed).toEqual(SPEED_2X);
     // 50 帧 × 2 = 原来那 100 帧内容（末帧算法见 clipSourceFrames）
-    expect(clipSourceFrames(c)).toBe(99);
+    expect(clipSourceFrames(c, SAME_GRID)).toBe(99);
   });
 
   it("0.5× 让片段占位翻倍", () => {
@@ -2231,7 +2398,7 @@ describe("setClipPreservePitch：只换算法，不动长度", () => {
           id: "src",
           kind: "av",
           name: "src.mp4",
-          file: new File([], "src.mp4"),
+          file: new File([], "src.mp4", { lastModified: 0 }),
           fps: FPS.ndf2997,
           width: 1920,
           height: 1080,
@@ -3119,9 +3286,9 @@ describe("定格帧（D48）", () => {
 
     it("消耗的源片帧数是 1，与占位多长、速度多少无关", () => {
       const frozen = media(findClip(frozenTimeline(), "v")?.clip);
-      expect(clipSourceFrames(frozen)).toBe(1);
-      expect(clipSourceFrames({ ...frozen, timelineOut: 100_000 })).toBe(1);
-      expect(clipSourceFrames({ ...frozen, speed: { num: 4, den: 1 } })).toBe(1);
+      expect(clipSourceFrames(frozen, SAME_GRID)).toBe(1);
+      expect(clipSourceFrames({ ...frozen, timelineOut: 100_000 }, SAME_GRID)).toBe(1);
+      expect(clipSourceFrames({ ...frozen, speed: { num: 4, den: 1 } }, SAME_GRID)).toBe(1);
     });
   });
 
@@ -3399,7 +3566,7 @@ describe("删除素材", () => {
           id: "img",
           kind: "image",
           name: "p.png",
-          file: new File([], "p.png"),
+          file: new File([], "p.png", { lastModified: 0 }),
           hasAudio: false,
           audioCodec: null,
           width: 1200,
@@ -4036,7 +4203,7 @@ describe("滑移（D57）", () => {
     const fast: MediaClip = { ...clip("a", 0, 300, 100), speed: { num: 2, den: 1 } };
     const t = timeline([{ id: "V1", kind: "video", clips: [fast] }], 800);
     // 末帧落在 sourceIn + (L−1)×speed，所以是 599 而不是 600（见 `clipSourceFrames`）
-    expect(clipSourceFrames(fast)).toBe(599);
+    expect(clipSourceFrames(fast, SAME_GRID)).toBe(599);
     // 余量 = 800 − 100 − 599 = 101。按占位算（300）会算出 400，多放 299 帧
     expect(slipClip(t, "a", 101).changed).toBe(true);
     expect(slipClip(t, "a", 102).reason).toContain("源片末尾");

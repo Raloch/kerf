@@ -15,6 +15,7 @@ import type { CropInsets, LayerTransform } from "../compose/compositor";
 import type { TextStyle } from "../compose/text-raster";
 import { isShaderTransition } from "../compose/transition-shader";
 import type { Rational } from "../time/rational";
+import { regridFrames, regridFramesNeeded } from "../time/timebase";
 
 export type SourceId = string;
 export type ClipId = string;
@@ -261,7 +262,12 @@ export function sourceGridFps(source: SourceFacts, timelineFps: Rational): Ratio
 export const IMAGE_SOURCE_FRAMES = Number.POSITIVE_INFINITY;
 
 /**
- * 这个素材在自己的栅格里有多少帧——裁切的"还有没有更多素材"就是拿它判的。
+ * 这个素材在**自己的栅格**里有多少帧——裁切的"还有没有更多素材"就是拿它判的。
+ *
+ * 单位是 `sourceGridFps(source)`，**不是项目帧率**（`timelineFps` 只是纯音频素材
+ * 的栅格来源）。"这个素材铺在时间轴上占多少帧"是另一个量，见 `sourceTimelineFrames`
+ * ——两者只在源片帧率恰好等于项目帧率时相等，而那是绝大多数项目的形态，所以拿错了
+ * 很久都不会被发现。
  *
  * 纯音频素材用 `floor` 而不是 `round`：宁可少报一帧，也不能报出一帧解不出内容的
  * 位置（那会让裁到末尾的片段末帧静音，而静音在波形上看着就像素材本身如此）。
@@ -273,6 +279,51 @@ export function sourceDurationFrames(source: SourceFacts, timelineFps: Rational)
     1,
     Math.floor((source.durationMicros * timelineFps.num) / (timelineFps.den * 1_000_000)),
   );
+}
+
+/**
+ * 这个素材**铺满在时间轴上占多少帧**——导入时片段的初始长度就是它。
+ *
+ * 和 `sourceDurationFrames` 是**两个量**，只在"源片帧率 == 项目帧率"时相等。拿错
+ * 的两个方向都不报错，两个都是把成片解回来量出来的：
+ *
+ * - 源片帧率**低于**项目帧率（25fps 素材进 30fps 项目）：片段短 20%，**尾部那 2.5
+ *   秒永远够不到**——拉出点被"已经到源片末尾"挡住，滑移余量也算成 0。实测一条前 12.5
+ *   秒绿、后 2.5 秒红的素材，成片里**一帧红都没有**；
+ * - 源片帧率**高于**项目帧率（60 进 30）：片段长一倍。**不是黑帧，是定格**——前 10 秒
+ *   内容正常，之后 300 帧全是源片最后那一帧（reader 只能向前，问不到就一直给最后一个
+ *   sample）。实测一条颜色随时间线性变化的 10 秒素材，成片 20 秒、后 10 秒逐帧读回来
+ *   都是 `#fc0000` 一动不动，而导出报成功、泄漏为 0。定格比黑屏更坏：黑屏一眼能看出
+ *   是故障，而定格看起来像"这段素材本来就静止"（同 D48 那个角标存在的理由）。
+ *
+ * 纯音频素材的栅格本来就是项目帧率，所以那一支直接落回 `sourceDurationFrames`
+ * ——**不抄一份换算式**，那就是给同一条派生开第二个真值来源（同 `sourceGridFps`）。
+ */
+export function sourceTimelineFrames(source: SourceFacts, timelineFps: Rational): number {
+  if (source.kind === "image") return IMAGE_SOURCE_FRAMES;
+  if (source.kind !== "av") return sourceDurationFrames(source, timelineFps);
+  return Math.max(1, regridFrames(source.durationFrames, source.fps, timelineFps));
+}
+
+/**
+ * 一个素材片段身上的**两把尺子**。
+ *
+ * `sourceIn` 和 `sourceDurationFrames()` 量在源片栅格上，而片段占位量在时间轴帧率上
+ * ——凡是把两者放进同一个算式的地方（"还有没有更多素材"那一族判据全都是），都要先
+ * 换算。写成一个具名对象而不是两个 `Rational` 参数：那两个参数**换过来不报错**，
+ * 只把换算方向整个反过来，而两个方向的后果都长得像"素材本身就那么长"（见
+ * `sourceTimelineFrames` 的文件头）。
+ */
+export interface FrameGrids {
+  /** 片段所在时间轴的帧栅格。 */
+  readonly timelineFps: Rational;
+  /** 源片自己的帧栅格，由 `sourceGridFps()` 给——**不要直接读 `source.fps`**。 */
+  readonly sourceFps: Rational;
+}
+
+/** 这个素材配上项目帧率之后的两把尺子。构造 `FrameGrids` 只走这里。 */
+export function gridsFor(source: SourceFacts, timelineFps: Rational): FrameGrids {
+  return { timelineFps, sourceFps: sourceGridFps(source, timelineFps) };
 }
 
 /**
@@ -707,25 +758,35 @@ export function clipIsFrozen(clip: Clip): boolean {
 }
 
 /**
- * 这个片段从 `sourceIn` 起消耗多少源片帧——裁出点那道"还有没有更多素材"就是拿它判的。
+ * 这个片段从 `sourceIn` 起消耗多少源片帧，**单位是源片自己的栅格**——裁出点那道
+ * "还有没有更多素材"就是拿它判的，所以它必须和 `sourceIn` / `sourceDurationFrames()`
+ * 量在同一把尺子上。
  *
  * 片段占 L 帧，末帧落在源片的 `sourceIn + (L-1)×speed`，所以要 L-1 而不是 L 乘速度，
- * 再加回那一帧本身。**speed 为 1 时结果与旧式的 `sourceIn + L` 逐值相同**，这是刻意的：
- * 那道判据的行为在没变速的项目上一个字都不能变。
+ * 再加回那一帧本身。**原速 + 同栅格时结果与旧式的 `sourceIn + L` 逐值相同**，这是
+ * 刻意的：那道判据的行为在没变速、源片帧率又恰好等于项目帧率的项目上一个字都不能变
+ * （四个浏览器自检全是这个形态）。
+ *
+ * `grids` 不给缺省值是有意的：它是**必填**，于是漏传的调用点在编译期就红。以前这个
+ * 函数只收 `clip`，返回的其实是"时间轴帧 × 速度"，而调用方拿它去和源片栅格上的数
+ * 相减——两把尺子的读数加在一起，只在源片帧率等于项目帧率时恰好对。
  *
  * 用 `ceil` 而不是 `round`：宁可少给一帧，也不能报出一帧解不出内容的位置——同
  * `sourceDurationFrames` 里那个 `floor`，失败形态也一样（末帧静默变成解不出来的黑帧）。
  */
-export function clipSourceFrames(clip: MediaClip): number {
+export function clipSourceFrames(clip: MediaClip, grids: FrameGrids): number {
   const frames = clipDuration(clip);
   if (frames <= 0) return 0;
-  // 定格只消耗**一帧**，与占位多长、速度多少全都无关（D48）。这一条必须在速度那两条
-  // 之前判：定格片段身上可能还留着 `speed`（改速度在定格期间被拒、但字段是之前设的，
-  // 同 D40 那条"字段不跟着清掉"），按速度算出来的数会把出点上限和转场余量一起算错
+  // 定格只消耗**一帧**，与占位多长、速度多少、哪把尺子全都无关（D48）。这一条必须在
+  // 速度那两条之前判：定格片段身上可能还留着 `speed`（改速度在定格期间被拒、但字段是
+  // 之前设的，同 D40 那条"字段不跟着清掉"），按速度算出来的数会把出点上限和转场余量
+  // 一起算错
   if (isFrozen(clip)) return 1;
-  if (isNormalSpeed(clip)) return frames;
   const s = clipSpeed(clip);
-  return Math.ceil(((frames - 1) * s.num) / s.den) + 1;
+  // 这一步的单位还是**时间轴帧**（乘过速度）
+  const spanned = isNormalSpeed(clip) ? frames : Math.ceil(((frames - 1) * s.num) / s.den) + 1;
+  // 换成源片栅格。两个栅格相同时 `regridFramesNeeded` 不乘不除，原样返回
+  return regridFramesNeeded(spanned, grids.timelineFps, grids.sourceFps);
 }
 
 /**

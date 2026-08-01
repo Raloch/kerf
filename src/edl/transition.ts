@@ -43,6 +43,24 @@
 
 import type { Clip, MediaClip, Transition } from "./types";
 import { clipDuration, clipSourceFrames, clipSpeed, isFrozen, unscaleBySpeed } from "./types";
+import type { Rational } from "../time/rational";
+import { regridFrames } from "../time/timebase";
+
+/**
+ * 源片有多长，**以及用哪两把尺子量**。
+ *
+ * 单独给一个帧数不够：那个数和 `clip.sourceIn` 在源片栅格上，而片段占位在时间轴帧率
+ * 上，相减之前必须换算（见 `clipSourceFrames`）。源片帧率恰好等于项目帧率时两者相等，
+ * 所以这个缺口在 25fps 素材进 30fps 项目之前一直看不出来。
+ */
+export interface SourceExtent {
+  /** 源片总帧数，单位是**源片自己的栅格**（`sourceDurationFrames()`）。 */
+  readonly frames: number;
+  /** 源片自己的帧栅格（`sourceGridFps()`）。 */
+  readonly fps: Rational;
+  /** 片段所在时间轴的帧栅格。 */
+  readonly timelineFps: Rational;
+}
 
 /** 转场时长的下限。低于 2 帧对称窗口就退化成空。 */
 export const MIN_TRANSITION_FRAMES = 2;
@@ -141,12 +159,12 @@ export function transitionProgress(window: TransitionWindow, frame: number): num
 export function frozenFrames(
   window: TransitionWindow,
   role: "from" | "to",
-  sourceDurationFrames: number,
+  source: SourceExtent,
 ): number {
   const clip = role === "from" ? window.from : window.to;
   if (clip.kind !== "media") return 0;
   const need = window.frames / 2;
-  return Math.max(0, Math.min(need, need - availableHandle(clip, role, sourceDurationFrames)));
+  return Math.max(0, Math.min(need, need - availableHandle(clip, role, source)));
 }
 
 /**
@@ -223,16 +241,23 @@ export function clipRenderSpan(
  * 不给这条的话，一个定在源片第 0 帧的定格片段会被算成"入场侧一帧余量都没有"，于是
  * 检查器报出一个不存在的定格帧数——那是句假话，而画面上完全正常（同 `IMAGE_SOURCE_FRAMES`
  * 用 `Infinity` 表达"想占多久都行"的理由）。
+ *
+ * **余量先在源片栅格上算完，再换回时间轴帧**（`regridFrames`），最后才除速度。三步
+ * 顺序固定：`sourceIn` 和 `frames` 在源片那把尺子上，而返回值要给界面看。
  */
 export function availableHandle(
   clip: MediaClip,
   role: "from" | "to",
-  sourceDurationFrames: number,
+  source: SourceExtent,
 ): number {
   if (isFrozen(clip)) return Number.POSITIVE_INFINITY;
+  const grids = { timelineFps: source.timelineFps, sourceFps: source.fps };
   const inSource =
     role === "from"
-      ? sourceDurationFrames - (clip.sourceIn + clipSourceFrames(clip))
+      ? source.frames - (clip.sourceIn + clipSourceFrames(clip, grids))
       : clip.sourceIn;
-  return Math.max(0, unscaleBySpeed(inSource, clipSpeed(clip)));
+  return Math.max(
+    0,
+    unscaleBySpeed(regridFrames(inSource, source.fps, source.timelineFps), clipSpeed(clip)),
+  );
 }

@@ -18,6 +18,7 @@ import {
   unscaleBySpeed,
   sourceDurationFrames,
   sourceGridFps,
+  sourceTimelineFrames,
   sourceHasPicture,
   type AudioOnlySource,
   type AvSource,
@@ -161,30 +162,100 @@ describe("要不要走保音高的时间伸缩", () => {
 });
 
 describe("片段消耗多少源片帧", () => {
-  it("原速下与占位帧数逐值相同", () => {
+  /** 缺省两把尺子：源片帧率就等于项目帧率——绝大多数项目的形态。 */
+  const same = { timelineFps: FPS.ntsc30, sourceFps: FPS.ntsc30 };
+
+  it("原速同栅格下与占位帧数逐值相同", () => {
     // 这条钉的是"没变速的项目那道裁切判据一个字都不变"
     for (const frames of [1, 2, 37, 100, 999]) {
-      expect(clipSourceFrames(mediaClip({ timelineOut: frames }))).toBe(frames);
+      expect(clipSourceFrames(mediaClip({ timelineOut: frames }), same)).toBe(frames);
     }
   });
 
   it("2× 下 50 帧占位消耗 99 帧源片", () => {
     // 末帧落在 sourceIn + (50-1)×2，所以是 98+1 而不是 100——多算那一帧
     // 就是"允许把出点拉到源片之外"
-    expect(clipSourceFrames(mediaClip({ timelineOut: 50, speed: { num: 2, den: 1 } }))).toBe(99);
+    expect(clipSourceFrames(mediaClip({ timelineOut: 50, speed: { num: 2, den: 1 } }), same)).toBe(99);
   });
 
   it("0.5× 下 100 帧占位只消耗 51 帧源片", () => {
-    expect(clipSourceFrames(mediaClip({ timelineOut: 100, speed: { num: 1, den: 2 } }))).toBe(51);
+    expect(clipSourceFrames(mediaClip({ timelineOut: 100, speed: { num: 1, den: 2 } }), same)).toBe(51);
   });
 
   it("非整数结果用 ceil：宁可少给一帧", () => {
     // 1.5× 下 4 帧占位要 (4-1)×1.5 = 4.5 → 5，+1 = 6
-    expect(clipSourceFrames(mediaClip({ timelineOut: 4, speed: { num: 3, den: 2 } }))).toBe(6);
+    expect(clipSourceFrames(mediaClip({ timelineOut: 4, speed: { num: 3, den: 2 } }), same)).toBe(6);
   });
 
   it("零长片段消耗 0 帧", () => {
-    expect(clipSourceFrames(mediaClip({ timelineIn: 10, timelineOut: 10 }))).toBe(0);
+    expect(clipSourceFrames(mediaClip({ timelineIn: 10, timelineOut: 10 }), same)).toBe(0);
+  });
+
+  // ---- 源片帧率 ≠ 项目帧率 ----
+  //
+  // 这几条钉的是"两把尺子"。`sourceIn` 和 `sourceDurationFrames()` 在源片栅格上，
+  // 占位在项目帧率上，混着相减只在两者相等时恰好对——而那是绝大多数项目的形态。
+
+  it("**25fps 素材在 30fps 时间轴上，450 帧占位只吃掉 375 帧源片**", () => {
+    const grids = { timelineFps: FPS.ntsc30, sourceFps: FPS.pal25 };
+    expect(clipSourceFrames(mediaClip({ timelineOut: 450 }), grids)).toBe(375);
+  });
+
+  it("**60fps 素材反过来：300 帧占位吃掉 600 帧源片**", () => {
+    const grids = { timelineFps: FPS.ntsc30, sourceFps: FPS.ntsc60 };
+    expect(clipSourceFrames(mediaClip({ timelineOut: 300 }), grids)).toBe(600);
+  });
+
+  it("换栅格与变速叠加时只在最后换一次尺子", () => {
+    const grids = { timelineFps: FPS.ntsc30, sourceFps: FPS.pal25 };
+    // 150 帧占位 @2× 走过 (150-1)×2+1 = 299 个时间轴帧 → ceil(299×25/30) = 250
+    expect(
+      clipSourceFrames(mediaClip({ timelineOut: 150, speed: { num: 2, den: 1 } }), grids),
+    ).toBe(250);
+  });
+
+  it("定格恒为 1 帧，与两把尺子无关", () => {
+    // 定格判在换算之前：一帧就是一帧，换尺子换不出第二帧来
+    for (const sourceFps of [FPS.pal25, FPS.ntsc60, FPS.ndf23976]) {
+      expect(
+        clipSourceFrames(mediaClip({ timelineOut: 999, freeze: true }), {
+          timelineFps: FPS.ntsc30,
+          sourceFps,
+        }),
+      ).toBe(1);
+    }
+  });
+});
+
+describe("素材铺在时间轴上占多少帧（sourceTimelineFrames）", () => {
+  it("**源片帧率等于项目帧率时就是源片帧数本身**", () => {
+    expect(sourceTimelineFrames(av, FPS.film24)).toBe(240);
+  });
+
+  it("25fps 素材进 30fps 项目占 450 帧，60fps 进 30fps 占 300 帧", () => {
+    const at = (fps: typeof FPS.pal25, durationFrames: number) =>
+      sourceTimelineFrames({ ...av, fps, durationFrames }, FPS.ntsc30);
+    expect(at(FPS.pal25, 375)).toBe(450); // 15 秒还是 15 秒
+    expect(at(FPS.ntsc60, 600)).toBe(300); // 10 秒还是 10 秒
+  });
+
+  it("**它和 `sourceDurationFrames` 是两个量**", () => {
+    const slow = { ...av, fps: FPS.pal25, durationFrames: 375 };
+    expect(sourceDurationFrames(slow, FPS.ntsc30)).toBe(375); // 源片栅格
+    expect(sourceTimelineFrames(slow, FPS.ntsc30)).toBe(450); // 时间轴栅格
+  });
+
+  it("纯音频素材两个函数给同一个数——它的栅格本来就是项目帧率", () => {
+    expect(sourceTimelineFrames(music, FPS.ntsc30)).toBe(sourceDurationFrames(music, FPS.ntsc30));
+  });
+
+  it("图片没有长度，仍然是 Infinity", () => {
+    expect(sourceTimelineFrames(photo, FPS.ntsc30)).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  it("短到铺不满一帧时至少给 1 帧，不给 0", () => {
+    // 0 帧的片段落地就是非法状态（`trimmedClip` 那道"至少保留 1 帧"）
+    expect(sourceTimelineFrames({ ...av, fps: FPS.ntsc60, durationFrames: 1 }, FPS.ntsc30)).toBe(1);
   });
 });
 

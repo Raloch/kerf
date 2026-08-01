@@ -38,9 +38,12 @@ import {
   clipSourceId,
   clipSpeed,
   findFont,
+  gridsFor,
   isFrozen,
   scaleBySpeed,
   sourceDurationFrames,
+  sourceGridFps,
+  sourceTimelineFrames,
   SPEED_RANGE,
   transitionFitsTrack,
   type Clip,
@@ -64,6 +67,7 @@ import {
   MIN_TRANSITION_FRAMES,
   frozenFrames,
   transitionWindow,
+  type SourceExtent,
 } from "../edl/transition";
 import { newClipId, newLinkId } from "../media/source-id";
 import { rational, toNumber, type Rational } from "../time/rational";
@@ -537,16 +541,19 @@ function trimmedClip(
   if (newOut <= clip.timelineIn) return "片段至少要保留 1 帧";
   if (clip.kind === "media") {
     const source = timeline.sources.find((s) => s.id === clip.sourceId);
-    // 纯音频素材的帧数按项目帧率派生——**这就是裁切必须和 `sourceIn` 同栅格的地方**，
-    // 见 `AudioOnlySource` 的文件头
-    const sourceLimit = source
-      ? sourceDurationFrames(source, timeline.fps)
-      : Number.MAX_SAFE_INTEGER;
-    // 变速片段消耗的源片帧数不等于占位帧数（`clipSourceFrames`，原速下逐值相同）。
-    // 漏乘的表现是 2× 下能把出点拉到源片之外，而那几帧解不出来 =
-    // **那一层画面静默消失**（同 D37 记的那个形态）
-    const usedSourceFrames = clip.sourceIn + clipSourceFrames({ ...clip, timelineOut: newOut });
-    if (usedSourceFrames > sourceLimit) return "已经到源片末尾，没有更多素材";
+    if (source) {
+      // 判据全程在**源片栅格**上：`sourceIn` 和 `sourceDurationFrames` 本来就在那儿，
+      // `clipSourceFrames` 收 `grids` 之后也换算过（见它的文件头）。纯音频素材的栅格
+      // 就是项目帧率，由 `gridsFor` 统一回答，见 `AudioOnlySource` 的文件头
+      const grids = gridsFor(source, timeline.fps);
+      // 变速片段消耗的源片帧数不等于占位帧数（`clipSourceFrames`，原速同栅格下逐值
+      // 相同）。漏乘的表现是 2× 下能把出点拉到源片之外，而那几帧解不出来 =
+      // **那一层画面静默消失**（同 D37 记的那个形态）
+      const used = clip.sourceIn + clipSourceFrames({ ...clip, timelineOut: newOut }, grids);
+      if (used > sourceDurationFrames(source, timeline.fps)) {
+        return "已经到源片末尾，没有更多素材";
+      }
+    }
   }
   return { ...clip, timelineOut: newOut };
 }
@@ -775,8 +782,14 @@ export function slipClip(
 
   // 先各自算一遍能不能滑，再决定实际滑多少——夹紧必须**取整组的交集**，
   // 各自夹各自的会让画面滑了 60 帧而声音只滑了 40，那就是音画错位
-  const targets: { readonly trackId: TrackId; readonly clip: MediaClip; readonly limit: number }[] =
-    [];
+  const targets: {
+    readonly trackId: TrackId;
+    readonly clip: MediaClip;
+    /** 上界，单位是**源片帧**（滑移量本来就是源片帧，见文件头）。 */
+    readonly limit: number;
+    /** 这个片段一共吃掉多少源片帧，已按 `gridsFor` 换算过。 */
+    readonly used: number;
+  }[] = [];
   for (const id of ids) {
     const found = findClip(timeline, id);
     if (!found) return reject(timeline, `找不到片段 ${id}`);
@@ -786,7 +799,10 @@ export function slipClip(
     if (clip.kind === "image") return reject(timeline, blame(id, "图片没有「源片的哪一刻」"));
     const source = timeline.sources.find((s) => s.id === clip.sourceId);
     const limit = source ? sourceDurationFrames(source, timeline.fps) : Number.MAX_SAFE_INTEGER;
-    targets.push({ trackId: found.track.id, clip, limit });
+    const used = source
+      ? clipSourceFrames(clip, gridsFor(source, timeline.fps))
+      : clipDuration(clip);
+    targets.push({ trackId: found.track.id, clip, limit, used });
   }
 
   /*
@@ -805,7 +821,7 @@ export function slipClip(
   let highBlocker = clipId;
   for (const t of targets) {
     const low = t.clip.sourceIn;
-    const high = t.limit - t.clip.sourceIn - clipSourceFrames(t.clip);
+    const high = t.limit - t.clip.sourceIn - t.used;
     if (low < lowRoom) {
       lowRoom = low;
       lowBlocker = t.clip.id;
@@ -1810,17 +1826,31 @@ export function junctionInfo(timeline: Timeline, clipId: ClipId): JunctionInfo |
     transition,
     effectiveFrames: window.frames,
     shortfall: {
-      from: frozenFrames(window, "from", sourceFramesOf(timeline, previous)),
-      to: frozenFrames(window, "to", sourceFramesOf(timeline, found.clip)),
+      from: frozenFrames(window, "from", sourceExtentOf(timeline, previous)),
+      to: frozenFrames(window, "to", sourceExtentOf(timeline, found.clip)),
     },
   };
 }
 
-/** 片段引用的源片有多少帧。文字片段没有源片，返回 0（它永远不会定格）。 */
-function sourceFramesOf(timeline: Timeline, clip: Clip): number {
-  if (clip.kind !== "media") return 0;
-  const source = timeline.sources.find((s) => s.id === clip.sourceId);
-  return source ? sourceDurationFrames(source, timeline.fps) : 0;
+/**
+ * 片段引用的源片有多长，**连同量它用的两把尺子**（见 `SourceExtent`）。
+ *
+ * 文字片段没有源片，帧数返回 0（它永远不会定格）；栅格那两项随便给一个自洽的值即可，
+ * `frozenFrames` 对非素材片段先返回 0，走不到换算那一步。
+ */
+function sourceExtentOf(timeline: Timeline, clip: Clip): SourceExtent {
+  const source = clip.kind === "media" ? findClipSource(timeline, clip) : undefined;
+  if (!source) return { frames: 0, fps: timeline.fps, timelineFps: timeline.fps };
+  return {
+    frames: sourceDurationFrames(source, timeline.fps),
+    fps: sourceGridFps(source, timeline.fps),
+    timelineFps: timeline.fps,
+  };
+}
+
+/** 片段引用的素材，找不到时 undefined（引用不到素材本身是别处守的不变量，见 D23）。 */
+function findClipSource(timeline: Timeline, clip: MediaClip): MediaSource | undefined {
+  return timeline.sources.find((s) => s.id === clip.sourceId);
 }
 
 /** 转场种类的显示名。加新种类时这里会因为 Record 缺项而编译报错。 */
@@ -2100,7 +2130,7 @@ export function setClipSpeed(timeline: Timeline, clipId: ClipId, speed: Rational
   const source = timeline.sources.find((s) => s.id === clip.sourceId);
   if (source) {
     const limit = sourceDurationFrames(source, timeline.fps);
-    if (clip.sourceIn + clipSourceFrames(next) > limit) {
+    if (clip.sourceIn + clipSourceFrames(next, gridsFor(source, timeline.fps)) > limit) {
       return reject(timeline, "变速后会超出源片末尾，先把出点往回收一帧");
     }
   }
@@ -2182,7 +2212,7 @@ export function unfreezeClip(timeline: Timeline, clipId: ClipId): EditResult {
   const source = timeline.sources.find((s) => s.id === clip.sourceId);
   if (source) {
     const limit = sourceDurationFrames(source, timeline.fps);
-    const needed = clipSourceFrames(thawed);
+    const needed = clipSourceFrames(thawed, gridsFor(source, timeline.fps));
     const available = limit - clip.sourceIn;
     if (needed > available) {
       return reject(
@@ -2874,17 +2904,22 @@ export function addSource(timeline: Timeline, options: AddSourceOptions): AddSou
     conformed = { ...conformed, name: source.name };
   }
   /**
-   * 片段初始有多长。
+   * 片段初始有多长，单位是**时间轴帧**。
    *
    * 视频和音频用素材自己的长度；**图片没有长度**，用一个缺省秒数——它想占多久都行，
-   * 而 0 帧或 1 帧的片段用户还得自己拉开。这个数不是"源片长度"，所以刻意不走
-   * `sourceDurationFrames`（那个函数对图片返回 `Infinity`，正是裁切要的答案）。
+   * 而 0 帧或 1 帧的片段用户还得自己拉开。这个数不是"源片长度"，所以刻意不走那两个
+   * 派生函数（它们对图片返回 `Infinity`，那是裁切要的答案、不是这里要的）。
+   *
+   * 问的是 `sourceTimelineFrames` 不是 `sourceDurationFrames`：后者在源片自己的栅格上，
+   * 拿它当占位帧数会让 25fps 素材在 30fps 项目里短 20%、60fps 素材长一倍（后者的后半段
+   * 全是解不出来的黑帧且导出报成功）。两者只在源片帧率等于项目帧率时相等。
    */
   const lengthFrames =
     source.kind === "image"
       ? Math.max(1, Math.round((IMAGE_DEFAULT_SECONDS * conformed.fps.num) / conformed.fps.den))
-      : // 帧数要在**定好项目帧率之后**再算：纯音频素材的帧数是按项目帧率派生的
-        sourceDurationFrames(source, conformed.fps);
+      : // 帧数要在**定好项目帧率之后**再算：空项目导入第一个视频素材时项目帧率会跟着
+        // 它走（上面那个 `conformed`），而纯音频素材的帧数本来就是按项目帧率派生的
+        sourceTimelineFrames(source, conformed.fps);
   const withSource: Timeline = {
     ...conformed,
     sources: [...conformed.sources, source],

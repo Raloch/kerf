@@ -14,6 +14,7 @@ import {
   clipIsFrozen,
   isFrozen,
   clipSourceFrames,
+  gridsFor,
   clipSourceId,
   clipSpeed,
   markedRange,
@@ -971,12 +972,17 @@ function ClipView({
   /**
    * 这个片段覆盖多少**源片**帧 / 秒——缩略图和波形横向铺开靠它。
    *
-   * 变速下它不等于占位帧数（`clipSourceFrames`，原速下逐值相同）。漏乘的表现是
+   * 变速下它不等于占位帧数（`clipSourceFrames`，原速同栅格下逐值相同）。漏乘的表现是
    * **波形和缩略图与听到/看到的对不上**：2× 的片段只画出前一半的内容然后停住，
    * 而两者各自看都"像是对的"。这里有三个量刻意分开：源片入点用**源片栅格**、
-   * 片段长度用**时间轴帧率**、覆盖多少源片再乘**速度**。
+   * 片段长度用**时间轴帧率**、覆盖多少源片再乘**速度**。缩略条是按**源片帧号**索引的
+   * （`sourceInFrame` 和 `source.durationFrames` 都在那把尺子上），所以这个数也必须
+   * 换算过——`clipSourceFrames` 收 `gridsFor` 就是为此。
    */
-  const sourceFrames = clip.kind === "media" ? clipSourceFrames(clip) : clipDuration(clip);
+  const sourceFrames =
+    clip.kind === "media" && source
+      ? clipSourceFrames(clip, gridsFor(source, timeline.fps))
+      : clipDuration(clip);
   const speedFactor = clip.kind === "media" ? toNumber(clipSpeed(clip)) : 1;
   const label = clip.name ?? (clip.kind === "text" ? clip.text : source?.name) ?? clip.id;
   const length = clipDuration(clip);

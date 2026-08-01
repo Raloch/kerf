@@ -21,7 +21,20 @@ import {
   transitionWindow,
   windowCovers,
 } from "./transition";
+import type { SourceExtent } from "./transition";
 import type { Clip, MediaClip, TextClip, Transition } from "./types";
+import { FPS } from "../time/rational";
+
+/**
+ * 源片长度 + 两把尺子。缺省是"源片帧率就等于项目帧率"——绝大多数项目的形态，
+ * 也是这个文件里除最后那一组之外所有用例的前提。
+ */
+const ext = (frames: number, over: Partial<SourceExtent> = {}): SourceExtent => ({
+  frames,
+  fps: FPS.ntsc30,
+  timelineFps: FPS.ntsc30,
+  ...over,
+});
 
 const media = (over: Partial<MediaClip> = {}): MediaClip => ({
   id: "c1",
@@ -155,8 +168,8 @@ describe("frozenFrames", () => {
     // A 占源片 [0,100)，源片有 300 帧 → 出点后还有 200 帧余量
     const { a, b } = pair();
     const w = transitionWindow(a, b, dissolve(20))!;
-    expect(frozenFrames(w, "from", 300)).toBe(0);
-    expect(frozenFrames(w, "to", 300)).toBe(0);
+    expect(frozenFrames(w, "from", ext(300))).toBe(0);
+    expect(frozenFrames(w, "to", ext(300))).toBe(0);
   });
 
   it("两段满长素材相邻时两侧都全定格——这是最常见的情形", () => {
@@ -164,36 +177,60 @@ describe("frozenFrames", () => {
     const b = media({ id: "b", timelineIn: 100, timelineOut: 200, sourceIn: 0 });
     const w = transitionWindow(a, b, dissolve(20))!;
     // 各需要 10 帧余量，A 的出点就是源片末尾、B 的入点就是源片开头
-    expect(frozenFrames(w, "from", 100)).toBe(10);
-    expect(frozenFrames(w, "to", 100)).toBe(10);
+    expect(frozenFrames(w, "from", ext(100))).toBe(10);
+    expect(frozenFrames(w, "to", ext(100))).toBe(10);
   });
 
   it("余量部分够时只定格差额", () => {
     const a = media({ id: "a", timelineIn: 0, timelineOut: 100, sourceIn: 0 });
     const b = media({ id: "b", timelineIn: 100, timelineOut: 200, sourceIn: 4 });
     const w = transitionWindow(a, b, dissolve(20))!;
-    expect(frozenFrames(w, "from", 106)).toBe(4); // 需要 10，有 6
-    expect(frozenFrames(w, "to", 300)).toBe(6); // 需要 10，有 4
+    expect(frozenFrames(w, "from", ext(106))).toBe(4); // 需要 10，有 6
+    expect(frozenFrames(w, "to", ext(300))).toBe(6); // 需要 10，有 4
   });
 
   it("文字片段永远不定格——它的画面是现场生成的", () => {
     const a = text({ id: "a", timelineIn: 0, timelineOut: 100 });
     const b = media({ id: "b", timelineIn: 100, timelineOut: 200, sourceIn: 0 });
     const w = transitionWindow(a as Clip, b, dissolve(20))!;
-    expect(frozenFrames(w, "from", 0)).toBe(0);
+    expect(frozenFrames(w, "from", ext(0))).toBe(0);
   });
 });
 
 describe("availableHandle", () => {
   it("出场看出点之后，入场看入点之前", () => {
     const clip = media({ timelineIn: 0, timelineOut: 100, sourceIn: 30 });
-    expect(availableHandle(clip, "from", 300)).toBe(170);
-    expect(availableHandle(clip, "to", 300)).toBe(30);
+    expect(availableHandle(clip, "from", ext(300))).toBe(170);
+    expect(availableHandle(clip, "to", ext(300))).toBe(30);
   });
 
   it("不返回负数", () => {
     const clip = media({ timelineIn: 0, timelineOut: 100, sourceIn: 0 });
-    expect(availableHandle(clip, "from", 50)).toBe(0);
+    expect(availableHandle(clip, "from", ext(50))).toBe(0);
+  });
+
+  it("**源片帧率 ≠ 项目帧率时余量要换尺子**", () => {
+    /*
+      25fps 素材放在 30fps 时间轴上：占位 300 帧 = 10 秒 = 250 帧源片。
+      源片 375 帧 → 出点之后还剩 125 帧**源片**，换回时间轴帧是 150。
+
+      不换算的旧写法读到的是 375 − (0 + 300) = 75——**少报一半**，界面上那句
+      "余量 N 帧"于是是假话，而画面完全正常（定格帧数是显示值，不进渲染）。
+    */
+    const clip = media({ timelineIn: 0, timelineOut: 300, sourceIn: 0 });
+    const mixed = ext(375, { fps: FPS.pal25, timelineFps: FPS.ntsc30 });
+    expect(availableHandle(clip, "from", mixed)).toBe(150);
+    // 入点侧同理：50 帧源片入点 = 60 个时间轴帧
+    const trimmed = media({ timelineIn: 0, timelineOut: 300, sourceIn: 50 });
+    expect(availableHandle(trimmed, "to", mixed)).toBe(60);
+  });
+
+  it("用满源片的混帧率片段余量为 0，不是负数也不是「还有一截」", () => {
+    // 450 帧占位 @30fps = 375 帧源片，正好用满
+    const clip = media({ timelineIn: 0, timelineOut: 450, sourceIn: 0 });
+    expect(
+      availableHandle(clip, "from", ext(375, { fps: FPS.pal25, timelineFps: FPS.ntsc30 })),
+    ).toBe(0);
   });
 });
 
@@ -259,15 +296,15 @@ describe("变速片段的转场余量（D39）", () => {
     // 表现是界面说"够 60 帧"而窗口开到第 31 帧就开始定格
     const clip = media({ timelineIn: 0, timelineOut: 50, sourceIn: 0, speed: { num: 2, den: 1 } });
     // 消耗 (50-1)×2+1 = 99 帧源片，源片 159 帧 → 剩 60 帧源片 = 30 个时间轴帧
-    expect(availableHandle(clip, "from", 159)).toBe(30);
+    expect(availableHandle(clip, "from", ext(159))).toBe(30);
     // 原速同一片段：剩 109 帧源片 = 109 个时间轴帧（证明差别来自速度）
     const normal = media({ timelineIn: 0, timelineOut: 50, sourceIn: 0 });
-    expect(availableHandle(normal, "from", 159)).toBe(109);
+    expect(availableHandle(normal, "from", ext(159))).toBe(109);
   });
 
   it("入点侧同理：2× 下 20 帧入点只够借 10 个时间轴帧", () => {
     const clip = media({ timelineIn: 100, timelineOut: 150, sourceIn: 20, speed: { num: 2, den: 1 } });
-    expect(availableHandle(clip, "to", 300)).toBe(10);
+    expect(availableHandle(clip, "to", ext(300))).toBe(10);
   });
 
   it("定格帧数跟着按速度算", () => {
@@ -275,12 +312,12 @@ describe("变速片段的转场余量（D39）", () => {
     const b = media({ id: "b", timelineIn: 50, timelineOut: 100, sourceIn: 0 });
     const w = transitionWindow(a as Clip, b, dissolve(20))!;
     // a 消耗 99 帧源片；源片 105 帧 → 剩 6 帧源片 = 3 个时间轴帧，需要 10 → 定格 7
-    expect(frozenFrames(w, "from", 105)).toBe(7);
+    expect(frozenFrames(w, "from", ext(105))).toBe(7);
   });
 
   it("0.5× 的片段余量反而更多", () => {
     const clip = media({ timelineIn: 0, timelineOut: 100, sourceIn: 0, speed: { num: 1, den: 2 } });
     // 消耗 (100-1)/2 向上取整 +1 = 51 帧源片；源片 101 帧 → 剩 50 帧源片 = 100 个时间轴帧
-    expect(availableHandle(clip, "from", 101)).toBe(100);
+    expect(availableHandle(clip, "from", ext(101))).toBe(100);
   });
 });

@@ -9,6 +9,8 @@ import {
   frameToSeconds,
   framesToTimecode,
   microsToFrame,
+  regridFrames,
+  regridFramesNeeded,
   secondsToFrame,
   timecodeToFrames,
 } from "./timebase";
@@ -259,5 +261,49 @@ describe("帧号 → 微秒 × 有理数倍率（变速，D39）", () => {
     );
     // 同一个帧号在原速下是合法的（证明拒绝来自倍率，不是来自帧号本身）
     expect(() => frameToMicrosScaled(MAX_SAFE_FRAME, FPS.ndf2997, ONE)).not.toThrow();
+  });
+});
+
+describe("换帧栅格（regridFrames / regridFramesNeeded）", () => {
+  it("**栅格相同时不乘不除，原样返回**", () => {
+    // 这条是全部四个浏览器自检和绝大多数真实项目的形态，那条快路径保证它们
+    // 与加这层换算之前逐帧完全相同（同 `isNormalSpeed`）
+    for (const frames of [0, 1, 37, 999, 54_000]) {
+      expect(regridFrames(frames, FPS.ntsc30, FPS.ntsc30)).toBe(frames);
+      expect(regridFramesNeeded(frames, FPS.ntsc30, FPS.ntsc30)).toBe(frames);
+    }
+    // 相等但不是同一个对象也要走快路径（约简后的有理数比较，不是引用比较）
+    expect(regridFrames(999, rational(60, 2), FPS.ntsc30)).toBe(999);
+  });
+
+  it("同一段内容换尺子：15 秒还是 15 秒", () => {
+    // 375 帧 @25fps = 15 秒 = 450 帧 @30fps
+    expect(regridFrames(375, FPS.pal25, FPS.ntsc30)).toBe(450);
+    expect(regridFrames(450, FPS.ntsc30, FPS.pal25)).toBe(375);
+    // 600 帧 @60fps = 10 秒 = 300 帧 @30fps
+    expect(regridFrames(600, FPS.ntsc60, FPS.ntsc30)).toBe(300);
+  });
+
+  it("**两个方向的取整刻意不对称，不能互换**", () => {
+    // 240 帧 @23.976 ≈ 10.01 秒 = 300.3 帧 @30fps
+    // 「铺得满多少」向下取整（多算一帧就是报出一个解不出内容的位置）
+    expect(regridFrames(240, FPS.ndf23976, FPS.ntsc30)).toBe(300);
+    // 「要用掉多少」向上取整（少算一帧就是放行一个源片里不存在的帧）
+    expect(regridFramesNeeded(240, FPS.ndf23976, FPS.ntsc30)).toBe(301);
+  });
+
+  it("两个方向来回一趟不会把内容撑长——`floor` 之后再 `ceil` 回不到原值之上", () => {
+    // 这条钉的是 `sourceTimelineFrames` 与裁出点上界的**互相自洽**：导入产生的
+    // 片段长度换回源片栅格，绝不能超过源片本身的帧数（否则它一落地就已经越界）
+    for (const [srcFps, frames] of [
+      [FPS.pal25, 375],
+      [FPS.ntsc60, 600],
+      [FPS.ndf23976, 240],
+      [FPS.ndf2997, 1801],
+      [FPS.film24, 97],
+    ] as const) {
+      const onTimeline = regridFrames(frames, srcFps, FPS.ntsc30);
+      expect(regridFramesNeeded(onTimeline, FPS.ntsc30, srcFps)).toBeLessThanOrEqual(frames);
+    }
   });
 });
